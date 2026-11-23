@@ -200,12 +200,6 @@ const db = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
 } catch {
   $message = "failed: $($_.Exception.Message)"
   Write-Log $message
-  if (-not $WhatIfPreference) {
-    try {
-      & (Get-Command node.exe).Source (Join-Path $PSScriptRoot 'ac-report.mjs') --home $DataRoot --task t1368 --fail `
-        --summary "Nightly backup $message" --next 'check the scheduled task log and backup configuration' | Out-Null
-    } catch { }
-  }
   exit 1
 }
 exit 0

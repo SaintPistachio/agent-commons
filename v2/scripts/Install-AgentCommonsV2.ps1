@@ -12,7 +12,7 @@ Reproducibility (goal g2): the Node version must satisfy package.json engines; e
 (commit, v2 tree hash, Node path and version, package-lock and node_modules lock hashes) that /health reports; and
 the `current` swap goes through `current.next`, so an interrupted swap is finished by the next run.
 DataRoot defaults to the folder beside the main checkout named <checkout>-data
-Nothing is placed under the user profile.
+Use a private data directory on a local fixed drive.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -27,8 +27,8 @@ $ErrorActionPreference = 'Stop'
 $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path
 if (-not $DataRoot) { $DataRoot = "$(Get-AcCheckout (Join-Path $SourceRoot 'v2'))-data" }
 $home2 = Resolve-AcDataRoot $PSScriptRoot $DataRoot
-Assert-AcNotOneDrive $home2
-if ($env:USERPROFILE -and (Test-AcPathWithin $home2 $env:USERPROFILE)) { throw "DataRoot $home2 is under the user profile." }
+Assert-AcLocalDataPath $home2
+if ([IO.Directory]::Exists($home2)) { Assert-AcPrivateDirectory $home2 }
 $commit = (git -C $SourceRoot rev-parse HEAD).Trim()
 if (git -C $SourceRoot status --porcelain -- v2) { throw 'v2/ has uncommitted changes; commit them first.' }
 $app = Join-Path $home2 "app\$commit"
@@ -51,6 +51,7 @@ if ($engines -match '<\s*(\d+)' -and $v.Major -ge [int]$Matches[1]) { throw "Nod
 
 if (-not (Test-Path (Join-Path $app 'v2\src\cli.ts'))) {
   if ($PSCmdlet.ShouldProcess($app, 'Install release')) {
+    if (-not [IO.Directory]::Exists($home2)) { Set-AcPrivateDirectory $home2 -Create }
     $modules = Join-Path $SourceRoot 'node_modules'
     if (-not (Test-Path -LiteralPath $modules -PathType Container)) {
       if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'package-lock.json') -PathType Leaf)) {

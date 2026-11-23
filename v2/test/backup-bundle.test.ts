@@ -12,9 +12,7 @@ import {
 import { SCHEMA_VERSION } from '../src/schema.ts';
 
 test('encrypted backup bundles round-trip databases, artifacts, and local files', async () => {
-  const codexTemp = 'F:\\Temp\\Codex';
-  const temp = process.platform === 'win32' && fs.existsSync(codexTemp) ? codexTemp : os.tmpdir();
-  const root = fs.mkdtempSync(path.join(temp, 'ac-backup-bundle-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-backup-bundle-'));
   const stagingParent = path.join(root, 'staging');
   const home = path.join(root, 'home');
   const helperRoot = path.join(root, 'helper');

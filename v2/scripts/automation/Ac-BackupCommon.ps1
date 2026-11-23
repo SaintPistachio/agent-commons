@@ -100,10 +100,17 @@ function Assert-AcNotOneDrive([string]$Path) {
   }
 }
 
+function Assert-AcLocalDataPath([string]$Path) {
+  Assert-AcNotOneDrive $Path
+  $physical = Resolve-AcPhysicalPath $Path
+  if ($physical -notmatch '^[A-Za-z]:\\' -or [IO.DriveInfo]::new([IO.Path]::GetPathRoot($physical)).DriveType -ne [IO.DriveType]::Fixed) {
+    throw 'Choose a private data directory on a local fixed drive.'
+  }
+}
+
 function Get-AcLocalTempRoot {
-  if ([IO.Directory]::Exists('F:\Temp\Codex')) { return 'F:\Temp\Codex' }
-  if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not set and F:\Temp\Codex is unavailable' }
-  [IO.Path]::Combine($env:LOCALAPPDATA, 'Temp')
+  if ($env:CODEX_TEMP_ROOT) { return $env:CODEX_TEMP_ROOT }
+  [IO.Path]::GetTempPath()
 }
 
 function Set-AcPrivateDirectory([string]$Path, [switch]$Create) {

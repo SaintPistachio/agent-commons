@@ -1,0 +1,17 @@
+{
+  "capability": "embeddings",
+  "purpose": {
+    "kind": "contract_test",
+    "description": "Build and query a tiny synthetic help index using API-produced numeric vectors, then use the retrieved recovery entry in Codex."
+  },
+  "model": "text-embedding-3-small",
+  "tier": "default",
+  "payload": {
+    "input": [
+      "Recovery: disable stops new submissions and preserves pending jobs and collected results. Use resume with the recorded job identifier to collect existing work.",
+      "Funding: Auto Recharge must remain disabled. Use only existing prepaid credits; never purchase or top up credits.",
+      "How do I stop new requests without losing results?"
+    ],
+    "dimensions": 256
+  }
+}

@@ -77,7 +77,7 @@ function profileState(profile: SeedProfile, rows: UsageWindow[]): 'open' | 'clos
     const row = rows.find(row => row.pool === required.group && row.window === required.limit);
     if (!row || row.stale || row.remaining_percent === null) unknown = true;
     // The helper treats zero as exhaustion; a small positive allowance is still open.
-    else if (row.remaining_percent === 0) return 'closed';
+    else if (row.closed || row.remaining_percent === 0) return 'closed';
   }
   return unknown ? 'unknown' : 'open';
 }
@@ -520,6 +520,8 @@ export const antigravity: PlatformAdapter = {
   discover,
   usage: quotaUsage,
   observeUsage,
+  reopenedQuotaPools: rows => [...new Set(seedProfiles()
+    .filter(profile => profileState(profile, rows) === 'open').map(profile => profile.group))],
   consumption,
   backfillConsumption,
   poolEvidenceStatus,

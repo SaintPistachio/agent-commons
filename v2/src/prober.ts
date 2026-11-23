@@ -7,7 +7,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Store } from './store.ts';
-import type { CliBinary, CliUpdateContext, ProbeContext, ProbeOverrides, ProbeResult, RunnerOptions } from './adapters/types.ts';
+import { UsageContractViolation, type CliBinary, type CliUpdateContext, type ProbeContext, type ProbeOverrides, type ProbeResult, type RunnerOptions } from './adapters/types.ts';
 import { adapter, adapterIds } from './adapters/registry.ts';
 import { compareCliVersions, isStableCliVersion, pendingStableVersion } from './adapters/cli-freshness.ts';
 import { pendingSdkVersion, SdkRecoveryRequired } from './adapters/sdk-freshness.ts';
@@ -17,8 +17,10 @@ import type { SdkRecoveryEvent } from './adapters/sdk-swap.ts';
 type Check = 'probe' | 'daily' | 'now' | 'sdk-now';
 type ProbeStore = Pick<Store, 'platformState' | 'recordProbe' | 'beginCliUpdate' | 'finishCliUpdate' |
   'recordDiscovery' | 'seedProfiles' | 'recordDiscoveryFailure' | 'recordDiscoverySummary' | 'jobEvents' | 'jobState'> &
-  Partial<Pick<Store, 'db' | 'setValidationOptions' | 'recordUsage' | 'usageFor' | 'recordSdkSnapshot' | 'beginSdkUpdate' | 'finishSdkUpdate'>>;
+  Partial<Pick<Store, 'db' | 'setValidationOptions' | 'recordUsage' | 'usageFor' | 'blockUsageRead' | 'recordSdkSnapshot' | 'beginSdkUpdate' | 'finishSdkUpdate'>>;
 const errorText = (error: unknown) => String((error as Error)?.message ?? error).replace(/\s+/g, ' ').slice(0, 250);
+export const usageIdentity = (state: ReturnType<Store['platformState']>) =>
+  JSON.stringify([state?.bin_selected_path ?? null, state?.bin_version ?? null, state?.binary_sha256 ?? null]);
 
 /** Recovery may follow a crash after the original lease was created, finalized, or already recovered. */
 export function recordSdkRecovery(store: Pick<Store, 'platformState' | 'recordProbe' | 'jobEvents'> &
@@ -288,12 +290,17 @@ export class Prober {
   refreshUsage(): Promise<void> {
     return Promise.all(this.ids().map(id => this.observeUsage(id))).then(() => {});
   }
-  /** A usage read runs only for a verified route (its helper and CLI match the approved ones) with no job running or queued to start. */
+  /** A usage read can run past a queue held by a cooldown, since no job can start on that route yet. */
   private usageReadAllowed(id: string): boolean {
     if (this.stopped || !adapter(id)?.observeUsage) return false;
     try {
-      if (this.store.platformState(id)?.probe_state !== 'verified') return false;
-      return !this.store.db?.prepare("SELECT 1 FROM jobs WHERE route=? AND status IN ('running','queued') LIMIT 1").get(id);
+      const state = this.store.platformState(id);
+      if (state?.probe_state !== 'verified') return false;
+      if (state.usage_blocked_identity === usageIdentity(state)) return false;
+      const held = Date.parse(state.cooldown_until ?? '') > Date.now();
+      return !this.store.db?.prepare(`SELECT 1 FROM jobs WHERE route=? AND (status='running'
+        OR (status='queued' AND (?=0 OR COALESCE(json_type(options,'$.auto'),'') <> 'object'))) LIMIT 1`)
+        .get(id, held ? 1 : 0);
     } catch { return false; }  // unknown: do not read
   }
 
@@ -316,7 +323,7 @@ export class Prober {
       const usage = this.store.usageFor?.(id) ?? [];
       const jobWatermark = () => {
         const row = this.store.db?.prepare(
-          "SELECT COALESCE(MAX(seq),0) seq, COALESCE(MAX(started_at),'') st, COALESCE(MAX(finished_at),'') fn FROM jobs WHERE route=?"
+          "SELECT COALESCE(MAX(seq),0) seq, COALESCE(MAX(started_at),'') st, COALESCE(MAX(finished_at),'') fn FROM jobs WHERE route=? AND started_at IS NOT NULL"
         ).get(id) as { seq: number; st: string; fn: string } | undefined;
         return row ? `${row.seq}|${row.st}|${row.fn}` : '';
       };
@@ -337,8 +344,16 @@ export class Prober {
           || after?.last_update_result === 'running') return;
         if (jobWatermark() !== markBefore) return;
         const rows = snapshot.rows.map(row => ({ ...row, observed_at: row.observed_at ?? startedAt }));
-        this.store.recordUsage?.(id, rows, snapshot.source);
-      } catch { /* local evidence unavailable or the store closed */ }
+        this.store.recordUsage?.(id, rows, snapshot.source, startedAt, snapshot.partial);
+      } catch (error) {
+        if (error instanceof UsageContractViolation) {
+          const identity = usageIdentity(before);
+          try {
+            if (usageIdentity(this.store.platformState(id)) === identity) this.store.blockUsageRead?.(id, identity);
+          } catch { /* store closed */ }
+          console.error(JSON.stringify({ event: 'usage.control_violation', route: id, message: errorText(error) }));
+        }
+      }
     }).finally(() => {
       if (this.observing.get(id) === run) this.observing.delete(id);
     });
@@ -352,8 +367,14 @@ export class Prober {
     if (!job || !this.ids().includes(job.route)) return;
     if (['completed', 'failed', 'cancelled', 'needs_review'].includes(job.status)) void this.observeUsage(job.route);
     if (job.status !== 'failed' || !String(job.error ?? '').startsWith('CLI_ERROR')) return;
-    const last = this.store.platformState(job.route)?.last_probe_at;
-    if (last && Date.now() - Date.parse(last) < RECHECK_AFTER_FAILURE) return;
-    void this.probe(job.route);
+    const recheck = () => {
+      if (this.stopped) return;
+      const last = this.store.platformState(job.route)?.last_probe_at;
+      if (!last || Date.now() - Date.parse(last) >= RECHECK_AFTER_FAILURE) void this.probe(job.route);
+    };
+    // An active probe may already have recorded its result and still be reading usage or discovery metadata.
+    const activeProbe = this.running.get(job.route);
+    if (activeProbe) void activeProbe.then(recheck).catch(() => {});
+    else recheck();
   }
 }

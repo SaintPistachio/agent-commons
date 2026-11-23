@@ -60,9 +60,10 @@ function sdkStore(t: TestContext) {
   // Start with the v16 columns used by these store methods and apply the actual migration.
   db.exec(`CREATE TABLE platform_state (
     adapter_id TEXT PRIMARY KEY, family TEXT NOT NULL, billing TEXT NOT NULL, probe_state TEXT NOT NULL,
-    last_probe_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_update_result TEXT
+    last_probe_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_update_result TEXT, cooldown_until TEXT
   );
   CREATE TABLE jobs (seq INTEGER PRIMARY KEY, id TEXT, route TEXT NOT NULL, status TEXT NOT NULL, consult_verdict TEXT, finished_at TEXT, created_at TEXT);
+  CREATE TABLE usage_windows (route TEXT, pool TEXT, window TEXT, remaining_percent REAL, resets_at TEXT, observed_at TEXT, source TEXT);
   PRAGMA user_version=16;`);
   migrate(db);
   const store: Store = Object.assign(Object.create(Store.prototype), {

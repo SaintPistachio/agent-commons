@@ -51,8 +51,10 @@ export function codexLimits(events: Iterable<unknown>, previous: UsageWindow[] =
     for (const value of samples) {
       const id = key(value), before = series.get(id), previousWindow = before?.last ?? known.get(id);
       const sameReset = value.resets_at !== null && value.resets_at === previousWindow?.resets_at;
+      const recovered = previousWindow?.remaining_percent != null ? value.used < 100 - previousWindow.remaining_percent
+        : previousWindow?.closed === true && value.used === 0;
       value.closed = !!value.resets_at && Date.parse(value.resets_at) > now &&
-        (marked.has(id) || (sameReset && previousWindow?.closed === true));
+        (marked.has(id) || (sameReset && previousWindow?.closed === true && !recovered));
       series.set(id, { first: before?.first ?? value, last: value, count: (before?.count ?? 0) + 1,
         uninterrupted: !before || (before.uninterrupted && sameReset) });
     }

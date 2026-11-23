@@ -8,9 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { defaultOpenAIHelperRoot } from '../src/adapters/openai-models.ts';
 
 test('defaultOpenAIHelperRoot uses the environment, config, sibling, and fallback in order', () => {
-  const codexTemp = 'F:\\Temp\\Codex';
-  const temp = process.platform === 'win32' && fs.existsSync(codexTemp) ? codexTemp : os.tmpdir();
-  const root = fs.mkdtempSync(path.join(temp, 'ac-helper-resolution-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-helper-resolution-'));
   try {
     const home = path.join(root, 'Foo-data');
     const sibling = path.join(root, 'Foo', 'tools', 'openai-capabilities');

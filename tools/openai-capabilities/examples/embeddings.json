@@ -1,0 +1,13 @@
+{
+  "capability": "embeddings",
+  "purpose": {
+    "kind": "contract_test",
+    "description": "Produce numeric vectors for a synthetic local similarity-search contract test."
+  },
+  "model": "text-embedding-3-small",
+  "tier": "default",
+  "payload": {
+    "input": ["The red bicycle is outside.", "A blue bicycle is parked nearby."],
+    "dimensions": 256
+  }
+}

@@ -17,7 +17,7 @@ import { text, optText, MAX_TEXT } from './validate.ts';
 import { adapter, adapterIds, allAdapters, DEFAULT_ROUTE } from './adapters/registry.ts';
 import { compareVersionParts, parseModelVersion, supersededBy } from './adapters/inventory.ts';
 import { compareCostEfficiency, modelPricing } from './adapters/model-pricing.ts';
-import { INTENTS, EFFORTS, type AdapterCapabilities, type ProbeResult } from './adapters/types.ts';
+import { INTENTS, EFFORTS, type AdapterCapabilities, type ProbeResult, type UsageObservation, type UsageWindow } from './adapters/types.ts';
 import { git, RESULT_LIMIT } from './adapters/shared.ts';
 import { resolvePatchCheck } from './patch-check.ts';
 import { buildContext, realDirectory, redactSecrets, resolveContextRoot, same } from './context.ts';
@@ -1375,8 +1375,9 @@ export class Store {
       for (const candidate of this.db.prepare(`SELECT id,route,json_extract(options,'$.toolset.name') toolset,
         json_extract(options,'$.toolset.max_concurrent') toolset_max, json_extract(options,'$.toolset.slot_locks') slot_locks FROM jobs WHERE status='queued'
         AND NOT EXISTS (SELECT 1 FROM platform_state
-          WHERE adapter_id=jobs.route AND last_update_result='running')
-        ORDER BY seq`).all() as Json[]) {
+          WHERE adapter_id=jobs.route AND (last_update_result='running'
+            OR (cooldown_until>? AND json_type(jobs.options,'$.auto')='object')))
+        ORDER BY seq`).all(now()) as Json[]) {
         if ((counts[candidate.route] ?? 0) >= (routeLimits[candidate.route] ?? 0)) continue;
         if (candidate.toolset && (toolsetRunning[candidate.toolset] ?? 0) >= Number(candidate.toolset_max ?? 1)) continue;
         // The server's own process slots (the Blender wrapper's two), which other apps share: wait while all are held.
@@ -1486,25 +1487,80 @@ export class Store {
     });
   }
   /** Stores observations without predicting refills. Older deliveries cannot overwrite newer ones. */
-  recordUsage(route: string, rows: import('./adapters/types.ts').UsageObservation[], source: string): void {
+  recordUsage(route: string, rows: UsageObservation[], source: string, checkStartedAt?: string, partial = false): void {
+    if (!rows.length) return;
     const at = now();
     const upsert = this.db.prepare(`INSERT INTO usage_windows(route,pool,window,remaining_percent,resets_at,observed_at,source)
       VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(route,pool,window) DO UPDATE SET
         remaining_percent=excluded.remaining_percent, resets_at=excluded.resets_at,
         observed_at=excluded.observed_at, source=excluded.source
-      WHERE excluded.observed_at >= usage_windows.observed_at`);
-    for (const row of rows) {
-      if (!row || typeof row.pool !== 'string' || !row.pool.trim() || typeof row.window !== 'string' || !row.window.trim()) continue;
-      if (row.remaining_percent !== null && (typeof row.remaining_percent !== 'number'
-        || !Number.isFinite(row.remaining_percent) || row.remaining_percent < 0 || row.remaining_percent > 100)) continue;
-      const observed = row.observed_at === undefined ? at : row.observed_at;
-      if (typeof observed !== 'string' || !Number.isFinite(Date.parse(observed))) continue;
-      if (row.resets_at !== null && (typeof row.resets_at !== 'string' || !Number.isFinite(Date.parse(row.resets_at)))) continue;
-      upsert.run(route, row.pool, row.window, row.remaining_percent,
-        row.resets_at === null ? null : new Date(row.resets_at).toISOString(),
-        new Date(observed).toISOString(), row.closed === true && row.resets_at ? `${source}:closed` : source);
-    }
+      WHERE excluded.observed_at > usage_windows.observed_at
+        OR (excluded.observed_at = usage_windows.observed_at AND ?=1)`);
+    const previous = this.db.prepare('SELECT * FROM usage_windows WHERE route=? AND pool=? AND window=?');
+    const markEarly = this.db.prepare(`UPDATE usage_windows SET early_reset_observed_at=?, early_reset_scheduled_at=?, early_reset_remaining_percent=?
+      WHERE route=? AND pool=? AND window=?`);
+    const persist = () => {
+      const observedWindows = new Map<string, UsageWindow>();
+      const known = checkStartedAt ? this.usageFor(route) : [];
+      const tracksResets = checkStartedAt && adapter(route)?.capabilities.billing === 'sub';
+      for (const row of rows) {
+        if (!row || typeof row.pool !== 'string' || !row.pool.trim() || typeof row.window !== 'string' || !row.window.trim()) continue;
+        if (row.remaining_percent !== null && (typeof row.remaining_percent !== 'number'
+          || !Number.isFinite(row.remaining_percent) || row.remaining_percent < 0 || row.remaining_percent > 100)) continue;
+        const observed = row.observed_at === undefined ? at : row.observed_at;
+        if (typeof observed !== 'string' || !Number.isFinite(Date.parse(observed))) continue;
+        if (row.resets_at !== null && (typeof row.resets_at !== 'string' || !Number.isFinite(Date.parse(row.resets_at)))) continue;
+        const observedAt = new Date(observed).toISOString();
+        if (checkStartedAt && observedAt > at) continue;
+        const resetsAt = row.resets_at === null ? null : new Date(row.resets_at).toISOString();
+        const closed = row.closed === true && !!resetsAt;
+        const before = tracksResets ? previous.get(route, row.pool, row.window) as Json | undefined : undefined;
+        const written = upsert.run(route, row.pool, row.window, row.remaining_percent, resetsAt, observedAt,
+          closed ? `${source}:closed` : source, checkStartedAt ? 0 : 1);
+        if (!written.changes || !checkStartedAt || observedAt < checkStartedAt) continue;
+        // A check straddling the scheduled reset cannot prove that replenishment occurred early.
+        if (before && typeof before.resets_at === 'string' && before.resets_at > at && !closed && row.remaining_percent !== null
+          && (before.source === source || before.source.endsWith(':closed') || before.source === 'reply' && before.remaining_percent === 0)) {
+          // Some providers return slightly different timestamps for the same schedule. A rebound to
+          // previously observed headroom in that schedule is not another newly observed refill.
+          const sameSchedule = Math.abs(Date.parse(before.early_reset_scheduled_at ?? '') - Date.parse(before.resets_at)) <= 2_000;
+          const alreadyObserved = sameSchedule ? before.early_reset_remaining_percent ?? 0 : 0;
+          if (before.remaining_percent !== null && row.remaining_percent > Math.max(before.remaining_percent, alreadyObserved)) {
+            markEarly.run(at, before.resets_at, row.remaining_percent, route, row.pool, row.window);
+          }
+        }
+        const stale = !!resetsAt && resetsAt <= at;
+        observedWindows.set(JSON.stringify([row.pool, row.window]),
+          { ...row, route, resets_at: resetsAt, observed_at: observedAt, source, stale, closed,
+            remaining_percent: stale ? null : row.remaining_percent });
+      }
+      if (checkStartedAt && !partial && observedWindows.size) this.reconcileQuotaCooldown(route, [...observedWindows.values()], known, checkStartedAt);
+    };
+    if (this.db.isTransaction) persist();
+    else this.transaction(persist);
+  }
+
+  blockUsageRead(route: string, identity: string): void {
+    this.db.prepare('UPDATE platform_state SET usage_blocked_identity=? WHERE adapter_id=?').run(identity, route);
+  }
+
+  private reconcileQuotaCooldown(route: string, snapshot: UsageWindow[], known: UsageWindow[], checkStartedAt: string): void {
+    const positive = snapshot.filter(row => !row.closed && row.remaining_percent !== null && row.remaining_percent > 0);
+    const pools = adapter(route)?.reopenedQuotaPools?.(snapshot, known) ?? [];
+    if (!pools.length) return;
+    // A fully open pool supersedes a prior reply's synthetic marker for exhaustion of an unidentified window.
+    const clearMarker = this.db.prepare(`DELETE FROM usage_windows WHERE route=? AND pool=?
+      AND window='exhaustion' AND observed_at < ? AND source LIKE 'reply%'`);
+    for (const pool of pools) clearMarker.run(route, pool, checkStartedAt);
+    const state = this.platformState(route);
+    if (!state?.cooldown_started_at || checkStartedAt <= state.cooldown_started_at) return;
+    if (state.cooldown_reason === 'all observed quota pools are closed') return this.clearCooldown(route);
+    if (!/^QUOTA_EXHAUSTED\b/.test(state.cooldown_reason ?? '')) return;
+    // A partial or unrelated reading must not erase the windows that established this cooldown.
+    const blocked: Array<[string, string]> = JSON.parse(state.cooldown_quota_windows ?? '[]');
+    if (blocked.length && blocked.every(([pool, window]) => pools.includes(pool) && (window === 'exhaustion'
+      || positive.some(fresh => fresh.pool === pool && fresh.window === window)))) this.clearCooldown(route);
   }
 
   /** A passed reset is unknown, not evidence of a refill. Stored observations remain unchanged. */
@@ -1517,6 +1573,8 @@ export class Store {
       return { route: row.route, pool: row.pool, window: row.window,
         remaining_percent: stale ? null : row.remaining_percent, resets_at: row.resets_at,
         observed_at: row.observed_at, source: markedClosed ? row.source.slice(0, -':closed'.length) : row.source, stale,
+        ...(row.early_reset_observed_at ? { early_reset_observed_at: row.early_reset_observed_at,
+          early_reset_scheduled_at: row.early_reset_scheduled_at } : {}),
         closed: markedClosed && row.resets_at !== null && Date.parse(row.resets_at) > at };
     });
   }
@@ -1550,7 +1608,8 @@ export class Store {
   /** Each pool is constrained by its tightest fresh window; independent pools are alternatives. */
   private routeQuotaState(routeId: string): number | null {
     const poolMins = new Map<string, number>();
-    for (const window of this.usageFor(routeId)) {
+    const windows = this.usageFor(routeId);
+    for (const window of adapter(routeId)?.routeQuotaWindows?.(windows) ?? windows) {
       if (window.stale) continue;
       const remaining = window.closed ? 0 : window.remaining_percent;
       if (remaining === null) continue;
@@ -1661,12 +1720,19 @@ export class Store {
       this.db.prepare(`INSERT INTO platform_state(adapter_id,family,billing,probe_state,reason,last_probe_at,updated_at) VALUES(?,?,?,'unavailable','not probed yet',?,?)`)
         .run(route, caps.family, caps.billing, at, at);
     }
-    this.db.prepare('UPDATE platform_state SET cooldown_until=?, cooldown_reason=?, updated_at=? WHERE adapter_id=?').run(until, reason, at, route);
+    const rows = this.usageFor(route);
+    const blocked = (adapter(route)?.routeQuotaWindows?.(rows) ?? rows)
+      .filter(row => !row.stale && (row.closed || row.remaining_percent === 0))
+      .map(row => [row.pool, row.window]);
+    this.db.prepare(`UPDATE platform_state SET cooldown_until=?, cooldown_reason=?, cooldown_started_at=?,
+      cooldown_quota_windows=?, updated_at=? WHERE adapter_id=?`).run(new Date(until).toISOString(), reason, at, JSON.stringify(blocked), at, route);
   }
   /** Ends a route's cooldown (all routes when none is named). */
   clearCooldown(route?: string): void {
-    if (route) this.db.prepare('UPDATE platform_state SET cooldown_until=NULL, cooldown_reason=NULL, updated_at=? WHERE adapter_id=? AND cooldown_until IS NOT NULL').run(now(), route);
-    else this.db.prepare('UPDATE platform_state SET cooldown_until=NULL, cooldown_reason=NULL, updated_at=? WHERE cooldown_until IS NOT NULL').run(now());
+    const clear = `UPDATE platform_state SET cooldown_until=NULL, cooldown_reason=NULL, cooldown_started_at=NULL,
+      cooldown_quota_windows=NULL, updated_at=? WHERE cooldown_until IS NOT NULL`;
+    if (route) this.db.prepare(`${clear} AND adapter_id=?`).run(now(), route);
+    else this.db.prepare(clear).run(now());
   }
 
   // ---- operator tools (cli.ts) ----------------------------------------------

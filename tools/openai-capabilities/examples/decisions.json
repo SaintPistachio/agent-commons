@@ -1,0 +1,39 @@
+{
+  "capability": "decisions",
+  "purpose": {
+    "kind": "contract_test",
+    "description": "Validate typed predicate, choice, and score outputs for a synthetic ticket application."
+  },
+  "model": "gpt-6-luna",
+  "tier": "default",
+  "payload": {
+    "input": "A customer was charged twice for one order. The application otherwise works.",
+    "questions": [
+      {
+        "type": "predicate",
+        "name": "duplicate_charge",
+        "instructions": "Does the ticket report a duplicate charge?"
+      },
+      {
+        "type": "choice",
+        "name": "queue",
+        "instructions": "Select the queue responsible for the reported issue.",
+        "choices": [
+          {"value": "billing", "description": "Charges, invoices, and refunds."},
+          {"value": "access", "description": "Login and account access."},
+          {"value": "other", "description": "Issues outside billing and access."}
+        ]
+      },
+      {
+        "type": "score",
+        "name": "application_impact",
+        "instructions": "Rate how much the ticket prevents use of the application.",
+        "levels": [
+          {"label": "Usable", "description": "The application remains usable."},
+          {"label": "Limited", "description": "Some application functions cannot be used."},
+          {"label": "Blocked", "description": "The application cannot be used."}
+        ]
+      }
+    ]
+  }
+}

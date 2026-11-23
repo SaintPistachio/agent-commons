@@ -8,7 +8,7 @@ import { defaultHome } from './paths.ts';
 import { startServer, DEFAULT_PORT } from './server.ts';
 import { importV1 } from './import-v1.ts';
 import { profileOf } from './tools.ts';
-import { Prober } from './prober.ts';
+import { Prober, usageIdentity } from './prober.ts';
 import { allAdapters } from './adapters/registry.ts';
 import { resolveOpenAIHelperRoot } from './adapters/openai-models.ts';
 import { backupDatabase, restoreDatabase, consultStats, outcomeStats, dropJob, jobDiff, pruneHome, rotateLog } from './ops.ts';
@@ -783,6 +783,7 @@ switch (command) {
       console.log(`  ${s.adapter_id.padEnd(12)} ${s.probe_state.padEnd(11)} ${(s.cli_version ?? '-').padEnd(24)} running ${q?.running ?? 0}, queued ${q?.queued ?? 0}${s.cooldown_until ? `; cooldown until ${s.cooldown_until}` : ''}`);
       const platform = allAdapters().find(a => a.capabilities.id === s.adapter_id);
       for (const line of cliFreshnessLines(s, platform?.upstreamTrack)) console.log(`    ${line}`);
+      if (s.usage_blocked_identity === usageIdentity(s)) console.log('    quota polling suspended: local command reported model work');
       if (platform?.update) console.log(`    ${cliUpdateStatusLine(s, platform.upstreamTrack)}`);
       if (platform?.sdk) console.log(`    ${sdkStatusLine(s)}`);
       if (platform?.modelSourceStatus) {
@@ -795,7 +796,9 @@ switch (command) {
     if (windows.length) {
       console.log('usage windows:');
       for (const w of windows) console.log(`  ${w.route} / ${w.pool} / ${w.window}: ${w.stale || w.remaining_percent === null ? 'unknown' : w.remaining_percent + '%'}` +
-        `${w.resets_at ? `, resets ${w.resets_at}` : ''}${w.closed ? ', closed' : ''} (${w.source}, seen ${w.observed_at})`);
+        `${w.resets_at ? `, ${w.route === 'openai-api' ? 'expires' : 'scheduled reset'} ${w.resets_at}` : ''}`
+        + `${w.early_reset_observed_at ? `, early replenishment seen ${w.early_reset_observed_at} (previous schedule ${w.early_reset_scheduled_at})` : ''}`
+        + `${w.closed ? ', closed' : ''} (${w.source}, seen ${w.observed_at})`);
     }
     for (const route of allAdapters().filter(a => a.poolEvidenceStatus)) {
       const lines = route.poolEvidenceStatus!(store.poolEvidence(route.capabilities.id), store.consumptionRuns(route.capabilities.id));

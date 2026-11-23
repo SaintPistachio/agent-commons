@@ -77,6 +77,8 @@ export interface UsageWindow extends UsageObservation {
   observed_at: string;
   source: string;
   stale: boolean;
+  early_reset_observed_at?: string;
+  early_reset_scheduled_at?: string;
 }
 
 export interface ConsumptionRow {
@@ -261,7 +263,12 @@ export interface ProbeContext {
 export interface UsageSnapshot {
   rows: UsageObservation[];
   source: string;
+  /** An unrecognized provider meter prevents a cooldown decision from this snapshot. */
+  partial?: boolean;
 }
+
+/** A native metadata command reported model work. Suspend quota reads for this executable identity. */
+export class UsageContractViolation extends Error {}
 
 export interface SdkSnapshot {
   installed: string | null;
@@ -329,6 +336,10 @@ export interface PlatformAdapter {
    * spends money: local evidence, or a read-only quota report such as Antigravity's `/usage`.
    */
   observeUsage?(ctx: ProbeContext): Promise<UsageSnapshot | undefined>;
+  /** Pools proved available by this snapshot, with prior coverage for comparison. */
+  reopenedQuotaPools?(rows: UsageWindow[], known: UsageWindow[]): string[];
+  /** Windows used to summarize route-level availability when model-specific meters also exist. */
+  routeQuotaWindows?(rows: UsageWindow[]): UsageWindow[];
   /** Extracts observations from a reply already received during a job; never performs I/O. */
   usage?(reply: Json): UsageObservation[];
   /** Compares quota windows in an existing reply. Resets and missing comparisons are not evidence. */

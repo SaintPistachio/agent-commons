@@ -11,9 +11,7 @@ import { Store } from '../src/store.ts';
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 
 test('Store and CLI rotate tokens while preserving actor records and connection settings', () => {
-  const codexTemp = 'F:\\Temp\\Codex';
-  const temp = process.platform === 'win32' && fs.existsSync(codexTemp) ? codexTemp : os.tmpdir();
-  const home = fs.mkdtempSync(path.join(temp, 'ac-rotate-client-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-rotate-client-'));
   try {
     const store = new Store(home);
     try {

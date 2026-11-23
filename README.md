@@ -13,12 +13,7 @@ $acPort = 4727
 $acHome = Join-Path $env:LOCALAPPDATA 'AgentCommons-data'
 $acProject = 'C:\Projects\SampleProject'
 . .\v2\scripts\automation\Ac-BackupCommon.ps1
-Assert-AcNotOneDrive $acHome
-$acPhysicalHome = Resolve-AcPhysicalPath $acHome
-if ($acPhysicalHome -notmatch '^[A-Za-z]:\\' -or
-    [IO.DriveInfo]::new([IO.Path]::GetPathRoot($acPhysicalHome)).DriveType -ne [IO.DriveType]::Fixed) {
-    throw 'Choose a private data directory on a local fixed drive.'
-}
+Assert-AcLocalDataPath $acHome
 if (Test-Path -LiteralPath $acHome) {
     throw 'Choose a new data directory for this quickstart.'
 }

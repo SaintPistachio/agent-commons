@@ -178,7 +178,7 @@ test('a write through a symlinked config keeps the link', t => {
 function withToolset(f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}) {
   const data = JSON.parse(readFileSync(join(f.root, 'tools.json'), 'utf8'));
   data.toolsets = { blender: { server: 'blender_3d', routes: ['codex', 'claude'], advice_tools: ['get_scene_info', 'session_start'],
-    edit_tools: ['execute_blender_code'], max_concurrent: 2, write_roots: ['F:\\Temp\\Codex'], ...extra } };
+    edit_tools: ['execute_blender_code'], max_concurrent: 2, write_roots: ['C:\\Fixtures\\AgentCommons'], ...extra } };
   writeFileSync(join(f.root, 'tools.json'), JSON.stringify(data));
   return loadManifest(f.home)!;
 }
@@ -190,7 +190,7 @@ test('tool sets: validation, per-mode tools, route limits and a stable hash', t 
   assert.deepEqual(advice.tools, ['get_scene_info', 'session_start'], 'advice jobs never get the code tool');
   assert.deepEqual(advice.write_roots, [], 'advice jobs get no extra write roots');
   assert.deepEqual(edit.tools, ['get_scene_info', 'session_start', 'execute_blender_code']);
-  assert.deepEqual(edit.write_roots, ['F:\\Temp\\Codex']);
+  assert.deepEqual(edit.write_roots, ['C:\\Fixtures\\AgentCommons']);
   assert.equal(advice.sha256, jobToolset(m, 'blender', 'codex', 'advice').sha256);
   assert.notEqual(advice.sha256, edit.sha256);
   assert.throws(() => jobToolset(m, 'blender', 'openai-api', 'advice'), /runs only on codex, claude/);
@@ -214,7 +214,7 @@ test('tool sets: Codex gets only the one server through -c overrides; Claude thr
   assert.ok(c.includes('mcp_servers.blender_3d.env={BLENDER_MCP_SAFE_MODE="1"}'));
   assert.ok(c.includes('mcp_servers.blender_3d.enabled_tools=["get_scene_info","session_start","execute_blender_code"]'));
   assert.ok(c.includes('mcp_servers.blender_3d.tools.execute_blender_code.approval_mode="approve"'));
-  assert.deepEqual(args.slice(args.indexOf('--add-dir'), args.indexOf('--add-dir') + 2), ['--add-dir', 'F:\\Temp\\Codex']);
+  assert.deepEqual(args.slice(args.indexOf('--add-dir'), args.indexOf('--add-dir') + 2), ['--add-dir', 'C:\\Fixtures\\AgentCommons']);
   assert.ok(!codexArgs({ file: 'codex.exe' }, { mode: 'advice', options: {} }, 'C:\\w', 'C:\\d').some(a => a.includes('mcp_servers')), 'no tool set, no servers');
 
   const advice = jobToolset(withToolset(f), 'blender', 'claude', 'advice');
@@ -229,7 +229,7 @@ test('tool sets: Codex gets only the one server through -c overrides; Claude thr
   const editSet = jobToolset(withToolset(f), 'blender', 'claude', 'edit');
   const eargs = claudeArgs({ file: 'claude.exe' }, { mode: 'edit', options: { toolset: editSet } }, 'C:\\d\\mcp-toolset.json');
   assert.ok(!eargs.includes('--disallowedTools'));
-  assert.deepEqual(eargs.slice(eargs.indexOf('--add-dir'), eargs.indexOf('--add-dir') + 2), ['--add-dir', 'F:\\Temp\\Codex']);
+  assert.deepEqual(eargs.slice(eargs.indexOf('--add-dir'), eargs.indexOf('--add-dir') + 2), ['--add-dir', 'C:\\Fixtures\\AgentCommons']);
   assert.throws(() => jobToolset(withToolset(f), 'toString', 'claude', 'advice'), /no approved tool set/, 'prototype names are unknown sets, not a crash');
   assert.deepEqual(Object.keys(JSON.parse(claudeToolsetConfig(advice)).mcpServers), ['blender_3d']);
   assert.ok(!claudeArgs({ file: 'claude.exe' }, { mode: 'advice', options: {} }).includes('--mcp-config'));
@@ -265,7 +265,7 @@ test('air_get tools lists approved tool sets as K lines, and tools:<set> answers
   const s = hubStatus(withToolset(f), f.env);
   const all = toolsAirLines(s, null, 1000);
   const blenderLine = all.find(l => l.startsWith('K blender '));
-  assert.ok(blenderLine && /^K blender server=blender_3d routes=codex,claude advice=get_scene_info,session_start edit=execute_blender_code max=2 sha=[0-9a-f]{12} roots="F:\\\\Temp\\\\Codex" ""$/.test(blenderLine), all.join('\n'));
+  assert.ok(blenderLine && /^K blender server=blender_3d routes=codex,claude advice=get_scene_info,session_start edit=execute_blender_code max=2 sha=[0-9a-f]{12} roots="C:\\\\Fixtures\\\\AgentCommons" ""$/.test(blenderLine), all.join('\n'));
   assert.match(toolsAirLines(s, 'blender', 1000).join('\n'), /^K blender server=blender_3d /);
   assert.match(toolsSummaryLine(s), / toolsets=1 /);
   // A manifest object containing a shadowed builtin name must not produce duplicate K lines.

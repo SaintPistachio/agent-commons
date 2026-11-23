@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { backfillMemoryIndex } from './recall.ts';
 
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 /** Small normalized rows; list fields are JSON arrays of short strings. Each step upgrades one version. */
 export function migrate(db: DatabaseSync): void {
@@ -408,6 +408,24 @@ export function migrate(db: DatabaseSync): void {
             AND NOT EXISTS (SELECT 1 FROM job_outcomes o WHERE o.job_id=j.id AND o.kind='consult_verdict')
           ORDER BY j.seq`);
       db.exec('PRAGMA user_version = 21');
+      db.exec('COMMIT');
+    } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
+  }
+  if (version < 22) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      addColumn(db, 'usage_windows', 'early_reset_observed_at', 'TEXT');
+      addColumn(db, 'usage_windows', 'early_reset_scheduled_at', 'TEXT');
+      addColumn(db, 'usage_windows', 'early_reset_remaining_percent', 'REAL');
+      addColumn(db, 'platform_state', 'cooldown_started_at', 'TEXT');
+      addColumn(db, 'platform_state', 'cooldown_quota_windows', 'TEXT');
+      addColumn(db, 'platform_state', 'usage_blocked_identity', 'TEXT');
+      db.exec(`UPDATE platform_state SET cooldown_started_at=updated_at,
+          cooldown_quota_windows=(SELECT json_group_array(json_array(pool,window))
+            FROM usage_windows WHERE route=platform_state.adapter_id AND source LIKE 'reply%'
+              AND (remaining_percent=0 OR source LIKE '%:closed') AND resets_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+          WHERE cooldown_until IS NOT NULL AND cooldown_started_at IS NULL;
+        PRAGMA user_version = 22;`);
       db.exec('COMMIT');
     } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
   }

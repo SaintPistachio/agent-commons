@@ -1,0 +1,30 @@
+{
+  "requests": [
+    {
+      "custom_id": "synthetic-bicycle",
+      "request": {
+        "capability": "embeddings",
+        "purpose": {
+          "kind": "contract_test",
+          "description": "Validate an asynchronous embedding integration using a tiny synthetic item."
+        },
+        "model": "text-embedding-3-small",
+        "tier": "batch",
+        "payload": {"input": ["The red bicycle is outside."], "dimensions": 256}
+      }
+    },
+    {
+      "custom_id": "synthetic-pencil",
+      "request": {
+        "capability": "embeddings",
+        "purpose": {
+          "kind": "contract_test",
+          "description": "Validate unordered Batch result matching using a second tiny synthetic item."
+        },
+        "model": "text-embedding-3-small",
+        "tier": "batch",
+        "payload": {"input": ["Three blue pencils are on the desk."], "dimensions": 256}
+      }
+    }
+  ]
+}

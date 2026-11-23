@@ -1,0 +1,16 @@
+{
+  "capability": "responses",
+  "purpose": {
+    "kind": "coding_assistance",
+    "description": "Identify useful boundary cases before writing tests for a synthetic discount function; return concrete cases and expected outcomes.",
+    "deliverable": "Boundary-case test list for the current discount-function implementation"
+  },
+  "model": "gpt-6-luna",
+  "tier": "flex",
+  "max_cost_usd": "0.25",
+  "payload": {
+    "input": "For a synthetic function final_price(price, discount) = max(0, price - discount), propose a concise set of boundary tests. Assume finite nonnegative decimal inputs. Include expected values and explain any behavior that needs an explicit product decision.",
+    "max_output_tokens": 2048,
+    "reasoning": {"effort": "low"}
+  }
+}

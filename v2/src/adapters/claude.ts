@@ -6,10 +6,11 @@ import type { Json } from '../store.ts';
 import { profileGrid, type PlatformAdapter, type ProbeContext, type RouteCommand, type RunContext } from './types.ts';
 import { launchCli } from './shared.ts';
 import { claudeToolsetAllowed, claudeToolsetConfig, claudeToolsetDenied } from '../tool-hub.ts';
-import { cliCommand, launchSelectedCli, pathCopies, registryUpstream, resolveCli, retainNativeCli, retainedCliPath, runOfficialUpdater, sameCliPath, versionedCopies, type CliRoute } from './cli-freshness.ts';
+import { cliCommand, compareCliVersions, launchSelectedCli, parseCliVersion, pathCopies, registryUpstream, resolveCli, retainNativeCli, retainedCliPath, runOfficialUpdater, sameCliPath, versionedCopies, type CliRoute } from './cli-freshness.ts';
 import { catalogDiscoveries, catalogSelectionStatus, chooseClaudeModel, claudeFallback, cliEfforts, queuedCliSelection, readClaudeModels } from './cli-models.ts';
 import { cooldownUntil } from '../cooldown.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, modelPricing } from './model-pricing.ts';
+import { readClaudeUsage } from './claude-usage.ts';
 
 const ADVICE_TOOLS = ['Read', 'Grep', 'Glob'];
 const EDIT_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'MultiEdit', 'Write'];
@@ -99,6 +100,23 @@ export const claude: PlatformAdapter = {
   estimatedCost(model: string | null, effort: string | null, promptChars: number) {
     const spec = modelPricing(model ?? 'sonnet');
     return spec ? { expectedUsd: estimateExpectedCostUsd(spec, promptChars, effort), basis: 'weight' as const } : null;
+  },
+  observeUsage(ctx) {
+    if (process.env.AGENT_COMMONS_CLAUDE_USAGE !== '1') return Promise.resolve(undefined);
+    const version = ctx.selected && parseCliVersion(ctx.selected.version);
+    // Headless /usage gained a structured report in Claude Code 2.1.273.
+    const command = ctx.selected && version && compareCliVersions(version, '2.1.273') >= 0
+      ? cli.command(ctx.selected.path, ctx.options) : undefined;
+    return command ? readClaudeUsage(command) : Promise.resolve(undefined);
+  },
+  routeQuotaWindows: rows => rows.filter(row => !row.pool.startsWith('claude / ')),
+  reopenedQuotaPools(rows, known) {
+    const windows = new Set(rows.filter(row => row.pool === 'default').map(row => row.window));
+    // A known short window or a model-specific limit cannot be silently omitted by a partial reply.
+    return windows.has('5h') && windows.has('weekly')
+      && rows.every(row => !row.closed && row.remaining_percent !== null && row.remaining_percent > 0)
+      && known.filter(row => !row.stale && row.pool.startsWith('claude / ')).every(row =>
+        rows.some(fresh => fresh.pool === row.pool && fresh.window === row.window)) ? ['default'] : [];
   },
   usage: reply => Array.isArray(reply?.usage) ? reply.usage : [],
   async update(ctx) {

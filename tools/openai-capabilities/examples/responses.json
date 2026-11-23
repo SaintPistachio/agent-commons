@@ -1,0 +1,30 @@
+{
+  "capability": "responses",
+  "purpose": {
+    "kind": "application_integration",
+    "description": "Test the application's direct Responses endpoint and strict JSON extraction contract with synthetic input."
+  },
+  "model": "gpt-6-luna",
+  "tier": "flex",
+  "payload": {
+    "input": "Extract the product and quantity: Please order three blue pencils.",
+    "max_output_tokens": 512,
+    "text": {
+      "format": {
+        "type": "json_schema",
+        "name": "order_item",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "product": {"type": "string"},
+            "quantity": {"type": "integer"}
+          },
+          "required": ["product", "quantity"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+  }
+}

@@ -467,7 +467,7 @@ export function jobToolset(manifest: ToolManifest | null, name: string, route: s
   const known = [...Object.keys(BUILTIN_TOOLSETS), ...Object.keys(manifest?.toolsets ?? {})];
   const set = findToolset(manifest, name) ?? fail('TOOLSET_UNKNOWN', 400, `no approved tool set ${JSON.stringify(name)}; known: ${known.join(', ')}`);
   if (!set.routes.includes(route)) fail('TOOLSET_ROUTE', 400, `tool set ${name} runs only on ${set.routes.join(', ')}`);
-  // API jobs run their tools inside AC; code-running (edit) tool sets there wait for AJ's approval.
+  // API jobs run their tools inside Agent Commons. Code-running tool sets require operator approval.
   if (route === 'openai-api' && mode === 'edit') fail('TOOLSET_EDIT_NOT_APPROVED', 400, 'edit tool sets are not approved on openai-api');
   // Edit jobs get the edit list; advice jobs only the advice list, never the code-running tools.
   const tools = [...new Set(mode === 'edit' ? [...set.advice_tools, ...set.edit_tools] : set.advice_tools)];

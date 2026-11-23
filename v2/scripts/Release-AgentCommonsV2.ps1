@@ -1,7 +1,7 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-One-step release: test, install the checkout's HEAD into live Agent Commons, fast-forward main, push, back up.
+Tests and installs the checkout's HEAD into Agent Commons.
 
 .DESCRIPTION
 Run from the work branch's checkout (a linked worktree is fine). Steps, stopping at the first failure:
@@ -11,33 +11,40 @@ Run from the work branch's checkout (a linked worktree is fine). Steps, stopping
   3. Install-AgentCommonsV2.ps1 (database backup, release copy, `current` swap, graceful restart), then checks that
      `current` points at HEAD and /health answers.
   4. Fast-forwards main to HEAD in the main checkout (`git merge --ff-only`; never a merge commit or a reset).
-  5. Pushes main and the work branch to origin (no force), retrying network errors up to 4 times.
-  6. Copies the backups off the drive (automation\Backup-AcOffDrive.ps1, without a second database backup).
-  7. Records a checkpoint in Agent Commons (rev, branch, what ran) as the -Connection app.
--NoPush skips step 5, -NoMain skips steps 4 and 5. Installing into live Agent Commons is the point of this script:
-run it only when the user has approved that release.
+  5. With -Push, pushes main and the work branch to origin without force.
+  6. With an off-drive destination configured, copies the backups off the drive.
+  7. With -Project and -Connection, records a checkpoint in the specified local project.
+Use -WhatIf to preview or -NoMain to upgrade without promoting main.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
   [string]$SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+  [string]$DataRoot,
+  [ValidateRange(1, 65535)][int]$Port = 4727,
+  [string]$Project,
   [string]$Task,
-  [string]$Connection = 'ac-scheduler',
+  [string]$Connection,
   [switch]$SkipTests,
   [string]$SkipReason,
   [switch]$NoMain,
+  [switch]$Push,
   [switch]$NoPush,
   [switch]$AllowDroppingLive
 )
 $ErrorActionPreference = 'Stop'
 if ($SkipTests -and -not "$SkipReason".Trim()) { throw '-SkipTests needs -SkipReason "why the tests are skipped"; the reason is recorded in the release checkpoint.' }
 if ($SkipReason -and -not $SkipTests) { throw '-SkipReason is only used with -SkipTests.' }
+if ($Push -and ($NoPush -or $NoMain)) { throw '-Push requires promotion of main and is incompatible with -NoPush.' }
+if ([bool]$Project -ne [bool]$Connection -or ($Task -and -not $Project)) { throw 'Recording a checkpoint requires both -Project and -Connection.' }
+. (Join-Path $PSScriptRoot 'automation\Ac-BackupCommon.ps1')
 function Step([string]$text) { Write-Host "== $text" -ForegroundColor Cyan }
 function Invoke-Git { param([Parameter(ValueFromRemainingArguments)][string[]]$GitArgs) & git @GitArgs; if ($LASTEXITCODE) { throw "git $($GitArgs -join ' ') failed ($LASTEXITCODE)" } }
 
 $commit = (git -C $SourceRoot rev-parse HEAD).Trim()
 $branch = (git -C $SourceRoot rev-parse --abbrev-ref HEAD).Trim()
 $mainCheckout = Split-Path (git -C $SourceRoot rev-parse --path-format=absolute --git-common-dir).Trim() -Parent
-$dataRoot = Join-Path (Split-Path $mainCheckout -Parent) ((Split-Path $mainCheckout -Leaf) + '-data')
+$DataRoot = Resolve-AcDataRoot $PSScriptRoot $DataRoot
+if (-not $PSCmdlet.ShouldProcess($DataRoot, "Install commit $commit")) { return }
 $node = (Get-Command node.exe).Source
 $done = @()
 
@@ -77,11 +84,11 @@ if (-not $SkipTests) {
 } else { $done += "tests skipped ($($SkipReason.Trim()))" }
 
 Step '3. Install into live Agent Commons'
-& (Join-Path $PSScriptRoot 'Install-AgentCommonsV2.ps1') -SourceRoot $SourceRoot
+& (Join-Path $PSScriptRoot 'Install-AgentCommonsV2.ps1') -SourceRoot $SourceRoot -DataRoot $DataRoot -Port $Port
 $expected = [IO.Path]::GetFullPath((Join-Path $dataRoot "app\$commit")).TrimEnd('\')
 $target = [IO.Path]::GetFullPath("$((Get-Item (Join-Path $dataRoot 'current')).Target)").TrimEnd('\')
 if ($target -ne $expected) { throw "current points at $target, not $expected" }
-$health = Invoke-RestMethod 'http://127.0.0.1:4727/health' -TimeoutSec 5
+$health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 5
 $done += "installed (schema $($health.schema_version))"
 
 if (-not $NoMain) {
@@ -91,7 +98,7 @@ if (-not $NoMain) {
   else { Invoke-Git -C $SourceRoot fetch . "${commit}:main" }  # main is not checked out: move the ref, fast-forward only
   if ((git -C $SourceRoot rev-parse main).Trim() -ne $commit) { throw "main is not at the tested commit $commit after the fast-forward" }
   $done += 'main fast-forwarded'
-  if (-not $NoPush) {
+  if ($Push) {
     Step '5. Push main and the work branch'
     # Push the pinned, tested commit to explicit destinations: no '+', no configured push refspecs, no tags.
     foreach ($ref in @('main', $branch) | Select-Object -Unique) {
@@ -107,14 +114,19 @@ if (-not $NoMain) {
   }
 }
 
-Step '6. Off-drive backup copy'
-& (Join-Path $PSScriptRoot 'automation\Backup-AcOffDrive.ps1') -DataRoot $dataRoot -NoFreshBackup
-if ($LASTEXITCODE) { Write-Warning 'off-drive copy failed (see its log)'; $done += 'off-drive copy FAILED' } else { $done += 'backed up off-drive' }
+$backupConfig = Read-AcBackupConfig $DataRoot
+if ($backupConfig.offDriveDestination) {
+  Step '6. Off-drive backup copy'
+  & (Join-Path $PSScriptRoot 'automation\Backup-AcOffDrive.ps1') -DataRoot $DataRoot -NoFreshBackup
+  if ($LASTEXITCODE) { Write-Warning 'off-drive copy failed (see its log)'; $done += 'off-drive copy FAILED' } else { $done += 'backed up off-drive' }
+}
 
-Step '7. Record in Agent Commons'
-$reportArgs = @((Join-Path $PSScriptRoot 'automation\ac-report.mjs'), '--connection', $Connection, '--rev', $commit, '--br', $branch,
-  '--summary', "Released $($commit.Substring(0, 8)) from ${branch}: $($done -join ', ').")
-if ($Task) { $reportArgs += @('--task', $Task) }
-& $node @reportArgs
-if ($LASTEXITCODE) { Write-Warning 'the Agent Commons checkpoint was not recorded' }
+if ($Project) {
+  Step '7. Record in Agent Commons'
+  $reportArgs = @((Join-Path $PSScriptRoot 'automation\ac-report.mjs'), '--home', $DataRoot, '--project', $Project,
+    '--connection', $Connection, '--rev', $commit, '--br', $branch, '--summary', "Released $($commit.Substring(0, 8)) from ${branch}: $($done -join ', ').")
+  if ($Task) { $reportArgs += @('--task', $Task) }
+  & $node @reportArgs
+  if ($LASTEXITCODE) { Write-Warning 'the Agent Commons checkpoint was not recorded' }
+}
 "Release complete: $($done -join ', ')"

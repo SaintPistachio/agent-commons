@@ -215,6 +215,18 @@ export const codex: PlatformAdapter = {
   modelSourceStatus: version => catalogSelectionStatus(readCodexModels(version)),
   validate: () => ({}),
   observeUsage: readAppServerUsage,
+  reopenedQuotaPools(rows, known) {
+    const primary = rows.filter(row => row.pool === 'codex');
+    if (primary.some(row => row.closed || row.remaining_percent === null || row.remaining_percent <= 0)) return [];
+    const windows = new Set(primary.map(row => row.window));
+    if (known.some(row => row.pool === 'codex' && row.window === 'exhaustion')) {
+      if (!windows.has('300m') || rows.some(row => row.closed || row.remaining_percent === null || row.remaining_percent <= 0)) return [];
+      if (known.some(row => !row.stale && row.window !== 'exhaustion'
+        && !rows.some(fresh => fresh.pool === row.pool && fresh.window === row.window))) return [];
+    }
+    return windows.has('10080m') && known.filter(row => row.pool === 'codex' && row.window !== 'exhaustion')
+      .every(row => windows.has(row.window)) ? ['codex'] : [];
+  },
   usage: reply => reply.usage,
   consumption: reply => reply.consumption,
   launch(job, ctx) {
