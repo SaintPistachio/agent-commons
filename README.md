@@ -4,12 +4,31 @@ Agent Commons is a local service that lets Claude, Codex, and Antigravity share 
 
 ## Quickstart on Windows
 
-Install Node.js 24.18.0 or a newer Node.js 24 release, PowerShell 7, and Git. Clone this repository and open PowerShell from the checkout. Choose a writable, non-synchronized data directory outside the checkout. Use a different port if 4727 is already in use.
+Install Node.js 24.18.0 or a newer Node.js 24 release, PowerShell 7, and Git. Clone this repository and open PowerShell from the checkout as the Windows user who will run the service. Use a different port if 4727 is already in use.
+
+Create a new private data directory before initializing the service. The setup restricts the directory and new files inside it to your Windows account and LocalSystem. If the path already exists, choose a new directory under your private local application-data folder.
 
 ```powershell
 $acPort = 4727
-$acHome = 'C:\Projects\AgentCommons-data'
+$acHome = Join-Path $env:LOCALAPPDATA 'AgentCommons-data'
 $acProject = 'C:\Projects\SampleProject'
+. .\v2\scripts\automation\Ac-BackupCommon.ps1
+Assert-AcNotOneDrive $acHome
+$acPhysicalHome = Resolve-AcPhysicalPath $acHome
+if ($acPhysicalHome -notmatch '^[A-Za-z]:\\' -or
+    [IO.DriveInfo]::new([IO.Path]::GetPathRoot($acPhysicalHome)).DriveType -ne [IO.DriveType]::Fixed) {
+    throw 'Choose a private data directory on a local fixed drive.'
+}
+if (Test-Path -LiteralPath $acHome) {
+    throw 'Choose a new data directory for this quickstart.'
+}
+Set-AcPrivateDirectory $acHome -Create
+Assert-AcPrivateDirectory $acHome
+```
+
+After the directory check succeeds, run these commands in the same PowerShell window.
+
+```powershell
 npm.cmd ci
 New-Item -ItemType Directory -Path $acProject -Force | Out-Null
 node v2/src/cli.ts init --home $acHome --port $acPort
@@ -21,7 +40,9 @@ node v2/src/cli.ts serve --home $acHome --port $acPort
 The service listens on `127.0.0.1`. To verify that the client can reach the sample project, run the following from a second PowerShell window in the checkout. Use the same paths as above.
 
 ```powershell
-node v2/src/cli.ts air-sync --connection 'C:\Projects\AgentCommons-data\connections\sample-client.json' --root 'C:\Projects\SampleProject'
+$acHome = Join-Path $env:LOCALAPPDATA 'AgentCommons-data'
+$acConnection = Join-Path $acHome 'connections\sample-client.json'
+node v2/src/cli.ts air-sync --connection $acConnection --root 'C:\Projects\SampleProject'
 ```
 
 The reply should identify the `Sample` project. For an MCP client, configure the stdio command `node` with the absolute path to `v2/src/mcp.ts`, then `--connection` and the absolute path to the client connection file. Create a separate client connection for each app. Keep connection files private because they contain bearer tokens.
