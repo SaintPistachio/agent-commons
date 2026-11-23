@@ -20,7 +20,8 @@ import { compareCostEfficiency, modelPricing } from './adapters/model-pricing.ts
 import { INTENTS, EFFORTS, type AdapterCapabilities, type ProbeResult, type UsageObservation, type UsageWindow } from './adapters/types.ts';
 import { git, RESULT_LIMIT } from './adapters/shared.ts';
 import { resolvePatchCheck } from './patch-check.ts';
-import { buildContext, realDirectory, redactSecrets, resolveContextRoot, same } from './context.ts';
+import { buildContext, inside, realDirectory, redactSecrets, resolveContextRoot, same } from './context.ts';
+import { releaseWorkerPolicy, workerPolicyMessage, type WorkerPolicy } from './worker-policy.ts';
 import { activeDecisionsSql, indexMemoryRow, recallProjectMemory } from './recall.ts';
 import { inferSelection } from './selection.ts';
 import { cooldownUntil } from './cooldown.ts';
@@ -98,8 +99,10 @@ export class Store {
   readonly home: string;
   /** Where the apps' own configuration lives, for the shared tool hub (tests replace it). */
   toolsEnv: HubEnv = { userHome: os.homedir() };
-  constructor(home: string) {
+  private readonly workerPolicy: WorkerPolicy;
+  constructor(home: string, workerPolicy: WorkerPolicy = releaseWorkerPolicy) {
     this.home = home;
+    this.workerPolicy = workerPolicy;
     fs.mkdirSync(path.join(home, 'artifacts'), { recursive: true });
     this.db = new DatabaseSync(path.join(home, 'commons.sqlite'));
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
@@ -350,15 +353,50 @@ export class Store {
     const projects = root ? rows.filter(row => row.root && (norm(root).startsWith(norm(row.root) + path.sep) || norm(root) === norm(row.root))) : rows;
     return { projects };
   }
-  op_project_create(_actor: Actor, input: Json): Json {
+  private canonicalProjectRoot(root: string): string {
+    const canonical = realDirectory(root) ?? fail('PROJECT_ROOT_INVALID', 400, 'The project root must be an existing directory.');
+    const home = realDirectory(this.home) ?? path.resolve(this.home);
+    if (inside(same(home), same(canonical)) || inside(same(canonical), same(home)))
+      fail('PROJECT_ROOT_INVALID', 400, 'The project root must not overlap the Agent Commons data directory.');
+    return canonical;
+  }
+  private rootGitDirectory(root: string): string | null {
+    const marker = fs.lstatSync(path.join(root, '.git'), { throwIfNoEntry: false });
+    if (!marker || (!marker.isFile() && !marker.isDirectory())) return null;
+    try {
+      const top = realDirectory(git(root, ['rev-parse', '--show-toplevel']));
+      if (!top || same(top) !== same(root)) return null;
+      return realDirectory(git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir'])) ?? null;
+    } catch { return null; }
+  }
+  op_project_create(actor: Actor, input: Json): Json {
+    if (actor.role !== 'operator') fail('OPERATOR_REQUIRED', 403, 'Only the operator can register a project.');
     const root = optText(input.root, 'root', 4096);
-    const resolved = root ? path.resolve(root) : null;
-    if (resolved && this.db.prepare('SELECT 1 FROM projects WHERE root=?').get(resolved)) fail('PROJECT_ROOT_EXISTS', 409);
+    const resolved = root ? this.canonicalProjectRoot(root) : null;
+    if (root && resolved && same(path.resolve(root)) !== same(resolved))
+      fail('PROJECT_ROOT_INVALID', 400, 'Give the physical directory when registering a project.');
+    if (resolved && (this.db.prepare('SELECT root FROM projects WHERE root IS NOT NULL').all() as { root: string }[])
+      .some(row => same(realDirectory(row.root) ?? path.resolve(row.root)) === same(resolved))) fail('PROJECT_ROOT_EXISTS', 409);
     const at = now(), row = { id: randomUUID(), name: text(input.name, 'name', 256), objective: optText(input.objective, 'objective') ?? '',
       root: resolved, next_action: optText(input.next_action, 'next_action', 4096), created_at: at, updated_at: at };
-    this.db.prepare('INSERT INTO projects(id,name,objective,root,next_action,created_at,updated_at) VALUES(?,?,?,?,?,?,?)')
-      .run(row.id, row.name, row.objective, row.root, row.next_action, at, at);
+    this.db.prepare('INSERT INTO projects(id,name,objective,root,approved_root,approved_git_dir,next_action,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
+      .run(row.id, row.name, row.objective, row.root, resolved, resolved ? this.rootGitDirectory(resolved) : null, row.next_action, at, at);
     return { project: row };
+  }
+  /** Local operator CLI only. This is not an RPC operation. */
+  approveProjectRoot(actor: Actor, projectId: string, root: string): Json {
+    if (actor.role !== 'operator') fail('OPERATOR_REQUIRED', 403, 'Only the operator can approve a project root.');
+    return this.transaction(() => {
+      const project = this.project(projectId);
+      const canonical = this.canonicalProjectRoot(root);
+      const registered = project.root ? realDirectory(project.root) : undefined;
+      if (!registered || same(registered) !== same(canonical) || same(path.resolve(root)) !== same(canonical))
+        fail('PROJECT_ROOT_MISMATCH', 409, 'Give the explicit physical directory registered to this project.');
+      this.db.prepare('UPDATE projects SET approved_root=?, approved_git_dir=?, updated_at=? WHERE id=?')
+        .run(canonical, this.rootGitDirectory(canonical), now(), project.id);
+      this.emit('project', 'project_root_approved', project.id, actor.id);
+      return { id: project.id, root: project.root, approved_root: canonical };
+    });
   }
   private projectDecisionTiers(projectId: string, limit: number): Json[] {
     const active = activeDecisionsSql();
@@ -650,6 +688,8 @@ export class Store {
     const skipped: string[] = [], ready: Seat[] = [];
     for (const seat of chosen) {
       const r = status.get(seat.route)!;
+      const refusal = this.workerPolicy(seat.route, null);
+      if (refusal) { skipped.push(`${seat.seat}:${refusal}`); continue; }
       if (r.state !== 'verified') skipped.push(`${seat.seat}:${r.state}`); else if (r.cooldownUntil) skipped.push(`${seat.seat}:cooldown`); else ready.push(seat);
     }
     if (!ready.length) fail('ROOM_SEATS_UNAVAILABLE', 409, `no seat can take this round: ${skipped.join(' ')}`);
@@ -886,14 +926,16 @@ export class Store {
     const platform = adapter(requested) ?? allAdapters().find(a => a.capabilities.short === requested)
       ?? fail('ROUTE_UNAVAILABLE', 400, `route must be auto or one of ${adapterIds().join(', ')} (or ${allAdapters().map(a => a.capabilities.short).join(', ')})`);
     const route = platform.capabilities.id;
+    const toolsName = optText(input.tools, 'tools', 64);
+    const refusal = this.workerPolicy(route, toolsName);
+    if (refusal) fail(refusal, 403, workerPolicyMessage(refusal));
     if (mode !== 'advice' && mode !== 'edit') fail('INVALID_INPUT', 400, 'mode must be advice or edit');
     if (intent === 'edit' && mode !== 'edit') fail('INVALID_INPUT', 400, 'intent edit is an edit job; omit mode or set mode edit');
     // Each adapter's declared limits are enforced here, so a new platform gets them without code of its own.
     const caps = platform.capabilities;
     if (!caps.modes.includes(workerMode)) fail('INVALID_INPUT', 400, `${route} jobs are ${caps.modes.join(' or ')} only`);
-    if (!project.root) fail('PROJECT_ROOT_REQUIRED', 400, 'jobs run in the project root; register the project with a root');
+    const projectRoot = this.approvedProjectRoot(project.id);
     // tools=<name>: an operator-approved tool set from the shared manifest, snapshotted (with its hash) into the job.
-    const toolsName = optText(input.tools, 'tools', 64);
     const toolset = toolsName ? jobToolset(isBuiltinToolset(toolsName) ? null : loadManifest(this.home), toolsName, route, mode) : null;
     const minutes = input.timeout_minutes ?? caps.defaultTimeoutMinutes;
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) fail('INVALID_INPUT', 400, 'timeout_minutes must be 1-240');
@@ -937,18 +979,20 @@ export class Store {
     if (platform.capabilities.billing === 'paid' && refs.some(ref => ref.startsWith('diff:')))
       fail('CTX_NOT_ALLOWED', 400, 'paid routes take no diff context; name the files instead');
     const cwd = optText(input.cwd, 'cwd', 4096);
-    const contextRoot = cwd ? resolveContextRoot(project.root, cwd, [this.home]) : project.root;
+    const contextRoot = cwd ? resolveContextRoot(projectRoot, cwd, [this.home]) : projectRoot;
     if (cwd) options.cwd = contextRoot;
+    if (refs.some(ref => ref.startsWith('diff:'))) this.assertJobRepository(project.id, contextRoot);
     if (patchEdit) {
       const turns = input.max_turns ?? 2;
       if (!Number.isInteger(turns) || turns < 1 || turns > 4) fail('INVALID_INPUT', 400, 'patch edit max_turns must be 1 to 4');
-      const check = resolvePatchCheck(this.home, project.root, checkName!);
+      const check = resolvePatchCheck(this.home, projectRoot, checkName!);
       let base: string;
       try {
         const top = (cwd: string) => realDirectory(git(cwd, ['rev-parse', '--show-toplevel']));
         const common = (cwd: string) => realDirectory(git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
-        const projectCommon = common(project.root);
-        if (same(top(project.root) ?? '') !== same(realDirectory(project.root) ?? '') || same(top(contextRoot) ?? '') !== same(contextRoot)
+        const projectCommon = this.assertJobRepository(project.id, projectRoot);
+        this.assertJobRepository(project.id, contextRoot);
+        if (same(top(projectRoot) ?? '') !== same(projectRoot) || same(top(contextRoot) ?? '') !== same(contextRoot)
           || !projectCommon || same(common(contextRoot) ?? '') !== same(projectCommon))
           return fail('PATCH_BASE_OUTSIDE_PROJECT', 400, 'select the registered repository root or the root of one of its linked worktrees');
         base = git(contextRoot, ['rev-parse', '--verify', 'HEAD^{commit}']);
@@ -1100,8 +1144,9 @@ export class Store {
     if (refs.length > 20) return refuse('INVALID_INPUT');
     if (paid && refs.some(ref => ref.startsWith('diff:'))) return refuse('CTX_NOT_ALLOWED');
     try {
-      const projectId = job.project_id, projectRoot = this.project(projectId).root;
+      const projectId = job.project_id, projectRoot = this.approvedProjectRoot(projectId);
       const root = o.cwd ? resolveContextRoot(projectRoot, o.cwd, [this.home]) : projectRoot;
+      if (refs.some(ref => ref.startsWith('diff:'))) this.assertJobRepository(projectId, root);
       const context = buildContext(refs, {
         root,
         deny: [this.home],
@@ -1366,6 +1411,10 @@ export class Store {
   /** Runner: atomically move the oldest queued job whose route has a free slot to running. */
   claimQueuedJob(routeLimits: Record<string, number>, globalLimit: number): Json | null {
     return this.transaction(() => {
+      for (const row of this.db.prepare("SELECT id, route, mode, options FROM jobs WHERE status='queued'").all()) {
+        const refusal = this.queuedWorkerRefusal(jobRow(row)!);
+        if (refusal) this.failBeforeDispatch(String(row.id), refusal);
+      }
       const running = this.db.prepare("SELECT route, count(*) n FROM jobs WHERE status='running' GROUP BY route").all() as Json[];
       const counts = Object.fromEntries(running.map(r => [r.route, Number(r.n)]));
       if (running.reduce((sum, r) => sum + Number(r.n), 0) >= globalLimit) return null;
@@ -1391,6 +1440,14 @@ export class Store {
       }
       return null;
     });
+  }
+  queuedWorkerRefusal(job: Json): string | null {
+    const set = job.options?.toolset;
+    const builtin = set?.builtin === 'project' && set.name === 'project' && set.server === 'builtin';
+    return this.workerPolicy(job.route, set ? (builtin ? 'project' : 'external') : null, job.mode, !!job.options?.patch_edit);
+  }
+  failBeforeDispatch(id: string, code: string): void {
+    this.updateJob(id, { status: 'failed', finished_at: now(), error: code });
   }
   /** Runner: record progress or the outcome. Only listed columns can change. */
   updateJob(id: string, fields: Json): Json {
@@ -1780,7 +1837,7 @@ export class Store {
   routeLine(): string {
     const flag: Record<string, string> = { blocked: 'blk', drifted: 'drift', unavailable: 'na', not_probed: 'na' };
     return 'R ' + this.routeStatus().map(r => {
-      const flags = [flag[r.state], r.cooldownUntil ? `cool@${r.cooldownUntil.slice(0, 16)}Z` : '', r.billing === 'paid' ? 'paid' : ''].filter(Boolean);
+      const flags = [this.workerPolicy(r.id, null) ? 'blk' : flag[r.state], r.cooldownUntil ? `cool@${r.cooldownUntil.slice(0, 16)}Z` : '', r.billing === 'paid' ? 'paid' : ''].filter(Boolean);
       return `${r.short}=${r.running}/${r.limit}${r.queued ? `+${r.queued}q` : ''}${flags.length ? ':' + flags.join(',') : ''}`;
     }).join(' ');
   }
@@ -1790,7 +1847,7 @@ export class Store {
   /** route_hints: idle, verified, non-paid routes outside a family (default: the caller's), as short names. */
   op_route_hints(actor: Actor, input: Json): Json {
     const family = input.exclude_family ?? this.actorFamily(actor.id), mode = input.mode ?? 'advice';
-    const routes = this.routeStatus().filter(r => r.state === 'verified' && !r.cooldownUntil && r.billing !== 'paid' && r.family !== family
+    const routes = this.routeStatus().filter(r => !this.workerPolicy(r.id, null) && r.state === 'verified' && !r.cooldownUntil && r.billing !== 'paid' && r.family !== family
       && r.running < r.limit && r.queued === 0 && adapter(r.id)!.capabilities.modes.includes(mode));
     return { air: routes.map(r => r.short).join(','), routes: routes.map(r => r.id) };
   }
@@ -1872,6 +1929,8 @@ export class Store {
     const skipped: string[] = [], eligible: Candidate[] = [];
     const hasProfiles = this.hasTable('platform_profiles'), hasState = this.hasTable('platform_state');
     for (const [order, r] of this.routeStatus().entries()) {
+      const workerRefusal = this.workerPolicy(r.id, toolsetName);
+      if (workerRefusal) { skipped.push(`${r.short}:${workerRefusal}`); continue; }
       const caps = adapter(r.id)!.capabilities;
       const quota = r.state === 'verified' && !r.cooldownUntil ? this.routeQuotaState(r.id) : null;
       const storedProfile = hasProfiles
@@ -1975,8 +2034,12 @@ export class Store {
       } catch (e) { pickError = String((e as Error)?.message ?? e); }
     } else {
       const target = adapter(requestedRoute) ?? allAdapters().find(a => a.capabilities.short === requestedRoute);
-      pickedRoute = target?.capabilities.id ?? null;
-      if (!pickedRoute) pickError = `unknown route ${requestedRoute}`;
+      if (!target) pickError = `unknown route ${requestedRoute}`;
+      else {
+        const refusal = this.workerPolicy(target.capabilities.id, optText(input.tools, 'tools', 64));
+        if (refusal) pickError = `${refusal}: ${workerPolicyMessage(refusal)}`;
+        else pickedRoute = target.capabilities.id;
+      }
     }
     let resolved: Json | null = null;
     let budgetError: string | null = null;
@@ -3013,6 +3076,31 @@ export class Store {
       .all() as Json[]).map(jobRow) as Json[];
   }
   projectRoot(projectId: string): string | null { return (this.project(projectId).root as string | null) ?? null; }
+  approvedProjectRoot(projectId: string): string {
+    const project = this.project(projectId);
+    if (!project.root) return fail('PROJECT_ROOT_REQUIRED', 400, 'Register a project with a root to run jobs.');
+    if (!project.approved_root)
+      return fail('PROJECT_ROOT_UNAPPROVED', 403, 'The operator must approve this root with project-approve-root.');
+    const actual = this.canonicalProjectRoot(project.root);
+    if (same(actual) !== same(project.approved_root))
+      return fail('PROJECT_ROOT_CHANGED', 409, 'The project root no longer resolves to the approved directory.');
+    return actual;
+  }
+  /** Git discovery cannot use a repository above the approved root or silently change linked repository metadata. */
+  assertJobRepository(projectId: string, cwd: string): string {
+    const root = this.approvedProjectRoot(projectId);
+    const project = this.project(projectId);
+    try {
+      const top = realDirectory(git(cwd, ['rev-parse', '--show-toplevel']));
+      const common = realDirectory(git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+      const gitDir = realDirectory(git(cwd, ['rev-parse', '--absolute-git-dir']));
+      if (top && common && gitDir && inside(same(top), same(cwd)) && inside(same(common), same(gitDir))
+        && (inside(same(root), same(top)) || (project.approved_git_dir && same(resolveContextRoot(root, top, [this.home])) === same(top)))
+        && ((inside(same(root), same(top)) && same(common) === same(path.join(top, '.git')))
+          || (project.approved_git_dir && same(common) === same(project.approved_git_dir)))) return common;
+    } catch { /* Use the same error for missing and foreign repositories. */ }
+    return fail('PROJECT_REPOSITORY_UNAPPROVED', 403, 'The Git repository is outside the approved project or its linked worktrees.');
+  }
 
   recordPatchTurnContext(job: Json, turn: number, context: string): void {
     const artifact = this.storeArtifact(job.project_id, SYSTEM_ACTOR.id, `${this.handleOf('j', job.id)}-patch-turn-${turn}.md`,

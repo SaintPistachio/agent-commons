@@ -7,14 +7,15 @@ import { test, type TestContext } from 'node:test';
 import { antigravity } from '../src/adapters/antigravity.ts';
 import { claude } from '../src/adapters/claude.ts';
 import { Prober } from '../src/prober.ts';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 
 function fixture(t: TestContext) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-model-freshness-'));
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-model-freshness-'));
+  const home = path.join(fixtureRoot, 'data');
   const store = new Store(home);
   t.after(() => {
     store.close();
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
   const write = (file: string, value: unknown) => fs.writeFileSync(file, JSON.stringify(value));
   return { home, store, write };
@@ -82,7 +83,9 @@ test('Antigravity checks an overdue catalog when the verified route becomes idle
   assert.equal(store.modelDiscoveryState('antigravity')?.error, null);
   const before = store.modelDiscoveryState('antigravity')?.last_attempt_at;
   const actor = store.createActor('catalog-operator', 'participant', 'catalog-operator').actor;
-  const project = store.call(actor, 'project_create', { name: 'Inventory', root: home, operation_id: randomUUID() }).project;
+  const repo = path.join(path.dirname(home), 'repo');
+  fs.mkdirSync(repo);
+  const project = store.call(actor, 'project_create', { name: 'Inventory', root: repo, operation_id: randomUUID() }).project;
   const job = store.call(actor, 'job_submit', {
     project_id: project.id, route: 'antigravity', prompt: 'fixture', operation_id: randomUUID(),
   }).job;

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { applyInstall, claudeToolsetConfig, codexServerNames, codexServerToml, hubStatus, jobToolset, loadManifest, parseManifest, planInstall, toolsAirLines, toolsSummaryLine, type HubEnv } from '../src/tool-hub.ts';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { codexArgs } from '../src/adapters/codex.ts';
 import { claudeArgs } from '../src/adapters/claude.ts';
 
@@ -14,6 +14,7 @@ function fixture(t: TestContext) {
   t.after(() => { while (closers.length) closers.pop()!(); rmSync(root, { recursive: true, force: true }); });
   const home = join(root, 'ac'), user = join(root, 'user'), skills = join(root, 'skills');
   mkdirSync(home, { recursive: true });
+  mkdirSync(join(root, 'proj'));
   for (const name of ['blender-3d', 'playwright']) {
     mkdirSync(join(skills, name), { recursive: true });
     writeFileSync(join(skills, name, 'SKILL.md'), `---\nname: ${name}\ndescription: Does ${name} things.\n---\nBody\n`);
@@ -242,7 +243,6 @@ test('tool sets: submit snapshots the set, and admission holds a third Blender j
   closers.push(() => store.close());
   store.createActor('claude-desktop', 'participant', 'claude-desktop');
   const actor: Actor = { id: 'claude-desktop', name: 'claude-desktop', role: 'participant' };
-  mkdirSync(join(f.root, 'proj'));
   const project = (store.op_project_create(actor, { name: 'P', root: join(f.root, 'proj') }) as any).project;
   const submit = (route: string, mode = 'advice') => store.op_job_submit(actor, { project_id: project.id, route, mode, prompt: 'look', tools: 'blender' }).job;
   const a = submit('codex'), b = submit('claude', 'edit'), c = submit('codex'), plain = store.op_job_submit(actor, { project_id: project.id, route: 'codex', prompt: 'x' }).job;

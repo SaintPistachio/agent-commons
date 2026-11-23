@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { backfillMemoryIndex } from './recall.ts';
 
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 /** Small normalized rows; list fields are JSON arrays of short strings. Each step upgrades one version. */
 export function migrate(db: DatabaseSync): void {
@@ -427,6 +427,14 @@ export function migrate(db: DatabaseSync): void {
           WHERE cooldown_until IS NOT NULL AND cooldown_started_at IS NULL;
         PRAGMA user_version = 22;`);
       db.exec('COMMIT');
+    } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
+  }
+  if (version < 23) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      addColumn(db, 'projects', 'approved_root', 'TEXT');
+      addColumn(db, 'projects', 'approved_git_dir', 'TEXT');
+      db.exec('PRAGMA user_version = 23; COMMIT');
     } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
   }
 }

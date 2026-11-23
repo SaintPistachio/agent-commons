@@ -10,7 +10,7 @@ import { claude } from '../src/adapters/claude.ts';
 import { parseCodexAppServerRateLimits } from '../src/adapters/codex-limits.ts';
 import { UsageContractViolation, type UsageObservation, type UsageWindow } from '../src/adapters/types.ts';
 import { Prober } from '../src/prober.ts';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { migrate, SCHEMA_VERSION } from '../src/schema.ts';
 
 const iso = (offset: number) => new Date(Date.now() + offset).toISOString();
@@ -22,6 +22,7 @@ test('schema 22 preserves quota readings and carries forward an active schema 21
   t.after(() => db.close());
   db.exec(`
     CREATE TABLE platform_state (adapter_id TEXT PRIMARY KEY, cooldown_until TEXT, updated_at TEXT);
+    CREATE TABLE projects (id TEXT PRIMARY KEY);
     CREATE TABLE usage_windows (route TEXT, pool TEXT, window TEXT, source TEXT, remaining_percent REAL, resets_at TEXT);
     PRAGMA user_version = 21;
   `);
@@ -56,7 +57,7 @@ test('stored quota timestamps are canonical UTC even when the provider sends an 
 
 function fixture(t: TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-usage-polling-'));
-  const store = new Store(dir);
+  const store = new Store(path.join(dir, 'data'));
   t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return { dir, store };
 }

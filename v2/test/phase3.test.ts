@@ -7,7 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, CommonsError, type Actor } from '../src/store.ts';
+import { Store, CommonsError, type Actor } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 import { AIR_WORKER_PRIMER } from '../src/air/primer.ts';
 

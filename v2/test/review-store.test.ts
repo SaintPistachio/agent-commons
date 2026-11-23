@@ -6,15 +6,16 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, type Json } from '../src/store.ts';
+import { Store, type Json } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 
 function fixture(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-review-store-'));
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-review-store-'));
+  const home = path.join(fixtureRoot, 'data');
   const store = new Store(home);
-  t.after(() => { store.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { store.close(); fs.rmSync(fixtureRoot, { recursive: true, force: true }); });
   return { home, store };
 }
 
@@ -55,7 +56,9 @@ test('newerAvailable compares complete model lines even with broad stored famili
 test('a usage-recording failure cannot prevent a terminal job update', t => {
   const { home, store } = fixture(t);
   const { actor } = store.createActor('review-test', 'participant', 'review-test');
-  const project = store.call(actor, 'project_create', { name: 'Review', root: home, operation_id: randomUUID() }).project;
+  const repo = path.join(path.dirname(home), 'repo');
+  fs.mkdirSync(repo);
+  const project = store.call(actor, 'project_create', { name: 'Review', root: repo, operation_id: randomUUID() }).project;
   const job = store.call(actor, 'job_submit', {
     project_id: project.id, route: 'antigravity', prompt: 'test', operation_id: randomUUID(),
   }).job;

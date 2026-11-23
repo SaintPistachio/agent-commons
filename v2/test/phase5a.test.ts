@@ -6,16 +6,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
 import { SCHEMA_VERSION } from '../src/schema.ts';
 import { consultStats } from '../src/ops.ts';
 
 function fixture(t: any, verified = ['claude', 'codex', 'openai-api', 'antigravity']) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-p5a-'));
-  const repo = path.join(home, 'repo'); fs.mkdirSync(repo);
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-p5a-'));
+  const home = path.join(fixtureRoot, 'data');
+  const repo = path.join(fixtureRoot, 'repo'); fs.mkdirSync(repo);
   const store = new Store(home);
-  t.after(() => { try { store.close(); } catch {} fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { try { store.close(); } catch {} fs.rmSync(fixtureRoot, { recursive: true, force: true }); });
   const claude: Actor = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   store.setActorTags('claude-desktop', 'anthropic', 'claude');
   for (const id of verified) store.recordProbe(adapter(id)!.capabilities, { state: 'verified' });

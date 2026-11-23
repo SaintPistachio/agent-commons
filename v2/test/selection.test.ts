@@ -5,19 +5,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
 import { EFFORTS, INTENTS } from '../src/adapters/types.ts';
 import { inferSelection, type SelectionInput } from '../src/selection.ts';
 
 function fixture(t: TestContext) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-selection-'));
-  const repo = path.join(home, 'repo');
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-selection-'));
+  const home = path.join(fixtureRoot, 'data');
+  const repo = path.join(fixtureRoot, 'repo');
   fs.mkdirSync(repo);
   let store = new Store(home);
   t.after(() => {
     try { store.close(); } catch {}
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
   const actor: Actor = store.createActor('selection-test', 'participant', 'selection-test').actor;
   store.recordProbe(adapter('openai-api')!.capabilities, { state: 'verified', cliVersion: '1.0' });

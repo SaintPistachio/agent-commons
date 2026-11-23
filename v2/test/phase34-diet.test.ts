@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 import { adapter } from '../src/adapters/registry.ts';
 import { parsePacket } from '../src/air/parser.ts';
@@ -238,7 +238,7 @@ test("patch.ts applies chained edits, preserves CRLF, rolls back on mismatch unl
 
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { startServer } from "../src/server.ts";
+import { startServer } from "./fixtures/service.ts";
 
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 

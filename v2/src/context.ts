@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fail } from './errors.ts';
+import { jobGitEnvironment } from './git-environment.ts';
 
 export interface ContextSources {
   root: string;
@@ -83,8 +84,8 @@ export function resolveContextRoot(projectRoot: string, cwd: string, deny: strin
   if (!inside(same(root), same(real))) {
     let listing: string;
     try {
-      listing = execFileSync('git', ['-C', root, 'worktree', 'list', '--porcelain', '-z'], {
-        encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      listing = execFileSync('git', ['-C', root, '-c', 'core.fsmonitor=false', 'worktree', 'list', '--porcelain', '-z'], {
+        env: jobGitEnvironment(), encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch {
       return fail('CTX_OUTSIDE_ROOT', 400, 'cwd is outside the project root and no linked worktree could be verified');
@@ -206,8 +207,8 @@ function diff(ref: string, range: string, root: string, deny: string[]): string 
   const excluded = deny.filter(folder => inside(root, path.resolve(folder))).map(folder => `:(exclude)${path.relative(root, path.resolve(folder)).replaceAll('\\', '/')}`);
   let out: string;
   try {
-    out = execFileSync('git', ['-C', root, 'diff', '--no-color', '--no-ext-diff', range, '--', '.', ...DIFF_EXCLUDES, ...excluded],
-      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] });
+    out = execFileSync('git', ['-C', root, '-c', 'core.fsmonitor=false', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', range, '--', '.', ...DIFF_EXCLUDES, ...excluded],
+      { env: jobGitEnvironment(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch { return fail('CTX_BAD_REF', 400, `${ref}: git could not produce that diff`); }
   return block(ref, out.replace(/\n$/, '') || '(no changes)');
 }

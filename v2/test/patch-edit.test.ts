@@ -8,7 +8,7 @@ import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Runner } from '../src/runner.ts';
-import { Store, type Json } from '../src/store.ts';
+import { Store, type Json } from './fixtures/service.ts';
 import { patchCheckArgs, resolvePatchCheck, runPatchCheck } from '../src/patch-check.ts';
 import type { RunnerOptions } from '../src/adapters/types.ts';
 import { patchWorktreeExecutables } from '../src/adapters/shared.ts';
@@ -204,7 +204,7 @@ test('the check snapshot honors cancellation and a missing Docker executable set
   assert.equal(cancelled.error, 'PATCH_CHECK_INTERRUPTED');
   fs.writeFileSync(path.join(f.repo, 'verify.sh'), '#!/bin/sh\nexit 0\n');
   f.git('update-index', '--add', '--chmod=+x', 'verify.sh');
-  const executablePaths = patchWorktreeExecutables(f.repo, undefined, f.home);
+  const executablePaths = patchWorktreeExecutables(f.repo, undefined);
   assert.deepEqual(executablePaths, ['verify.sh']);
   const dir = path.join(f.home, 'missing-check');
   const unavailable = await runPatchCheck(check, f.repo, dir, 'ac-check-missing', 5000, () => {}, undefined, executablePaths);

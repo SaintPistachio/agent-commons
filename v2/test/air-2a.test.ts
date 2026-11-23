@@ -5,24 +5,27 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, CommonsError, type Actor } from '../src/store.ts';
+import { Store, CommonsError, type Actor } from './fixtures/service.ts';
 import { toolReply } from '../src/mcp-reply.ts';
 import { listedTools } from '../src/tools.ts';
 
 function fixture(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-air2a-'));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-air2a-'));
+  const home = path.join(workspace, 'data');
+  const projectDirectory = path.join(workspace, 'repo');
+  fs.mkdirSync(projectDirectory);
   const store = new Store(home);
-  t.after(() => { try { store.close(); } catch {} fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { try { store.close(); } catch {} fs.rmSync(workspace, { recursive: true, force: true }); });
   const claude = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   const codex = store.createActor('codex-desktop', 'participant', 'codex-desktop').actor;
   const op = () => randomUUID();
   const call = (actor: Actor, method: string, input: Record<string, unknown> = {}) => store.call(actor, method, input);
-  const project = call(claude, 'project_create', { name: 'Demo', root: home, operation_id: op() }).project;
+  const project = call(claude, 'project_create', { name: 'Demo', root: projectDirectory, operation_id: op() }).project;
   const tx = (actor: Actor, packet: string) => call(actor, 'air_tx', { project_id: project.id, packet, operation_id: op() });
   const get = (actor: Actor, handles: string, extra: Record<string, unknown> = {}) => call(actor, 'air_get', { handles, ...extra }).air.split('\n') as string[];
   const sync = (actor: Actor, extra: Record<string, unknown> = {}) => call(actor, 'air_sync', { project_id: project.id, ...extra }).air.split('\n') as string[];
   const count = (table: string) => Number((store.db.prepare(`SELECT count(*) n FROM ${table}`).get() as any).n);
-  return { home, store, claude, codex, op, call, tx, get, sync, count, project };
+  return { home, projectDirectory, store, claude, codex, op, call, tx, get, sync, count, project };
 }
 const failure = (fn: () => unknown) => { try { fn(); } catch (error) { return error as CommonsError; } throw new Error('expected a failure'); };
 const h = (handle: string) => handle.split('@')[0];
@@ -80,13 +83,14 @@ test('air_get slices and searches artifacts by line', t => {
 
 test('air_sync finds the project from the workspace root', t => {
   const f = fixture(t);
-  const sub = path.join(f.home, 'src', 'deep');
+  const sub = path.join(f.projectDirectory, 'src', 'deep');
   assert.match(f.call(f.codex, 'air_sync', { root: sub }).air, /^@air1 sync p=p1 name=Demo /);
   assert.equal(failure(() => f.call(f.codex, 'air_sync', { root: os.tmpdir() })).code, 'PROJECT_NOT_FOUND');
   const other = f.call(f.claude, 'project_create', { name: 'Other', operation_id: f.op() }).project;
-  assert.equal(failure(() => f.call(f.codex, 'air_sync', { project_id: other.id, root: f.home })).code, 'PROJECT_MISMATCH');
+  assert.equal(failure(() => f.call(f.codex, 'air_sync', { project_id: other.id, root: f.projectDirectory })).code, 'PROJECT_MISMATCH');
   // A nested project wins over its parent.
-  const nested = f.call(f.claude, 'project_create', { name: 'Nested', root: path.join(f.home, 'src'), operation_id: f.op() }).project;
+  fs.mkdirSync(path.join(f.projectDirectory, 'src'));
+  const nested = f.call(f.claude, 'project_create', { name: 'Nested', root: path.join(f.projectDirectory, 'src'), operation_id: f.op() }).project;
   assert.match(f.call(f.codex, 'air_sync', { root: sub }).air, new RegExp(`^@air1 sync p=${f.store.handleOf('p', nested.id)} name=Nested `));
   assert.ok(listedTools().find(tool => tool.name === 'air_sync')!.inputSchema.properties.root, 'the tool takes root');
 });

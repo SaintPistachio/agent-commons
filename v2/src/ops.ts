@@ -4,16 +4,14 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { DatabaseSync, backup } from 'node:sqlite';
 import type { Store, Json } from './store.ts';
 import { fail } from './errors.ts';
-import { editDiff } from './adapters/shared.ts';
+import { editDiff, worktreeGit } from './adapters/shared.ts';
 import { adapter } from './adapters/registry.ts';
 
 const FINISHED = ['completed', 'failed', 'cancelled', 'needs_review'];
 const BACKUP_NAME = /^commons-\d{8}T\d{9}Z(-\d+)?\.sqlite$/;
-const git = (cwd: string, args: string[]) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 /**
  * Copies the database with SQLite's online backup API (safe while the service runs) to
@@ -93,7 +91,7 @@ export async function restoreDatabase(source: string, home: string, schemaVersio
 export function jobDiff(store: Store, ref: string): string {
   const job = store.jobByRef(ref);
   if (job.workdir && job.base_revision && fs.existsSync(job.workdir) && job.mode === 'edit') {
-    const diff = editDiff(job.workdir, job.base_revision);
+    const diff = editDiff(job.workdir, job.base_revision, job.options?.git_dir, !!job.options?.patch_edit);
     return diff ? `${diff.stat}\n${diff.patch}` : '(no changes)';
   }
   const saved = job.options?.diff_artifact ? store.artifactContent(job.options.diff_artifact) : undefined;
@@ -108,10 +106,11 @@ export function dropJob(store: Store, ref: string, force: boolean): string[] {
   const job = store.jobByRef(ref);
   if (!FINISHED.includes(job.status)) fail('JOB_NOT_FINISHED', 409, `job is ${job.status}`);
   if (job.mode !== 'edit' || !job.branch) fail('NOT_AN_EDIT_JOB', 400, 'only edit jobs have a worktree and branch');
-  const root = store.projectRoot(job.project_id) ?? fail('PROJECT_ROOT_REQUIRED');
+  const root = store.approvedProjectRoot(job.project_id);
+  const git = worktreeGit;
   const lines: string[] = [];
   const exists = !!job.workdir && fs.existsSync(job.workdir);
-  if (exists && !force && git(job.workdir, ['status', '--porcelain']))
+  if (exists && !force && git(job.workdir, ['status', '--porcelain', '--ignore-submodules=all'], job.options?.git_dir))
     fail('WORKTREE_DIRTY', 409, `the worktree has uncommitted changes${job.options?.diff_artifact ? ' (its diff is saved)' : ''}; review them or pass --force`);
   const branchExists = !!git(root, ['branch', '--list', job.branch]);
   if (branchExists && !force && !git(root, ['branch', '--merged', 'HEAD', '--list', job.branch]))

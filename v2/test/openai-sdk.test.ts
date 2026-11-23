@@ -63,11 +63,13 @@ function sdkStore(t: TestContext) {
     last_probe_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_update_result TEXT, cooldown_until TEXT
   );
   CREATE TABLE jobs (seq INTEGER PRIMARY KEY, id TEXT, route TEXT NOT NULL, status TEXT NOT NULL, consult_verdict TEXT, finished_at TEXT, created_at TEXT);
+  CREATE TABLE projects (id TEXT PRIMARY KEY);
   CREATE TABLE usage_windows (route TEXT, pool TEXT, window TEXT, remaining_percent REAL, resets_at TEXT, observed_at TEXT, source TEXT);
   PRAGMA user_version=16;`);
   migrate(db);
   const store: Store = Object.assign(Object.create(Store.prototype), {
     db, jobEvents: new EventEmitter(),
+    workerPolicy: () => null,
     transaction<T>(action: () => T): T {
       db.exec('BEGIN IMMEDIATE');
       try { const result = action(); db.exec('COMMIT'); return result; }
@@ -417,7 +419,8 @@ test('queued jobs on a route under maintenance wait: claims skip it until the up
   try {
     const actor = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
     const root = fsSync.mkdtempSync(path.join(os.tmpdir(), 'ac-sdk-gate-root-'));
-    store.call(actor, 'project_create', { name: 'Gate', root, operation_id: randomUUID() });
+    const operator = store.createActor('operator', 'operator').actor;
+    store.call(operator, 'project_create', { name: 'Gate', root, operation_id: randomUUID() });
     store.recordProbe(adapter('openai-api')!.capabilities, { state: 'verified' });
     const job = store.call(actor, 'job_submit', { project_id: 'p1', route: 'openai-api', prompt: 'x', cost: 'paid', max_cost_usd: 0.1,
       purpose: 'gate test', deliverable: 'none', operation_id: randomUUID() }).job;

@@ -31,8 +31,7 @@ interface PatchEditHooks {
 /** Adapters provide advice turns. Only this job runner may apply a patch and request the approved check. */
 export function launchPatchEdit(job: Json, route: PlatformAdapter, ctx: RunContext, hooks: PatchEditHooks): void {
   const config = job.options.patch_edit;
-  const project = ctx.store.projectRoot(job.project_id);
-  if (!project) throw new Error('project root is unavailable');
+  const project = ctx.store.approvedProjectRoot(job.project_id);
   const check = resolvePatchCheck(ctx.home, project, config.check);
   const approved = () => sha256(JSON.stringify(resolvePatchCheck(ctx.home, project, config.check))) === config.check_hash;
   if (sha256(JSON.stringify(check)) !== config.check_hash) throw new Error('approved check changed since job submission');
@@ -152,11 +151,11 @@ export function launchPatchEdit(job: Json, route: PlatformAdapter, ctx: RunConte
           if (applied.rejected.length) return finish('failed', `PATCH_EDIT_REJECTED: ${message(applied.rejected[0].reason)}`);
           if (!applied.files) return finish('failed', 'PATCH_EDIT_NO_CHANGES');
           const gitDir = ctx.store.jobRecord(job.id)?.options.git_dir;
-          if (worktreeChangedFiles(worktree, config.base, gitDir, ctx.home, true).some(isProtected))
+          if (worktreeChangedFiles(worktree, config.base, gitDir, true).some(isProtected))
             return finish('needs_review', 'PATCH_EDIT_PROTECTED_CHECK_PATH');
           attempt.applied = applied.files;
           for (const [file, edits] of latest) appliedChanges.set(file, edits);
-          const executables = patchWorktreeExecutables(worktree, gitDir, ctx.home);
+          const executables = patchWorktreeExecutables(worktree, gitDir);
           const container = `ac-check-${job.id}-${turn}`;
           ctx.annotate({ patch_attempts: attempts, patch_state: { phase: 'check', turn, container, docker: check.docker } });
           const cancellation = new AbortController();

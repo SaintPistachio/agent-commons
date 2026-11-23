@@ -2,6 +2,43 @@
 
 Follow the [Windows quickstart](../README.md) to initialize a home and connect an MCP client. The service stores data under that home and listens only on loopback. Use the `air` client profile for the compact project and job tools. `air_sync` with a project root discovers the project and returns its current state.
 
+## Security defaults and upgrades
+
+Claude, Codex, and Antigravity native CLI jobs are gated until their tools can
+run without access to provider credentials. CLI discovery and quota probes can
+still report those installations. Direct submission, automatic selection, and
+background jobs use the same execution policy. If no subscription route is
+eligible, automatic selection returns an error. An OpenAI API job still needs
+explicit spend authorization and approval from the central helper. The supported
+API options include advice, the built-in `project` read tools, and edit jobs with
+an approved check run in the isolated Docker environment.
+
+The operator registers new projects. Existing projects keep their records and
+history. Before a migrated project can provide files or run jobs, use the local
+operator CLI to approve its physical directory:
+
+```powershell
+node v2/src/cli.ts project-approve-root --home $acHome --project p1 --root 'C:\Projects\SampleProject'
+```
+
+On Windows, run the service and client setup under the same standard Windows account.
+Use a private data directory on a local fixed drive under a parent that other
+standard users cannot replace. The CLI checks existing
+permissions before creating or rotating a token or starting the service. If it
+reports `AC_HOME_NOT_PRIVATE`, stop the existing service and review the exact
+data directory. Run the repair as the intended service account. Reissue tokens
+if another user previously had access, then restart the service and reconnect
+the clients using their updated files.
+
+```powershell
+pwsh -NoProfile -File .\v2\scripts\automation\Protect-AcTokenHome.ps1 -DataRoot $acHome -Action Repair -WhatIf
+pwsh -NoProfile -File .\v2\scripts\automation\Protect-AcTokenHome.ps1 -DataRoot $acHome -Action Repair
+node v2/src/cli.ts rotate-client --home $acHome --all
+```
+
+Verify startup using `/health` and verify client authentication using `air-sync`.
+Jobs gated during an upgrade retain their status and reason in the job history.
+
 ## Configure a named check
 
 For patch edit jobs, create `patch-checks.json` inside the private service home. Replace the example paths and digest with your project root, Docker CLI path, and a locally installed Linux image. The image must provide `/bin/sh`, `cp`, `xargs`, and `chmod`, as well as the check's dependencies. Keep the check's image pinned by digest.

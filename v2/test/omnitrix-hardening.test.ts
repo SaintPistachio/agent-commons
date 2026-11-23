@@ -6,10 +6,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 import { Prober } from '../src/prober.ts';
-import { checkLoopbackHeaders, startServer } from '../src/server.ts';
+import { checkLoopbackHeaders, startServer } from './fixtures/service.ts';
 import { editDiff, helperEnv, workerEnv, worktreeChangedFiles } from '../src/adapters/shared.ts';
 import { claudeArgs } from '../src/adapters/claude.ts';
 import { codex, codexArgs } from '../src/adapters/codex.ts';
@@ -57,21 +57,21 @@ test('1. pre-captured gitDir resists tampered .git, preserves spaced filenames, 
   fs.writeFileSync(path.join(workdir, 'new.txt'), 'line1\nline2\n');
   fs.writeFileSync(path.join(workdir, 'with space.txt'), 'extra line\n');
 
-  const changed = worktreeChangedFiles(workdir, stored.base_revision, stored.options.git_dir, f.home);
+  const changed = worktreeChangedFiles(workdir, stored.base_revision, stored.options.git_dir);
   assert.ok(changed.includes('old.txt'), 'rename reports old path');
   assert.ok(changed.includes('new.txt'), 'rename reports new path');
   assert.ok(changed.includes('with space.txt'), 'spaced filename preserved unquoted');
 
-  const diff = editDiff(workdir, stored.base_revision, stored.options.git_dir, f.home);
+  const diff = editDiff(workdir, stored.base_revision, stored.options.git_dir);
   assert.ok(diff && diff.patch.includes('with space.txt') && diff.patch.includes('old.txt'));
 
   // Legacy job path without pre-captured git_dir still succeeds when .git is intact
   fs.rmSync(dotGit, { force: true });
   fs.writeFileSync(dotGit, origDotGit);
-  const legacyChanged = worktreeChangedFiles(workdir, null, null, f.home);
+  const legacyChanged = worktreeChangedFiles(workdir, null, null);
   assert.ok(legacyChanged.includes('with space.txt') && legacyChanged.includes('new.txt'));
 
-  assert.throws(() => editDiff(workdir, '0'.repeat(40), stored.options.git_dir, f.home), 'fatal git errors are not swallowed');
+  assert.throws(() => editDiff(workdir, '0'.repeat(40), stored.options.git_dir), 'fatal git errors are not swallowed');
 });
 
 test('2. codexLimits rejects millisecond and far-future resets_at timestamps', () => {

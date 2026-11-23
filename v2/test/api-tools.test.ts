@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 import { busySlots, jobToolset, loadManifest } from '../src/tool-hub.ts';
 import { dropOptionalNulls, mcpTools, projectTools, strictParameters } from '../src/api-tools.ts';

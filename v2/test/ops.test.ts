@@ -10,8 +10,8 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { startServer, releaseInfo } from '../src/server.ts';
-import { Store, CommonsError, type Actor } from '../src/store.ts';
+import { startServer, releaseInfo, protectFixtureHome } from './fixtures/service.ts';
+import { Store, CommonsError, type Actor } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 import { workerEnv, helperEnv } from '../src/adapters/shared.ts';
 import { registerAdapter, unregisterAdapter } from '../src/adapters/registry.ts';
@@ -56,14 +56,15 @@ function fixture(t: any) {
 }
 
 test('1.1 shutdown: operator or runtime token only; pending air_wait answers closing=1; the database closes', async t => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-stop-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-stop-'));
+  const home = path.join(base, 'data'), repo = path.join(base, 'repo');
+  fs.mkdirSync(repo);
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
   const seed = new Store(home);
   const participant = seed.createActor('claude-desktop', 'participant', 'claude-desktop').token;
   const operator = seed.createActor('operator', 'operator', 'local-operator').token;
   const actor = { id: 'claude-desktop', name: 'claude-desktop', role: 'participant' as const };
-  seed.call(actor, 'project_create', { name: 'R', root: path.join(home, 'r'), operation_id: randomUUID() });
-  fs.mkdirSync(path.join(home, 'r'));
+  seed.call(actor, 'project_create', { name: 'R', root: repo, operation_id: randomUUID() });
   const job = seed.call(actor, 'job_submit', { project_id: 'p1', route: 'claude', prompt: 'x', operation_id: randomUUID() }).job;
   seed.close();
   let stopped!: () => void; const shut = new Promise<void>(resolve => { stopped = resolve; });
@@ -190,16 +191,17 @@ test('2.3 the store enforces each adapter\'s modes, time limit and prompt limit'
 });
 
 test('2.4 a client that disconnects mid air_wait leaves no listener behind', async t => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-abort-'));
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-abort-'));
+  const home = path.join(base, 'data'), repo = path.join(base, 'repo');
+  fs.mkdirSync(repo);
   const seed = new Store(home);
   const token = seed.createActor('claude-desktop', 'participant', 'claude-desktop').token;
   const actor = { id: 'claude-desktop', name: 'claude-desktop', role: 'participant' as const };
-  fs.mkdirSync(path.join(home, 'r'));
-  seed.call(actor, 'project_create', { name: 'R', root: path.join(home, 'r'), operation_id: randomUUID() });
+  seed.call(actor, 'project_create', { name: 'R', root: repo, operation_id: randomUUID() });
   const job = seed.call(actor, 'job_submit', { project_id: 'p1', route: 'claude', prompt: 'x', operation_id: randomUUID() }).job;
   seed.close();
   const running = await startServer(home, 0, false);
-  t.after(async () => { await running.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await running.close(); fs.rmSync(base, { recursive: true, force: true }); });
   const baseline = running.store.jobEvents.listenerCount('job');
   const controller = new AbortController();
   const request = fetch(running.url + '/api/v1/call', { method: 'POST', signal: controller.signal, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
@@ -226,14 +228,13 @@ test('3 Google keys are stripped; ctx= refuses secret-looking content and the se
   }
   fs.writeFileSync(path.join(f.repo, 'fine.txt'), 'sk-short and AIza too short');
   assert.equal(f.submit({ context_refs: ['file:fine.txt'] }).options.ctx.length, 1);
-  // A project whose root contains the service home: nothing under the home can be sent.
-  const outer = f.call('project_create', { name: 'Outer', root: f.base, operation_id: randomUUID() }).project;
-  fs.writeFileSync(path.join(f.home, 'notes.txt'), 'harmless');
-  assert.equal(code(() => f.call('job_submit', { project_id: outer.id, route: 'claude', prompt: 'x', context_refs: ['file:home/notes.txt'], operation_id: randomUUID() })), 'CTX_DENIED');
+  // A project cannot include the service data directory.
+  assert.equal(code(() => f.call('project_create', { name: 'Outer', root: f.base, operation_id: randomUUID() })), 'PROJECT_ROOT_INVALID');
 });
 
 test('4.1 archived projects leave discovery and root lookup unless asked for', t => {
   const f = fixture(t);
+  fs.mkdirSync(path.join(f.repo, 'scratch'));
   const scratch = f.call('project_create', { name: 'Scratch', root: path.join(f.repo, 'scratch'), operation_id: randomUUID() }).project;
   f.store.setArchived('p2', true);
   assert.deepEqual(f.call('project_discover', {}).projects.map((p: any) => p.name), ['Repo']);
@@ -265,6 +266,7 @@ test('cli project-create makes a project through the operator actor (AIR-profile
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-pc-root-'));
   const run = (...a: string[]) => execFileSync(process.execPath, ['--disable-warning=ExperimentalWarning', CLI, ...a, '--home', home], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   try {
+    protectFixtureHome(home);
     run('init');
     const project = JSON.parse(run('project-create', '--name', 'Demo', '--root', root, '--objective', 'try it'));
     assert.equal(project.name, 'Demo');

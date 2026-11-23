@@ -26,10 +26,10 @@ function fixture(t: TestContext) {
   db.exec(`CREATE TABLE platform_state (
     adapter_id TEXT PRIMARY KEY, family TEXT, billing TEXT, probe_state TEXT,
     binary_sha256 TEXT, cli_version TEXT, help_sha256 TEXT, reason TEXT, last_probe_at TEXT, updated_at TEXT,
-    bin_path TEXT, bin_selected_path TEXT, bin_version TEXT, bin_source TEXT, bin_installed TEXT, bin_upstream TEXT,
-    cooldown_until TEXT
+    bin_path TEXT, bin_selected_path TEXT, bin_version TEXT, bin_source TEXT, bin_installed TEXT, bin_upstream TEXT, cooldown_until TEXT
   );
   CREATE TABLE jobs (seq INTEGER PRIMARY KEY, id TEXT, route TEXT, status TEXT, consult_verdict TEXT, finished_at TEXT, created_at TEXT);
+  CREATE TABLE projects (id TEXT PRIMARY KEY);
   CREATE TABLE usage_windows (route TEXT, pool TEXT, window TEXT, remaining_percent REAL, resets_at TEXT, observed_at TEXT, source TEXT);
   PRAGMA user_version=15;`);
   migrate(db);

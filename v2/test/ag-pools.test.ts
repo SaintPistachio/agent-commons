@@ -6,7 +6,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 import { antigravity } from '../src/adapters/antigravity.ts';
 import type { UsageObservation } from '../src/adapters/types.ts';

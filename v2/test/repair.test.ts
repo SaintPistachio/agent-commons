@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, type Actor, type Json } from '../src/store.ts';
+import { Store, type Actor, type Json } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
 import { planCorrection, repairTrigger } from '../src/repair.ts';
 import { SCHEMA_VERSION } from '../src/schema.ts';

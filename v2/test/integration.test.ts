@@ -8,8 +8,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { startServer } from '../src/server.ts';
-import { Store } from '../src/store.ts';
+import { startServer } from './fixtures/service.ts';
+import { Store } from './fixtures/service.ts';
 import { call, RemoteError } from '../src/client.ts';
 import { importV1 } from '../src/import-v1.ts';
 
@@ -39,6 +39,9 @@ test('two apps share a project through the MCP bridge, across a service restart'
   const seed = new Store(home);
   const claudeToken = seed.createActor('claude-desktop', 'participant', 'claude-desktop').token;
   const codexToken = seed.createActor('codex-desktop', 'participant', 'codex-desktop').token;
+  const operator = seed.createActor('operator', 'operator').actor;
+  const workspace = tempHome(t, 'ac2-int-repo-');
+  const project = seed.call(operator, 'project_create', { name: 'Repo', root: workspace, operation_id: randomUUID() }).project;
   seed.close();
   let running = await startServer(home, 0);
   defer(t, () => running.close());
@@ -49,8 +52,7 @@ test('two apps share a project through the MCP bridge, across a service restart'
   };
   const claudeFile = connection('claude-desktop', claudeToken);
   const claude = await mcpClient(t, claudeFile);
-  const workspace = path.join(home, 'repo');
-  const project = (await claude('project_create', { name: 'Repo', root: workspace, operation_id: randomUUID() })).project;
+  await assert.rejects(claude('project_create', { name: 'Denied', operation_id: randomUUID() }), (e: any) => e.code === 'OPERATOR_REQUIRED');
   const task = (await claude('task_create', { project_id: project.id, title: 'Add search', operation_id: randomUUID() })).task;
   await claude('task_claim', { task_id: task.id, version: 1, operation_id: randomUUID() });
   await claude('project_checkpoint', { project_id: project.id, task_id: task.id, summary: 'Index built', next_action: 'Wire the query API', operation_id: randomUUID() });

@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
 import { classifyAllowance, windowLengthMs } from '../src/allowance.ts';
 import type { UsageWindow } from '../src/adapters/types.ts';
@@ -49,10 +49,11 @@ test('the binding window decides: expiring, scarce, or neutral', () => {
 });
 
 function fixture(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-allowance-'));
-  const repo = path.join(home, 'repo'); fs.mkdirSync(repo);
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-allowance-'));
+  const home = path.join(fixtureRoot, 'data');
+  const repo = path.join(fixtureRoot, 'repo'); fs.mkdirSync(repo);
   const store = new Store(home);
-  t.after(() => { try { store.close(); } catch {} fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { try { store.close(); } catch {} fs.rmSync(fixtureRoot, { recursive: true, force: true }); });
   const claude: Actor = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   store.setActorTags('claude-desktop', 'anthropic', 'claude');
   for (const id of ['claude', 'codex', 'openai-api']) store.recordProbe(adapter(id)!.capabilities, { state: 'verified', cliVersion: '1.0' });

@@ -8,7 +8,7 @@ import test, { type TestContext } from 'node:test';
 import { buildContext } from '../src/context.ts';
 import { backfillMemoryIndex } from '../src/recall.ts';
 import { migrate, SCHEMA_VERSION } from '../src/schema.ts';
-import { Store, type Actor, type Json } from '../src/store.ts';
+import { Store, type Actor, type Json } from './fixtures/service.ts';
 
 type Internals = {
   db: DatabaseSync;
@@ -34,7 +34,7 @@ function fixture(t: TestContext) {
   const actor: Actor = { id: 'm3c-test', name: 'Memory tests', role: 'operator' };
   store.op_air_get(actor, { handles: 'p1' });
   const stamp = new Date().toISOString();
-  const project = { id: randomUUID(), root, name: 'Memory', objective: 'Verify project recall' };
+  const project = { id: randomUUID(), root, approved_root: root, name: 'Memory', objective: 'Verify project recall' };
   const taskId = randomUUID();
 
   function seed(table: string, values: Record<string, SQLInputValue>) {

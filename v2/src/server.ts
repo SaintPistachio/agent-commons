@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { Store, CommonsError } from './store.ts';
 import { Runner, type RunnerOptions } from './runner.ts';
 import { Prober } from './prober.ts';
+import { ensureTokenHome, writePrivateJson } from './token-home.ts';
+import type { WorkerPolicy } from './worker-policy.ts';
 
 export const DEFAULT_PORT = 4727;
 
@@ -50,6 +52,8 @@ export interface ServerOptions {
   probe?: boolean;
   /** Called once the service has closed after POST /api/v1/shutdown (cli.ts serve exits the process). */
   onShutdown?: () => void;
+  /** In-process test seam for fake adapters. The CLI always uses the production policy. */
+  workerPolicy?: WorkerPolicy;
 }
 
 /**
@@ -58,8 +62,9 @@ export interface ServerOptions {
  * cli.ts stop reads; participants get 403).
  */
 export async function startServer(home: string, port = DEFAULT_PORT, runnerOptions: RunnerOptions | false = {}, serverOptions: ServerOptions = {}): Promise<Running> {
+  ensureTokenHome(home);
   if (fs.existsSync(path.join(home, '.restore.lock'))) throw new Error('A backup restore is in progress for this home');
-  const store = new Store(home);
+  const store = new Store(home, serverOptions.workerPolicy);
   // Delegated jobs run inside the service, so they outlive the app that submitted them.
   const runner = runnerOptions === false ? null : new Runner(store, home, runnerOptions);
   const prober = runnerOptions !== false && serverOptions.probe ? new Prober(store, home, runnerOptions) : null;
@@ -120,9 +125,15 @@ export async function startServer(home: string, port = DEFAULT_PORT, runnerOptio
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => resolve()); });
   const address = server.address() as { port: number };
   const url = `http://127.0.0.1:${address.port}`;
+  try {
+    writePrivateJson(path.join(home, 'runtime.json'), { url, pid: process.pid, started_at: new Date().toISOString(), shutdown_token: shutdownToken }, true);
+  } catch (error) {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    store.close();
+    throw error;
+  }
   runner?.start();
   prober?.start();
-  fs.writeFileSync(path.join(home, 'runtime.json'), JSON.stringify({ url, pid: process.pid, started_at: new Date().toISOString(), shutdown_token: shutdownToken }));
   // Closing twice (a shutdown request, then a signal) does the work once.
   const close = () => closing ??= new Promise<void>(resolve => {
     store.wakeWaiters(); // pending air_wait calls answer now instead of holding the shutdown open

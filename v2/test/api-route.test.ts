@@ -19,7 +19,8 @@ function fixture(t: any) {
   const store = new Store(home);
   const actor: Actor = store.createActor('codex-desktop', 'participant', 'codex-desktop').actor;
   const call = (method: string, input: Record<string, unknown> = {}) => store.call(actor, method, input);
-  const project = call('project_create', { name: 'Repo', root, operation_id: randomUUID() }).project;
+  const operator = store.createActor('operator', 'operator').actor;
+  const project = store.call(operator, 'project_create', { name: 'Repo', root, operation_id: randomUUID() }).project;
   const runners: Runner[] = [];
   // Shared and mutable, so a test can break the helper executable between refresh-costs and invoke.
   const helper = { file: process.execPath, prefix: [FAKE], cwd: helperDir };

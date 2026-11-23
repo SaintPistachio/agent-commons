@@ -8,18 +8,19 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, CommonsError, type Actor } from '../src/store.ts';
-import { startServer } from '../src/server.ts';
+import { Store, CommonsError, type Actor } from './fixtures/service.ts';
+import { startServer } from './fixtures/service.ts';
 import { adapter, registerAdapter, unregisterAdapter } from '../src/adapters/registry.ts';
 
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 const failure = (fn: () => unknown) => { try { fn(); } catch (error) { return error as CommonsError; } throw new Error('expected a failure'); };
 
 function fixture(t: any, verified = ['claude', 'codex', 'openai-api', 'antigravity']) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-p4-'));
-  const repo = path.join(home, 'repo'); fs.mkdirSync(repo);
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-p4-'));
+  const home = path.join(fixtureRoot, 'data');
+  const repo = path.join(fixtureRoot, 'repo'); fs.mkdirSync(repo);
   const store = new Store(home);
-  t.after(() => { try { store.close(); } catch {} fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { try { store.close(); } catch {} fs.rmSync(fixtureRoot, { recursive: true, force: true }); });
   const claude: Actor = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   const codex: Actor = store.createActor('codex-desktop', 'participant', 'codex-desktop').actor;
   store.setActorTags('claude-desktop', 'anthropic', 'claude'); store.setActorTags('codex-desktop', 'openai', 'codex');

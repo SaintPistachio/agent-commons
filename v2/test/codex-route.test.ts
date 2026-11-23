@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { Runner } from '../src/runner.ts';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-codex.mjs', import.meta.url));

@@ -4,18 +4,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, CommonsError, type Actor } from '../src/store.ts';
+import { Store, CommonsError, type Actor } from './fixtures/service.ts';
 
 function fixture(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-store-'));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-store-'));
+  const home = path.join(workspace, 'data');
+  const projectDirectory = path.join(workspace, 'repo');
+  fs.mkdirSync(projectDirectory);
   let store = new Store(home);
-  t.after(() => { try { store.close(); } catch {} fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { try { store.close(); } catch {} fs.rmSync(workspace, { recursive: true, force: true }); });
   const claude = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   const codex = store.createActor('codex-desktop', 'participant', 'codex-desktop').actor;
   const op = () => randomUUID();
   const call = (actor: Actor, method: string, input: Record<string, unknown> = {}) => store.call(actor, method, input);
-  const project = call(claude, 'project_create', { name: 'Demo', root: home, objective: 'Ship it', operation_id: op() }).project;
-  return { home, claude, codex, op, call, project, reopen: () => { store.close(); store = new Store(home); return store; }, get store() { return store; } };
+  const project = call(claude, 'project_create', { name: 'Demo', root: projectDirectory, objective: 'Ship it', operation_id: op() }).project;
+  return { home, projectDirectory, claude, codex, op, call, project, reopen: () => { store.close(); store = new Store(home); return store; }, get store() { return store; } };
 }
 const code = (fn: () => unknown) => { try { fn(); } catch (error) { return (error as CommonsError).code; } return 'NO_ERROR'; };
 
@@ -38,7 +41,7 @@ test('one app records work and another resumes it, including after a restart', t
   assert.equal(brief.inbox.length, 1); assert.equal(brief.inbox[0].body, 'Can you review the lexer?');
   const focused = f.call(f.codex, 'project_resume', { project_id: f.project.id, task_id: task.id });
   assert.equal(focused.task.owner, 'claude-desktop'); assert.equal(focused.decisions.length, 1);
-  assert.deepEqual(f.call(f.codex, 'project_discover', { root: path.join(f.home, 'sub', 'dir') }).projects.map((p: any) => p.id), [f.project.id]);
+  assert.deepEqual(f.call(f.codex, 'project_discover', { root: path.join(f.projectDirectory, 'sub', 'dir') }).projects.map((p: any) => p.id), [f.project.id]);
 });
 
 test('operation_id replays the stored result and rejects different input', t => {
@@ -116,7 +119,7 @@ test('unknown methods, bad tokens and duplicate roots are refused', t => {
   const f = fixture(t);
   assert.equal(code(() => f.call(f.claude, 'routing_select', {})), 'UNKNOWN_METHOD');
   assert.equal(code(() => f.store.authenticate('wrong')), 'UNAUTHENTICATED');
-  assert.equal(code(() => f.call(f.claude, 'project_create', { name: 'Again', root: f.home, operation_id: f.op() })), 'PROJECT_ROOT_EXISTS');
+  assert.equal(code(() => f.call(f.claude, 'project_create', { name: 'Again', root: f.projectDirectory, operation_id: f.op() })), 'PROJECT_ROOT_EXISTS');
 });
 
 test('job_submit and job_status shorten long prompts unless asked; the runner still gets the whole prompt', t => {

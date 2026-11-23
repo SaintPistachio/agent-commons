@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { Store, CommonsError, type Actor, type Json } from '../src/store.ts';
+import { Store, CommonsError, type Actor, type Json } from './fixtures/service.ts';
 import { adapter, DEFAULT_ROUTE } from '../src/adapters/registry.ts';
 import { chooseClaudeModel, chooseCodexModel, cliEfforts, type CatalogSnapshot } from '../src/adapters/cli-models.ts';
 import { compareCostEfficiency, isModelEntitled } from '../src/adapters/model-pricing.ts';

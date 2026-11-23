@@ -234,6 +234,12 @@
     "v2/test/usage-polling.test.ts",
     "v2/test/viewer.test.ts",
     "v2/test/wait-limits.test.ts",
-    "v2/tsconfig.json"
+    "v2/tsconfig.json",
+    "v2/scripts/automation/Protect-AcTokenHome.ps1",
+    "v2/src/git-environment.ts",
+    "v2/src/token-home.ts",
+    "v2/src/worker-policy.ts",
+    "v2/test/daybreak-high.test.ts",
+    "v2/test/fixtures/service.ts"
   ]
 }

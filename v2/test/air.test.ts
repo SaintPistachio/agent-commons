@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, CommonsError, type Actor } from '../src/store.ts';
+import { Store, CommonsError, type Actor } from './fixtures/service.ts';
 import { parsePacket } from '../src/air/parser.ts';
 import { AirParseError } from '../src/air/types.ts';
 import { toolReply, toolError } from '../src/mcp-reply.ts';
@@ -12,18 +12,21 @@ import { RemoteError } from '../src/client.ts';
 import { SCHEMA_VERSION } from '../src/schema.ts';
 
 function fixture(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-air-'));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-air-'));
+  const home = path.join(workspace, 'data');
+  const projectDirectory = path.join(workspace, 'repo');
+  fs.mkdirSync(projectDirectory);
   let store = new Store(home);
-  t.after(() => { try { store.close(); } catch {} fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(() => { try { store.close(); } catch {} fs.rmSync(workspace, { recursive: true, force: true }); });
   const claude = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   const codex = store.createActor('codex-desktop', 'participant', 'codex-desktop').actor;
   const ag = store.createActor('antigravity', 'participant', 'antigravity-desktop').actor;
   const op = () => randomUUID();
   const call = (actor: Actor, method: string, input: Record<string, unknown> = {}) => store.call(actor, method, input);
-  const project = call(claude, 'project_create', { name: 'Demo', root: home, operation_id: op() }).project;
+  const project = call(claude, 'project_create', { name: 'Demo', root: projectDirectory, operation_id: op() }).project;
   const tx = (actor: Actor, packet: string, extra: Record<string, unknown> = {}) => call(actor, 'air_tx', { project_id: project.id, packet, operation_id: op(), ...extra });
   const count = (table: string) => Number((store.db.prepare(`SELECT count(*) n FROM ${table}`).get() as any).n);
-  return { home, claude, codex, ag, op, call, tx, count, project, get store() { return store; }, reopen: () => { store.close(); store = new Store(home); return store; } };
+  return { home, projectDirectory, claude, codex, ag, op, call, tx, count, project, get store() { return store; }, reopen: () => { store.close(); store = new Store(home); return store; } };
 }
 const failure = (fn: () => unknown) => { try { fn(); } catch (error) { return error as CommonsError & AirParseError; } throw new Error('expected a failure'); };
 const parseCode = (packet: string) => failure(() => parsePacket(packet)).code;

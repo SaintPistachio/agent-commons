@@ -2,10 +2,10 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type { Json } from '../store.ts';
 import { SECRET_VALUES } from '../context.ts';
+import { jobGitEnvironment } from '../git-environment.ts';
 import type { Active, ProbeResult, RouteCommand, RunContext } from './types.ts';
 
 /** SHA-256 of a file's bytes, streamed (CLI binaries can be hundreds of megabytes). */
@@ -98,7 +98,8 @@ export function helperCall(helper: RouteCommand, args: string[], timeoutMs = 120
   });
 }
 
-export const git = (cwd: string, args: string[]) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+export const git = (cwd: string, args: string[]) => execFileSync('git', ['-C', cwd, '-c', 'core.fsmonitor=false', ...args],
+  { env: jobGitEnvironment(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim();
 
 export function killTree(pid: number): void {
   try {
@@ -156,25 +157,24 @@ export function launchCli(job: Json, ctx: RunContext, command: RouteCommand | un
  * Git arguments that pin the pre-captured git directory and disable hooks and fsmonitor so a worker cannot redirect
  * host-side git inspection by modifying `.git` or repo config inside its worktree.
  */
-export function safeWorktreeGitArgs(cwd: string, gitDir?: string | null, home?: string): string[] {
-  const noHooks = home ? path.join(home, 'worktrees', '.no-hooks') : path.join(os.tmpdir(), 'ac-no-hooks');
-  fs.mkdirSync(noHooks, { recursive: true });
+export function safeWorktreeGitArgs(cwd: string, gitDir?: string | null): string[] {
   const target = gitDir ? ['--git-dir', gitDir, '--work-tree', cwd] : ['-C', cwd];
-  return [...target, '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${noHooks}`];
+  return [...target, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-c', 'submodule.recurse=false', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0'];
 }
 
 /** Discover effective filters in this checkout, including conditional includes, and disable external transforms. */
-export function patchWorktreeGitArgs(cwd: string, gitDir: string | undefined, home: string): string[] {
-  const safe = safeWorktreeGitArgs(cwd, gitDir, home);
+export function patchWorktreeGitArgs(cwd: string, gitDir?: string | null): string[] {
+  const safe = safeWorktreeGitArgs(cwd, gitDir);
   let keys = '';
   try {
     keys = execFileSync('git', [...safe, 'config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
-      { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      { cwd, env: jobGitEnvironment(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   } catch (error) { if ((error as { status?: number }).status !== 1) throw error; }
   const filters = new Set<string>();
   for (const key of keys.split('\0').filter(Boolean)) {
     const name = /^filter\.([a-z0-9_.-]+)\.(clean|smudge|process|required)$/i.exec(key)?.[1];
-    if (!name) throw new Error('Unsupported Git filter key in patch workspace');
+    if (!name) throw new Error('Unsupported Git filter key in job workspace');
     filters.add(name);
   }
   for (const filter of filters) {
@@ -183,10 +183,16 @@ export function patchWorktreeGitArgs(cwd: string, gitDir: string | undefined, ho
   return safe;
 }
 
+export function worktreeGit(cwd: string, args: string[], gitDir?: string): string {
+  return execFileSync('git', [...patchWorktreeGitArgs(cwd, gitDir), ...args], {
+    cwd, env: jobGitEnvironment(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+  }).trim();
+}
+
 /** Git, not the Windows filesystem mode, determines which checked-out scripts are executable. */
-export function patchWorktreeExecutables(cwd: string, gitDir: string | undefined, home: string): string[] {
-  const args = patchWorktreeGitArgs(cwd, gitDir, home);
-  return execFileSync('git', [...args, 'ls-files', '--stage', '-z'], { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+export function patchWorktreeExecutables(cwd: string, gitDir: string | undefined): string[] {
+  const args = patchWorktreeGitArgs(cwd, gitDir);
+  return execFileSync('git', [...args, 'ls-files', '--stage', '-z'], { cwd, env: jobGitEnvironment(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).split('\0').flatMap(entry => {
     const found = /^100755 [0-9a-f]+ 0\t(.+)$/s.exec(entry);
     return found ? [found[1]] : [];
@@ -197,18 +203,18 @@ export function patchWorktreeExecutables(cwd: string, gitDir: string | undefined
  * List changed and untracked files in an edit worktree using NUL-delimited `--no-renames` output so quoted names
  * stay verbatim and moves report both old and new paths. Throws if git fails.
  */
-export function worktreeChangedFiles(cwd: string, base?: string | null, gitDir?: string | null, home?: string, patchEdit = false): string[] {
-  const safe = patchEdit && home ? patchWorktreeGitArgs(cwd, gitDir ?? undefined, home) : safeWorktreeGitArgs(cwd, gitDir, home);
+export function worktreeChangedFiles(cwd: string, base?: string | null, gitDir?: string | null, patchEdit = false): string[] {
+  const safe = patchWorktreeGitArgs(cwd, gitDir);
   const run = (args: string[]) => execFileSync('git', [...safe, ...args], {
-    cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    cwd, env: jobGitEnvironment(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   });
   const seen = new Set<string>();
   const add = (p: string) => { if (p && !seen.has(p) && seen.size < 500) seen.add(p); };
   if (base) {
-    for (const file of run(['diff', '--name-only', '--no-renames', '-z', base]).split('\0')) add(file);
+    for (const file of run(['diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', '-z', base]).split('\0')) add(file);
     for (const file of run(['ls-files', '--others', ...(patchEdit ? [] : ['--exclude-standard']), '-z']).split('\0')) add(file);
   } else {
-    const tokens = run(['status', '--porcelain=v1', '-z', '--no-renames']).split('\0');
+    const tokens = run(['status', '--porcelain=v1', '-z', '--no-renames', '--ignore-submodules=all']).split('\0');
     for (let i = 0; i < tokens.length; i++) {
       const entry = tokens[i];
       if (!entry) continue;
@@ -224,10 +230,10 @@ export function worktreeChangedFiles(cwd: string, base?: string | null, gitDir?:
  * An edit job's changes against `base`: tracked changes (committed or not) plus untracked files, as one unified
  * diff, with a stat such as "+42 -11 (2f)". Reads only; the worktree and its index are left as they are.
  */
-export function editDiff(cwd: string, base: string, gitDir?: string | null, home?: string, patchEdit = false): { patch: string; stat: string } | null {
-  const safe = patchEdit && home ? patchWorktreeGitArgs(cwd, gitDir ?? undefined, home) : safeWorktreeGitArgs(cwd, gitDir, home);
+export function editDiff(cwd: string, base: string, gitDir?: string | null, patchEdit = false): { patch: string; stat: string } | null {
+  const safe = patchWorktreeGitArgs(cwd, gitDir);
   const run = (args: string[], prefix: string[] = safe, allowDiffExit = false) => {
-    const env = gitDir ? { ...process.env, GIT_DIR: gitDir } : process.env;
+    const env = { ...jobGitEnvironment(), ...(gitDir ? { GIT_DIR: gitDir } : {}) };
     try { return execFileSync('git', [...prefix, ...args], { cwd, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); }
     catch (error) {
       const status = (error as { status?: number }).status;
@@ -238,8 +244,8 @@ export function editDiff(cwd: string, base: string, gitDir?: string | null, home
   };
   let added = 0, removed = 0, files = 0;
   const count = (numstat: string) => { for (const line of numstat.split(/\r?\n/).filter(Boolean)) { const [a, d] = line.split('\t'); files++; added += Number(a) || 0; removed += Number(d) || 0; } };
-  let patch = run(['diff', '--no-color', '--no-ext-diff', '--no-textconv', base]);
-  count(run(['diff', '--numstat', base]));
+  let patch = run(['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', base]);
+  count(run(['diff', '--numstat', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', base]));
   const noIndexPrefix = safe.slice(safe.indexOf('-c'));
   for (const file of run(['ls-files', '--others', ...(patchEdit ? [] : ['--exclude-standard']), '-z']).split('\0').filter(Boolean)) {
     patch += run(['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--no-index', '--', '/dev/null', file], noIndexPrefix, true);

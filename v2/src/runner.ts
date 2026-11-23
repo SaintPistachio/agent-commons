@@ -4,8 +4,8 @@ import path from 'node:path';
 import type { Store, Json } from './store.ts';
 import type { Active, RunContext, RunnerOptions } from './adapters/types.ts';
 import { adapter, adapterIds, allAdapters } from './adapters/registry.ts';
-import { editDiff, git, killTree, patchWorktreeGitArgs, worktreeChangedFiles } from './adapters/shared.ts';
-import { execFileSync } from 'node:child_process';
+import { editDiff, killTree, worktreeGit, worktreeChangedFiles } from './adapters/shared.ts';
+import { CommonsError } from './errors.ts';
 import { AIR_WORKER_PRIMER, AIR_PATCH_PRIMER } from './air/primer.ts';
 import { resolveContextRoot } from './context.ts';
 import { launchPatchEdit } from './patch-edit.ts';
@@ -149,7 +149,7 @@ export class Runner {
     const job = this.store.jobRecord(id);
     if (!job || job.mode !== 'edit' || !job.workdir || !job.base_revision || !fs.existsSync(job.workdir)) return;
     try {
-      const diff = editDiff(job.workdir, job.base_revision, job.options?.git_dir, this.home, !!job.options?.patch_edit);
+      const diff = editDiff(job.workdir, job.base_revision, job.options?.git_dir, !!job.options?.patch_edit);
       if (diff) this.store.attachDiff(id, diff.patch, diff.stat);
     } catch (error) {
       const msg = String((error as Error)?.message ?? error).slice(0, 300);
@@ -177,6 +177,13 @@ export class Runner {
   }
 
   private launch(job: Json): void {
+    const refusal = this.store.queuedWorkerRefusal(job);
+    if (refusal) return this.store.failBeforeDispatch(job.id, refusal);
+    try { this.store.approvedProjectRoot(job.project_id); }
+    catch (error) {
+      if (error instanceof CommonsError) return this.store.failBeforeDispatch(job.id, error.code);
+      throw error;
+    }
     const dir = path.join(this.home, 'jobs', job.id);
     fs.mkdirSync(dir, { recursive: true });
     const route = adapter(job.route);
@@ -205,29 +212,26 @@ export class Runner {
 
   /** Advice uses the selected cwd. Edit gets a new, isolated worktree based on that checkout's HEAD. */
   private prepareWorkdir(job: Json): string {
-    const projectRoot = this.store.projectRoot(job.project_id);
-    if (!projectRoot || !fs.existsSync(projectRoot)) throw new Error('project root not found');
+    const projectRoot = this.store.approvedProjectRoot(job.project_id);
     const root = job.options?.cwd ? resolveContextRoot(projectRoot, job.options.cwd, [this.home]) : projectRoot;
     if (job.mode === 'advice') { this.store.updateJob(job.id, { workdir: root }); return root; }
-    const base = job.options?.patch_edit?.base ?? git(root, ['rev-parse', 'HEAD']);
+    this.store.assertJobRepository(job.project_id, root);
+    const base = job.options?.patch_edit?.base ?? worktreeGit(root, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base)) throw new Error('The job base is not a commit ID.');
     const branch = `ac/job-${job.id.slice(0, 8)}`, workdir = path.join(this.home, 'worktrees', job.id);
     fs.mkdirSync(path.dirname(workdir), { recursive: true });
-    if (job.options?.patch_edit) {
-      const run = (cwd: string, args: string[]) => execFileSync('git', [...patchWorktreeGitArgs(cwd, undefined, this.home), ...args],
-        { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-      run(root, ['worktree', 'add', '--no-checkout', '--no-track', '-b', branch, workdir, base]);
-      this.store.updateJob(job.id, { workdir, branch });
-      run(workdir, ['reset', '--hard', '--no-recurse-submodules', base]);
-    } else git(root, ['worktree', 'add', '-b', branch, workdir, base]);
-    const gitDir = git(workdir, ['rev-parse', '--absolute-git-dir']);
+    worktreeGit(root, ['worktree', 'add', '--no-checkout', '--no-track', '-b', branch, workdir, base]);
+    this.store.updateJob(job.id, { workdir, branch });
+    const gitDir = worktreeGit(workdir, ['rev-parse', '--absolute-git-dir']);
     this.store.annotateJob(job.id, { git_dir: gitDir });
-    this.store.updateJob(job.id, { workdir, branch, base_revision: base });
+    worktreeGit(workdir, ['reset', '--hard', '--no-recurse-submodules', base], gitDir);
+    this.store.updateJob(job.id, { base_revision: base });
     return workdir;
   }
 
   private changedFiles(job: Json, cwd: string): string[] {
     const latest = this.store.jobRecord(job.id);
-    try { return worktreeChangedFiles(cwd, latest?.base_revision, latest?.options?.git_dir, this.home, !!latest?.options?.patch_edit); }
+    try { return worktreeChangedFiles(cwd, latest?.base_revision, latest?.options?.git_dir, !!latest?.options?.patch_edit); }
     catch (error) {
       const msg = String((error as Error)?.message ?? error).slice(0, 300);
       console.error(JSON.stringify({ event: 'runner.changed_files_failed', job: job.id, error: msg }));

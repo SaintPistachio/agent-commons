@@ -8,8 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { startServer } from '../src/server.ts';
-import { Store } from '../src/store.ts';
+import { startServer } from './fixtures/service.ts';
+import { Store } from './fixtures/service.ts';
 import { listedTools, toolsFor } from '../src/tools.ts';
 
 const MCP = fileURLToPath(new URL('../src/mcp.ts', import.meta.url));
@@ -40,15 +40,17 @@ test('art_put stores an artifact and answers in one AIR line', t => {
 });
 
 test('an air-profile connection sees only the AIR tools over MCP, as text', async t => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-profile-'));
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-profile-'));
+  const home = path.join(base, 'data'), repo = path.join(base, 'repo');
+  fs.mkdirSync(repo);
   const seed = new Store(home);
   const token = seed.createActor('codex-desktop', 'participant', 'codex-desktop').token;
   const operator = seed.createActor('op', 'operator', 'op').actor;
-  seed.call(operator, 'project_create', { name: 'Repo', root: path.join(home, 'repo'), operation_id: randomUUID() });
+  seed.call(operator, 'project_create', { name: 'Repo', root: repo, operation_id: randomUUID() });
   seed.close();
   const running = await startServer(home, 0, false);
   const clients: Client[] = [];
-  t.after(async () => { for (const c of clients) await c.close(); await running.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { for (const c of clients) await c.close(); await running.close(); fs.rmSync(base, { recursive: true, force: true }); });
   const connect = async (profile?: string) => {
     const file = path.join(home, `conn-${profile ?? 'none'}.json`);
     fs.writeFileSync(file, JSON.stringify({ url: running.url, token, actorId: 'codex-desktop', projectIds: [], selectProject: true, ...(profile ? { toolProfile: profile } : {}) }));
@@ -59,7 +61,7 @@ test('an air-profile connection sees only the AIR tools over MCP, as text', asyn
   };
   const air = await connect('air');
   assert.deepEqual((await air.listTools()).tools.map(tool => tool.name), AIR);
-  const sync: any = await air.callTool({ name: 'air_sync', arguments: { root: path.join(home, 'repo', 'src') } });
+  const sync: any = await air.callTool({ name: 'air_sync', arguments: { root: path.join(repo, 'src') } });
   assert.equal(sync.structuredContent, undefined); assert.match(sync.content[0].text, /^@air1 sync p=p1 name=Repo .*snap=1/);
   const stored: any = await air.callTool({ name: 'art_put', arguments: { project_id: 'p1', name: 'notes', content: 'a\nb', operation_id: randomUUID() } });
   assert.deepEqual(stored.content, [{ type: 'text', text: 'A a1 name=notes kind=text bytes=3' }]); assert.equal(stored.structuredContent, undefined);

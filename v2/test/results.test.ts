@@ -6,20 +6,21 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, CommonsError } from '../src/store.ts';
-import { startServer } from '../src/server.ts';
+import { Store, CommonsError } from './fixtures/service.ts';
+import { startServer } from './fixtures/service.ts';
 
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 const fullResult = () => 'Beginning "quoted" \\ text\r\n' + 'line: λ 🐈 "quoted" \\ literal\\n\n'.repeat(24000) + 'end without newline';
 
 function fixture(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-results-'));
-  const repo = path.join(home, 'repo');
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-results-'));
+  const home = path.join(fixtureRoot, 'data');
+  const repo = path.join(fixtureRoot, 'repo');
   fs.mkdirSync(repo);
   const store = new Store(home);
   t.after(() => {
     try { store.close(); } catch {}
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
   const { actor, token } = store.createActor('results-user', 'participant', 'results-user');
   store.setActorTags(actor.id, 'anthropic', null);

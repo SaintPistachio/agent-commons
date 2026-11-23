@@ -6,8 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { startServer } from '../src/server.ts';
-import { Store, type Actor } from '../src/store.ts';
+import { startServer } from './fixtures/service.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { call, RemoteError, type Connection } from '../src/client.ts';
 import { listedTools } from '../src/tools.ts';
 import { AIR_PRIMER } from '../src/air/primer.ts';
@@ -15,18 +15,20 @@ import { AIR_PRIMER } from '../src/air/primer.ts';
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
 
 async function service(t: any) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-wait-'));
-  const repo = path.join(home, 'repo'); fs.mkdirSync(repo);
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-wait-'));
+  const home = path.join(fixtureRoot, 'data');
+  const repo = path.join(fixtureRoot, 'repo'); fs.mkdirSync(repo);
   const seed = new Store(home);
   const token = seed.createActor('claude-desktop', 'participant', 'claude-desktop').token;
+  const operator = seed.createActor('operator', 'operator').actor;
+  seed.call(operator, 'project_create', { name: 'Repo', root: repo, operation_id: randomUUID() });
   seed.close();
   const running = await startServer(home, 0, { claude: { file: process.execPath, prefix: [FAKE] }, tickMs: 50 });
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await running.close(); } };
-  t.after(async () => { await close(); fs.rmSync(home, { recursive: true, force: true }); });
+  t.after(async () => { await close(); fs.rmSync(fixtureRoot, { recursive: true, force: true }); });
   const conn: Connection = { url: running.url, token, actorId: 'claude-desktop' };
   const c = (method: string, input: Record<string, unknown> = {}) => call(conn, method, input);
-  await c('project_create', { name: 'Repo', root: repo, operation_id: randomUUID() });
   const job = async (prompt: string) => (await c('air_tx', { project_id: 'p1', packet: `@air1\n#0 job route=claude ${JSON.stringify(prompt)}`, operation_id: randomUUID() })).handles['0'] as string;
   const wait = async (handles: string, extra: Record<string, unknown> = {}) => {
     const started = Date.now(), r = await c('air_wait', { handles, ...extra });

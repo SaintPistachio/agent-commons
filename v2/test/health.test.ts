@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { healthLine, HEALTH_FILE, STALE_MS } from '../src/health.ts';
 
 function home(t: any) {
@@ -33,16 +33,17 @@ test('problems are listed on one line; a stale or broken file is reported', t =>
 
 test('air_sync shows the health line in snapshots and deltas while a problem lasts', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-health-'));
-  const store = new Store(dir);
+  const home = path.join(dir, 'data');
+  const store = new Store(home);
   t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const actor = store.createActor('claude-desktop', 'participant', 'claude-desktop').actor;
   const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
   store.call(actor, 'project_create', { name: 'Repo', root: repo, operation_id: randomUUID() });
-  write(dir, { checked_at: new Date().toISOString(), problems: [{ id: 'backup', text: 'stale' }] });
+  write(home, { checked_at: new Date().toISOString(), problems: [{ id: 'backup', text: 'stale' }] });
   const first = store.call(actor, 'air_sync', { project_id: 'p1' }).air as string;
   assert.equal(first.split('\n')[1], '! health n=1 "backup: stale"');
   const delta = store.call(actor, 'air_sync', { project_id: 'p1' }).air as string;
   assert.match(delta, /^! health n=1/m);
-  write(dir, { checked_at: new Date().toISOString(), problems: [] });
+  write(home, { checked_at: new Date().toISOString(), problems: [] });
   assert.doesNotMatch(store.call(actor, 'air_sync', { project_id: 'p1' }).air as string, /! health/);
 });

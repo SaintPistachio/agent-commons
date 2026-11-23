@@ -6,7 +6,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { Store, type Actor } from '../src/store.ts';
+import { Store, type Actor } from './fixtures/service.ts';
 import { Runner, resolveAntigravity } from '../src/runner.ts';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-antigravity.mjs', import.meta.url));

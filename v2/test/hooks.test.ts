@@ -9,8 +9,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { startServer } from '../src/server.ts';
-import { Store } from '../src/store.ts';
+import { startServer } from './fixtures/service.ts';
+import { Store } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
 
 const SCRIPTS = fileURLToPath(new URL('../scripts/', import.meta.url));

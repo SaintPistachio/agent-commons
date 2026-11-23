@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { waitDisplayOptions } from '../src/air/wait-options.ts';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { listedTools } from '../src/tools.ts';
 
 const reader = { id: 'reader' } as Parameters<Store['op_air_sync']>[0];
@@ -163,6 +163,7 @@ test('both wait commands can omit display options or send only the flags supplie
 function routing(t: TestContext, ids: string[]) {
   const { store, db } = fixture(t);
   Object.assign(store, {
+    workerPolicy: () => null,
     routeStatus: () => ids.map(id => ({
       id, short: id === 'openai-api' ? 'api' : id,
       state: 'verified', billing: id === 'openai-api' ? 'paid' : 'sub', family: id,

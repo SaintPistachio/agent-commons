@@ -6,13 +6,14 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { Store } from '../src/store.ts';
+import { Store, protectFixtureHome } from './fixtures/service.ts';
 
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 
 test('Store and CLI rotate tokens while preserving actor records and connection settings', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-rotate-client-'));
   try {
+    protectFixtureHome(home);
     const store = new Store(home);
     try {
       const operator = store.createActor('operator', 'operator', 'local-operator');

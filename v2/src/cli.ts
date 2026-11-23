@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { Store } from './store.ts';
+import { Store, type Actor } from './store.ts';
 import { SCHEMA_VERSION } from './schema.ts';
 import { defaultHome } from './paths.ts';
 import { startServer, DEFAULT_PORT } from './server.ts';
@@ -58,6 +58,8 @@ import { assertNotSyncedPath, createBackupBundle, verifyBackupBundle, restoreBac
  *   view [--port 4728]       serve read-only room pages on 127.0.0.1 (prints a link with a per-start key; Ctrl+C stops)
  *   air-sync, air-tx, air-get, air-result, air-wait, air-wait-until, route-hints   AIR-T clients over the loopback API (--connection FILE; see below)
  */
+import { assertRegularTokenFile, connectionPath, ensureTokenHome, writePrivateJson } from './token-home.ts';
+
 const args = process.argv.slice(2), command = args[0];
 const option = (name: string, fallback?: string) => { const i = args.indexOf('--' + name); return i >= 0 && args[i + 1] !== undefined && !args[i + 1].startsWith('--') ? args[i + 1] : fallback; };
 const flag = (name: string) => args.includes('--' + name);
@@ -479,27 +481,30 @@ const printLimits = (store: Store) => {
 };
 
 function writeConnection(name: string, value: object): string {
-  const dir = path.join(home, 'connections'); fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, name + '.json');
-  fs.writeFileSync(file, JSON.stringify(value, null, 2), { mode: 0o600 });
+  const file = connectionPath(home, name + '.json');
+  writePrivateJson(file, value, false);
   return file;
 }
 
 switch (command) {
-  case 'init': await withStore(store => {
-    if (store.db.prepare("SELECT 1 FROM actors WHERE role='operator'").get()) return print({ status: 'exists', home });
-    const { actor, token } = store.createActor('operator', 'operator', 'local-operator');
-    print({ status: 'initialized', home, connection: writeConnection('operator', { url, token, actorId: actor.id, projectIds: [], selectProject: true }) });
-  }); break;
+  case 'init':
+    ensureTokenHome(home, true);
+    await withStore(store => print(store.transaction(() => {
+      if (store.db.prepare("SELECT 1 FROM actors WHERE role='operator'").get()) return { status: 'exists', home };
+      const { actor, token } = store.createActor('operator', 'operator', 'local-operator');
+      return { status: 'initialized', home, connection: writeConnection('operator', { url, token, actorId: actor.id, projectIds: [], selectProject: true }) };
+    })));
+    break;
   case 'add-client': {
     const name = need(option('name'), '--name');
     const profile = profileOf(option('profile'));
-    await withStore(store => {
+    ensureTokenHome(home, true);
+    await withStore(store => print(store.transaction(() => {
       const { actor, token } = store.createActor(name, 'participant', name);
       if (option('family') || option('adapter')) store.setActorTags(actor.id, option('family') ?? null, option('adapter') ?? null);
-      print({ status: 'created', actor: actor.id, connection: writeConnection(name, { url, token, actorId: actor.id, projectIds: [], selectProject: true,
-        ...(profile === 'air' ? { toolProfile: 'air' } : {}) }) });
-    });
+      return { status: 'created', actor: actor.id, connection: writeConnection(name, { url, token, actorId: actor.id, projectIds: [], selectProject: true,
+        ...(profile === 'air' ? { toolProfile: 'air' } : {}) }) };
+    })));
     break;
   }
   case 'rotate-client': {
@@ -509,6 +514,7 @@ switch (command) {
     if (flag('profile') && profile !== 'air' && profile !== 'full')
       need(undefined, '--profile air|full');
     const connectionUrl = flag('url') ? need(option('url'), '--url URL') : url;
+    ensureTokenHome(home, true);
 
     await withStore(store => {
       const { db } = store;
@@ -516,21 +522,15 @@ switch (command) {
       const selected = all ? actors : actors.filter(actor => actor.id === name);
       if (!all && !selected.length) throw new Error(`actor ${name} not found`);
 
-      const dir = path.join(home, 'connections');
       const filename = (id: string) => id === 'local-operator' ? 'operator.json' : `${id}.json`;
       const fileKey = (id: string) => process.platform === 'win32' ? filename(id).toLowerCase() : filename(id);
       const plan = selected.map(({ id }) => {
         const basename = filename(id);
-        if (/[<>:"/\\|?*\u0000-\u001f]/.test(basename)
-          || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:[ .]|$)/i.test(basename))
-          throw new Error(`actor ${id} has an invalid connection filename`);
+        const connection = connectionPath(home, basename);
         if (actors.some(other => other.id !== id && fileKey(other.id) === fileKey(id)))
           throw new Error(`actor ${id} shares a connection filename with another actor`);
-        const connection = path.join(dir, basename);
         let settings: { projectIds?: string[]; selectProject?: boolean } = {};
-        const stat = fs.lstatSync(connection, { throwIfNoEntry: false });
-        if (stat) {
-          if (!stat.isFile()) throw new Error(`Connection path is not a regular file: ${connection}`);
+        if (assertRegularTokenFile(connection)) {
           const content = fs.readFileSync(connection, 'utf8');
           try { settings = JSON.parse(content) ?? {}; }
           catch { throw new Error(`Invalid connection JSON: ${connection}`); }
@@ -538,7 +538,6 @@ switch (command) {
         return { id, connection, settings };
       });
 
-      fs.mkdirSync(dir, { recursive: true });
       const rotated = plan.map(({ id, connection, settings }) => store.transaction(() => {
         const { actor, token } = store.rotateActorToken(id);
         const value = {
@@ -546,15 +545,7 @@ switch (command) {
           projectIds: settings.projectIds ?? [], selectProject: settings.selectProject ?? true,
           ...(actor.role === 'participant' && profile !== 'full' ? { toolProfile: 'air' } : {}),
         };
-        const temporary = path.join(dir, `.rotate-${randomUUID()}.tmp`);
-        const fd = fs.openSync(temporary, 'wx', 0o600);
-        try {
-          try { fs.writeFileSync(fd, JSON.stringify(value, null, 2)); }
-          finally { fs.closeSync(fd); }
-          fs.renameSync(temporary, connection);
-        } finally {
-          fs.rmSync(temporary, { force: true });
-        }
+        writePrivateJson(connection, value, true);
         return { actor: actor.id, connection };
       }));
       print(rotated);
@@ -757,6 +748,8 @@ switch (command) {
   case 'stop': {
     const runtimeFile = path.join(home, 'runtime.json');
     if (!fs.existsSync(runtimeFile)) { console.log('not running (no runtime.json)'); break; }
+    ensureTokenHome(home);
+    assertRegularTokenFile(runtimeFile);
     const runtime = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
     if (!runtime.shutdown_token) { console.log('the running service has no graceful stop (older release)'); process.exit(3); }
     try {
@@ -908,6 +901,11 @@ switch (command) {
     const root = option('root');
     print(store.call({ id: operator.id, name: operator.name, role: 'operator' }, 'project_create', { name: need(option('name'), '--name'),
       ...(root ? { root: path.resolve(root) } : {}), ...(option('objective') ? { objective: option('objective') } : {}), operation_id: randomUUID() }).project);
+  }); break;
+  case 'project-approve-root': await withStore(store => {
+    const operator = store.db.prepare("SELECT id, name, role FROM actors WHERE role='operator' LIMIT 1").get() as Actor | undefined;
+    if (!operator) throw new Error('project-approve-root needs an initialized home (run init first)');
+    print(store.approveProjectRoot(operator, need(option('project'), '--project ID'), need(option('root'), '--root DIR')));
   }); break;
   case 'archive-project': await withStore(store => print(store.setArchived(need(positional(), 'a project (p3 or its ID)'), !flag('unarchive')))); break;
   case 'set-actor': await withStore(store => {
