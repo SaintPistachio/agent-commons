@@ -13,7 +13,8 @@ import { type Active, type PlatformAdapter, type ProbeContext, type ProbeResult,
 import { hashFile, helperCall, helperEnv, killTree, openOutputs, replyUsage } from './shared.ts';
 import { metadataFamily } from './inventory.ts';
 import type { ModelDiscoveries } from './types.ts';
-import { defaultOpenAIHelperRoot, initialOpenAIRegistry, newestOpenAILines, openAIProfileSeeds, openAIModelSummary, readOpenAIModelStatus, readOpenAIRegistry, registryModelMap, registryRatesForModel, responsesRegistryModels, synchronizeOpenAIModels } from './openai-models.ts';
+import { defaultOpenAIHelperRoot, initialOpenAIRegistry, isRestrictedOpenAIModel, newestOpenAILines, openAIProfileSeeds, openAIModelSummary, readOpenAIModelStatus, readOpenAIRegistry, registryModelMap, registryRatesForModel, responsesRegistryModels, synchronizeOpenAIModels } from './openai-models.ts';
+import { readPublicInventory, refreshPublicInventory } from './openai-public-inventory.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, estimateWorstCaseUsd, modelPricing } from './model-pricing.ts';
 import { openAICreditUsage } from './openai-credits.ts';
 import { sameCliPath } from './cli-freshness.ts';
@@ -174,13 +175,16 @@ async function reconcile(job: Json, ctx: ReconcileContext): Promise<void> {
   if (job.model) ctx.store.markModelValidated(openaiApi.capabilities.id, job.model);
 }
 
-/** The maintained registry is pricing/capability evidence, not a model-list API request. */
+/** Public docs, project model visibility, and the helper's Responses registry remain separate evidence. */
 async function discover(ctx: ProbeContext): Promise<ModelDiscoveries> {
   const helper = ctx.options.openaiHelper ?? resolveOpenAIHelper(defaultOpenAIHelperRoot(ctx.home));
   if (!helper) throw new Error('central helper not found; model registry could not be read');
   const root = helperRoot(helper, ctx.home);
+  const inventory = ctx.overrides.openaiModelRefresh !== false
+    ? await refreshPublicInventory(ctx.home, root, helper, ctx.overrides.openaiFetch)
+    : readPublicInventory(ctx.home);
   if (ctx.overrides.openaiModelRefresh !== false)
-    await synchronizeOpenAIModels({ home: ctx.home, root, fetch: ctx.overrides.openaiFetch });
+    await synchronizeOpenAIModels({ home: ctx.home, root, fetch: ctx.overrides.openaiFetch, excluded: inventory.excluded });
   const registry = readOpenAIRegistry(root);
   const previous = openaiApi.profiles.map(seed => ({ ...seed }));
   const seeds = openAIProfileSeeds(registry).map(seed => {
@@ -190,7 +194,8 @@ async function discover(ctx: ProbeContext): Promise<ModelDiscoveries> {
   openaiApi.profiles.splice(0, openaiApi.profiles.length, ...seeds);
   openaiApi.capabilities.defaultModel = newestOpenAILines(registry).sol ?? null;
   const models = registryModelMap(registry);
-  const rows: ModelDiscoveries = responsesRegistryModels(registry).map(({ model, responses }) => ({
+  const rows: ModelDiscoveries = responsesRegistryModels(registry).filter(({ model }) =>
+    !isRestrictedOpenAIModel(model)).map(({ model, responses }) => ({
     model, family: metadataFamily(models[model], model), efforts: [...EFFORTS],
     tiers: registeredTiers(responses), state: 'verified', source: 'registry',
   }));
@@ -283,13 +288,15 @@ export const openaiApi: PlatformAdapter = {
       const flagged = new Set(readOpenAIModelStatus(ctx.home).flagged);
       return responsesRegistryModels(readOpenAIRegistry(helperRoot(helper, ctx.home)))
         .map(entry => entry.model)
-        .filter(model => !flagged.has(model));
+        .filter(model => !isRestrictedOpenAIModel(model) && !flagged.has(model));
     } catch { return []; }
   },
   validate(input, job) {  // modes and time limits are enforced by the store from capabilities
     const model = job.model === undefined ? input.model ?? openaiApi.capabilities.defaultModel : job.model;
     if (typeof model !== 'string' || !model)
       fail('INVALID_INPUT', 400, 'openai-api needs a Responses model from the central helper registry');
+    if (isRestrictedOpenAIModel(model))
+      fail('MODEL_UNAVAILABLE', 400, 'This OpenAI model is outside the public API route inventory');
     const effort = job.effort === undefined ? input.effort : job.effort;
     if (effort != null && !EFFORTS.some(allowed => allowed === effort))
       fail('INVALID_INPUT', 400, `openai-api effort must be one of ${EFFORTS.join(', ')}`);

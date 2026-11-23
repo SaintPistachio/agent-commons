@@ -15,6 +15,7 @@ Run from the work branch's checkout (a linked worktree is fine). Steps, stopping
   6. With an off-drive destination configured, copies the backups off the drive.
   7. With -Project and -Connection, records a checkpoint in the specified local project.
 Use -WhatIf to preview or -NoMain to upgrade without promoting main.
+Use -NoCloudBackup to make only the configured private off-drive copy.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -29,6 +30,7 @@ param(
   [switch]$NoMain,
   [switch]$Push,
   [switch]$NoPush,
+  [switch]$NoCloudBackup,
   [switch]$AllowDroppingLive
 )
 $ErrorActionPreference = 'Stop'
@@ -117,7 +119,7 @@ if (-not $NoMain) {
 $backupConfig = Read-AcBackupConfig $DataRoot
 if ($backupConfig.offDriveDestination) {
   Step '6. Off-drive backup copy'
-  & (Join-Path $PSScriptRoot 'automation\Backup-AcOffDrive.ps1') -DataRoot $DataRoot -NoFreshBackup
+  & (Join-Path $PSScriptRoot 'automation\Backup-AcOffDrive.ps1') -DataRoot $DataRoot -NoFreshBackup -SkipCloud:$NoCloudBackup
   if ($LASTEXITCODE) { Write-Warning 'off-drive copy failed (see its log)'; $done += 'off-drive copy FAILED' } else { $done += 'backed up off-drive' }
 }
 

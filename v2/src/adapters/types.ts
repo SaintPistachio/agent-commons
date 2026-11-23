@@ -312,7 +312,7 @@ export interface PlatformAdapter {
   /** Resolves a tracked profile or checks a pinned/explicit choice using current local metadata. */
   selectModel?(request: ModelChoiceRequest, cliVersion: string | null): ModelChoice;
   /** Effective native effort after adapter-specific fitting/clamping, when constrained. */
-  effectiveEffort?(taskOrIntent: string, nativeEffort: string): string | null;
+  effectiveEffort?(taskOrIntent: string, nativeEffort: string, home?: string): string | null;
   /** Estimated USD cost for routing tie-breaking and dry-run planning (read-only). */
   estimatedCost?(model: string | null, effort: string | null, promptChars: number, options?: Json): {
     expectedUsd: number; worstCaseUsd?: number; basis: 'pricing' | 'weight';
@@ -337,7 +337,7 @@ export interface PlatformAdapter {
    */
   observeUsage?(ctx: ProbeContext): Promise<UsageSnapshot | undefined>;
   /** Pools proved available by this snapshot, with prior coverage for comparison. */
-  reopenedQuotaPools?(rows: UsageWindow[], known: UsageWindow[]): string[];
+  reopenedQuotaPools?(rows: UsageWindow[], known: UsageWindow[], home?: string): string[];
   /** Windows used to summarize route-level availability when model-specific meters also exist. */
   routeQuotaWindows?(rows: UsageWindow[]): UsageWindow[];
   /** Extracts observations from a reply already received during a job; never performs I/O. */

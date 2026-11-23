@@ -435,6 +435,15 @@ const port = Number(option('port', String(DEFAULT_PORT)));
 const url = `http://127.0.0.1:${port}`;
 const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
 const withStore = async (work: (store: Store) => unknown) => { const store = new Store(home); try { await work(store); } finally { store.close(); } };
+function inventoryFreshness(store: Store, route: string): string {
+  const discovery = store.modelDiscoveryState(route);
+  const latest = (store.db.prepare('SELECT max(last_seen_at) AS last_seen FROM route_models WHERE route=?')
+    .get(route) as { last_seen: string | null }).last_seen;
+  const state = !latest ? 'unavailable' : discovery?.error || Date.now() - Date.parse(latest) > 26 * 60 * 60 * 1000
+    ? 'stale' : 'current';
+  return 'Model inventory ' + state + '; last successful observation ' + (latest ?? 'none') +
+    (discovery?.error ? '; ' + discovery.error : '');
+}
 const need = (value: string | undefined, what: string) => { if (!value) { console.error(`${command} needs ${what}`); process.exit(2); } return value; };
 const bundleCredential = (): BundleCredential => {
   const keySelected = flag('recovery-key');
@@ -612,14 +621,13 @@ switch (command) {
   }); break;
   case 'models': await withStore(async store => {
     const route = option('route');
+    const { antigravityInventoryLines } = await import('./adapters/antigravity-inventory.ts');
+    const { readPublicInventory, openAIPublicModelLines, publicInventorySummary } = await import('./adapters/openai-public-inventory.ts');
+    const { isRestrictedOpenAIModel, defaultOpenAIHelperRoot, openAIModelSummary } = await import('./adapters/openai-models.ts');
     if (flag('refresh')) {
       const prober = new Prober(store, home);
       if (route) await prober.discover(route);
       else await prober.discoverAll();
-    }
-    if (route === undefined || route === 'openai-api') {
-      const { openAIModelVisibility } = await import('./adapters/openai-models.ts');
-      for (const line of openAIModelVisibility(home)) console.log(line);
     }
     const setIndex = process.argv.indexOf('--set-state');
     if (setIndex !== -1) {
@@ -631,18 +639,38 @@ switch (command) {
         : 'model is not in the route inventory; use models --refresh first');
       store.setModelState(matches[0].route, model, state);
     }
-    const rows = store.routeModels(route);
+    const excluded = new Set(readPublicInventory(home).excluded ?? []);
+    const rows = store.routeModels(route).filter(row => row.route !== 'openai-api' ||
+      (!row.superseded_by && row.state !== 'retired' && !isRestrictedOpenAIModel(row.model) && !excluded.has(row.model)));
+    const ag = route === undefined || route === 'antigravity' ? antigravityInventoryLines(home, store.usageFor('antigravity')) : [];
     if (!rows.length) console.log('no models recorded; run models --refresh');
     let previous: string | undefined;
     for (const row of rows) {
-      if (previous !== row.route) { console.log(`${row.route}:`); previous = row.route; }
+      if (previous !== row.route) {
+        console.log(row.route + ':');
+        console.log('  ' + inventoryFreshness(store, row.route));
+        if (row.route === 'antigravity') for (const line of ag) console.log(line);
+        previous = row.route;
+      }
+      if (row.route === 'antigravity' && ag.length > 1) continue;
       const tiers = row.tiers?.map((tier: string) => row.route === 'openai-api' && tier === 'batch' ? 'batch (async; not selectable)' : tier);
       console.log(`  ${row.model} ${row.state}; efforts ${row.efforts.length ? row.efforts.join(', ') : '-'}` +
         `${tiers ? `; tiers ${tiers.join(', ') || '-'}` : ''}; last seen ${row.last_seen_at}; source ${row.source}` +
         `${row.superseded_by ? `; superseded by ${row.superseded_by}` : ''}`);
     }
+    if (ag.length && !rows.some(row => row.route === 'antigravity')) {
+      console.log('antigravity:');
+      for (const line of ag) console.log(line);
+    }
+    if (route === undefined || route === 'openai-api') {
+      const routable = new Set<string>(rows.filter(row => row.route === 'openai-api').map(row => row.model));
+      console.log(openAIModelSummary(home));
+      for (const line of publicInventorySummary(home)) console.log(line);
+      for (const line of openAIPublicModelLines(home, defaultOpenAIHelperRoot(home), routable)) console.log(line);
+    }
     for (const warning of store.newerAvailable(route))
-      console.log(`NEWER AVAILABLE: ${warning.old} -> ${warning.new} (${warning.state})`);
+      if (!isRestrictedOpenAIModel(warning.old) && !isRestrictedOpenAIModel(warning.new))
+        console.log(`NEWER AVAILABLE: ${warning.old} -> ${warning.new} (${warning.state})`);
   }); break;
   case 'route-bin': await withStore(async store => {
     const route = option('route', '') ?? '', file = option('path', '') ?? '', clear = flag('clear');
@@ -770,6 +798,8 @@ switch (command) {
     break;
   }
   case 'status': await withStore(async store => {
+    const { antigravityInventorySummary } = await import('./adapters/antigravity-inventory.ts');
+    const { publicInventorySummary } = await import('./adapters/openai-public-inventory.ts');
     const { cliFreshnessLines, cliUpdateStatusLine } = await import('./adapters/cli-freshness.ts');
     const { sdkStatusLine } = await import('./adapters/sdk-freshness.ts');
     const counts = store.serviceCounts();
@@ -782,6 +812,9 @@ switch (command) {
       const q = perRoute.find(r => r.route === s.adapter_id);
       console.log(`  ${s.adapter_id.padEnd(12)} ${s.probe_state.padEnd(11)} ${(s.cli_version ?? '-').padEnd(24)} running ${q?.running ?? 0}, queued ${q?.queued ?? 0}${s.cooldown_until ? `; cooldown until ${s.cooldown_until}` : ''}`);
       const platform = allAdapters().find(a => a.capabilities.id === s.adapter_id);
+      console.log('    ' + inventoryFreshness(store, s.adapter_id));
+      if (s.adapter_id === 'antigravity') console.log('    ' + antigravityInventorySummary(home));
+      if (s.adapter_id === 'openai-api') for (const line of publicInventorySummary(home)) console.log('    ' + line);
       for (const line of cliFreshnessLines(s, platform?.upstreamTrack)) console.log(`    ${line}`);
       if (s.usage_blocked_identity === usageIdentity(s)) console.log('    quota polling suspended: local command reported model work');
       if (platform?.update) console.log(`    ${cliUpdateStatusLine(s, platform.upstreamTrack)}`);

@@ -36,6 +36,21 @@ The service checks supported routes every 30 minutes and after jobs finish. It d
 
 Claude polling is off by default. To enable it with Claude Code 2.1.273 or later and a Claude subscription login, set `AGENT_COMMONS_CLAUDE_USAGE=1` in the service environment before starting it. The reader accepts only a structured local `/usage` result with zero model usage and cost. Unrecognized scoped windows make the observation partial, which prevents it from lifting a cooldown. The CLI's `status` output shows scheduled resets and any refill that Agent Commons observed ahead of a scheduled reset.
 
+## Model inventory
+
+Run `node v2/src/cli.ts models --home DIR` to see the models and effort levels
+Agent Commons has observed. Use `--route ROUTE` to filter the list and
+`--refresh` to request a new observation. The `status` command reports
+when the last successful observation was and flags refresh failures.
+
+The service refreshes inventory at startup, daily, and when local provider
+metadata changes. Antigravity refreshes its guarded catalog while the route
+is idle. Claude Code publishes its account catalog during normal use.
+OpenAI inventory combines public model documentation with the list available
+to your configured project when its credential is present. The refresh uses
+metadata requests without inference. An incomplete refresh preserves the last
+complete list.
+
 ## Set up the optional OpenAI API helper
 
 The helper in `tools/openai-capabilities` owns paid admission and usage accounting. Use its pinned Python dependencies and a separate, private runtime environment. Paid jobs require an explicit ceiling, a purpose, and a deliverable. Configure credentials and funding through the helper before enabling paid submissions. Use a separate project key and keep helper policies, funding evidence, credentials, and ledgers out of the checkout.

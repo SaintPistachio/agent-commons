@@ -55,7 +55,11 @@ export const OPENAI_HELPER_ROOT = defaultOpenAIHelperRoot();
 const DOCS = 'https://developers.openai.com/api/docs';
 const PRICING = `${DOCS}/pricing`;
 const INDEX = `${DOCS}/models`;
-const BASELINE = 'gpt-6.2-sol';
+
+/** These offerings require separate enrollment or a specialized project. */
+export function isRestrictedOpenAIModel(model: string): boolean {
+  return /(?:^|[-.])(?:cyber|rosalind|daybreak|law|csam)(?:$|[-.])/i.test(model);
+}
 
 type ObjectMap = Record<string, any>;
 export type Rates = Record<string, string>;
@@ -303,6 +307,7 @@ export function openAIModelVersion(model: string): { line: string; version: numb
 export function newestOpenAILines(registry: unknown): Record<string, string> {
   const selected: Record<string, string> = {};
   for (const { model } of responsesRegistryModels(registry)) {
+    if (isRestrictedOpenAIModel(model)) continue;
     const parsed = openAIModelVersion(model);
     if (!parsed) continue;
     const previous = selected[parsed.line];
@@ -564,7 +569,7 @@ export function readOpenAIModelStatus(home: string): RegistryStatus {
 }
 
 /** A same-directory, exclusive temporary file; the destination never contains partial JSON. */
-function atomicJson(file: string, value: unknown, mode = 0o600): void {
+export function atomicJson(file: string, value: unknown, mode = 0o600): void {
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
   let fd: number | undefined;
   try {
@@ -615,9 +620,10 @@ export interface SynchronizeOptions {
   root?: string;
   fetch?: PageFetch;
   now?: () => Date;
+  excluded?: readonly string[];
 }
 
-async function fetchDocsPage(fetchFn: PageFetch, url: string): Promise<string> {
+export async function fetchDocsPage(fetchFn: PageFetch, url: string): Promise<string> {
   const response = await fetchFn(url + '.md', {
     signal: AbortSignal.timeout(20000),
     headers: { 'User-Agent': 'AgentCommons/2' },
@@ -689,20 +695,20 @@ export async function synchronizeOpenAIModels(options: SynchronizeOptions): Prom
     const original = fs.readFileSync(file, 'utf8');
     const registry = JSON.parse(original);
     const models = registryModelMap(registry);
-    const [pricingPage, indexPage, baselinePage] = await Promise.all([
-      fetchPage(PRICING), fetchPage(INDEX), fetchPage(`${INDEX}/${BASELINE}`),
+    const [pricingPage, indexPage] = await Promise.all([
+      fetchPage(PRICING), fetchPage(INDEX),
     ]);
     const pricing = parseOpenAIPricing(pricingPage);
     const index = parseOpenAIModelIndex(indexPage);
-    parseOpenAIModelPage(baselinePage, BASELINE);
-    const candidates = [...index].filter(model => pricing.models[model]?.tiers.default).sort();
+    const excluded = new Set(options.excluded ?? []);
+    const candidates = [...index].filter(model => !isRestrictedOpenAIModel(model) && !excluded.has(model) && pricing.models[model]?.tiers.default).sort();
     if (!candidates.length) throw new Error('No indexed models have Standard pricing');
     // One model whose page lacks a verifiable fact (for example an older model with no token limits) is skipped
-    // on its own; it never blocks the other models. Shared pages (pricing, index, baseline) still fail the whole run.
+    // on its own; it never blocks the other models. Require at least one verified Responses model before publishing.
     const skipped: Array<{ model: string; reason: string }> = [];
     const parsed = (await Promise.all(candidates.map(async model => {
       try {
-        const markdown = model === BASELINE ? baselinePage : await fetchPage(`${INDEX}/${model}`);
+        const markdown = await fetchPage(`${INDEX}/${model}`);
         const page = parseOpenAIModelPage(markdown, model);
         const pageSplit = /more than\s+([\d,.]+)\s*([KM]?)\s+input tokens/i.exec(markdown);
         if (pageSplit && Object.keys(pricing.models[model].long_context_rates).length
@@ -714,6 +720,7 @@ export async function synchronizeOpenAIModels(options: SynchronizeOptions): Prom
         return null;
       }
     }))).filter((row): row is { model: string; page: ReturnType<typeof parseOpenAIModelPage> } => row !== null);
+    if (!parsed.some(row => row.page.supported)) throw new Error('No priced Responses model could be verified');
     status.skipped = skipped.sort((a, b) => a.model.localeCompare(b.model));
     const arrays = templateArrays(registry);
     const changes: Array<{ model: string; entry: ObjectMap; event: RegistryEvent; mismatch: boolean }> = [];

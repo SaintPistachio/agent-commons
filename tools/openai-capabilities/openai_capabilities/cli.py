@@ -3,14 +3,37 @@ import argparse
 import json
 from pathlib import Path
 
-from .adapters import AdapterError
+from .adapters import AdapterError, SDKAdapter
+from .credentials import load_credential
 from .policy import PolicyError
-from .service import PACKAGE_ROOT, Service, _scrub, read_json
+from .service import PACKAGE_ROOT, PROJECT_ROOT, Service, _scrub, read_json
 
 
 class SafeParser(argparse.ArgumentParser):
     def error(self, _message):
         self.exit(2, '{"status":"blocked","error_code":"invalid_arguments","next_action":"Inspect --help; credentials are never accepted as command arguments"}\n')
+
+
+def model_catalog(policy):
+    """Complete project-scoped GET /v1/models without opening the spending ledger."""
+    if policy.get("api_base_url", "https://api.openai.com/v1") != "https://api.openai.com/v1":
+        raise PolicyError("catalog_destination_invalid", "The catalog requires the official API destination.")
+    key = load_credential(policy, PROJECT_ROOT)
+    adapter = SDKAdapter(key, policy["organization_id"], policy["project_id"], timeout_seconds=15)
+
+    def list_models():
+        models = []
+        for row in adapter.client.models.list():
+            if len(models) >= 5000 or not isinstance(row.id, str) or not 1 <= len(row.id) <= 256:
+                raise ValueError("Invalid or oversized OpenAI model list")
+            models.append({"id": row.id})
+        return models
+
+    try:
+        models = adapter._perform(list_models)
+    finally:
+        adapter.close()
+    return {"status": "observed", "coverage": "complete", "inference_required": False, "models": models}
 
 
 def main(argv=None):
@@ -20,6 +43,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("status", "disable", "enable", "credits", "refresh-costs"):
         sub.add_parser(name)
+    sub.add_parser("model-catalog", help="Read the designated project's model list without inference or accounting")
     sub.add_parser("lookup", help="Read a recorded external operation without submitting or retrieving provider data").add_argument(
         "--external-request-id", required=True)
     for name in ("dry-run", "invoke", "batch-submit"):
@@ -48,6 +72,9 @@ def main(argv=None):
     confirm.add_argument("--ui-evidence", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == "model-catalog":
+            print(json.dumps(model_catalog(read_json(args.policy)), ensure_ascii=True, allow_nan=False))
+            return 0
         if args.command == "billing-evidence":
             import sys
             from .openai_helper_billing_evidence import import_documents, digest, bounded_file

@@ -13,6 +13,8 @@ import { optText } from '../validate.ts';
 import { profileGrid, type Active, type PlatformAdapter, type ProbeContext, type ProbeResult, type RouteCommand, type RunContext, type UsageObservation, type UsageSnapshot, type UsageWindow } from './types.ts';
 import { hashFile, helperCall, killTree, openOutputs, replyUsage, workerEnv } from './shared.ts';
 import { metadataEfforts, metadataFamily, metadataModel, metadataModels } from './inventory.ts';
+import { acceptedAntigravityIdentity, antigravityInventorySummary, currentAntigravityProfiles, profileState,
+  projectAntigravityInventory, saveAntigravityInventory, type SeedProfile } from './antigravity-inventory.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, modelPricing } from './model-pricing.ts';
 import type { Consumption, ConsumptionRun, ModelDiscoveries, ModelDiscovery, PoolEvidence } from './types.ts';
 
@@ -24,16 +26,6 @@ const PRE_RUN_GATES = new Set(['NO_ELIGIBLE_MODEL', 'REVALIDATION_REQUIRED', 'RE
   'INVALID_INPUT', 'SETUP_MISSING', 'CREDITS_ENABLED', 'HOOKS_CONFIGURED', 'AUTH_OVERRIDE',
   'AMBIENT_CUSTOMIZATIONS', 'MCP_CONFIGURED']);
 
-interface SeedProfile {
-  model: string;
-  family: string;
-  effort: string;
-  tasks: string[];
-  group: string;
-  quota_limits: Array<{ group: string; limit: string }>;
-  task_preferences?: Record<string, number>;
-}
-
 function seedProfiles(): SeedProfile[] {
   // Read-only: the helper owns its catalog, validation and approval records.
   const file = fileURLToPath(new URL('../../helpers/antigravity/routing-seed.json', import.meta.url));
@@ -43,6 +35,10 @@ function seedProfiles(): SeedProfile[] {
       typeof p.model === 'string' && typeof p.family === 'string' && Array.isArray(p.tasks)
       && Array.isArray(p.quota_limits) && p.quota_limits.length > 0) : [];
   } catch { return []; }
+}
+
+function availableProfiles(home?: string): SeedProfile[] {
+  return (home ? currentAntigravityProfiles(home) : undefined) ?? seedProfiles();
 }
 
 function vendor(model: unknown): string | null {
@@ -67,21 +63,6 @@ function quotaUsage(reply: Json): UsageObservation[] {
     }));
 }
 
-function profileState(profile: SeedProfile, rows: UsageWindow[]): 'open' | 'closed' | 'unknown' {
-  let unknown = false;
-  for (const required of profile.quota_limits) {
-    // An exhaustion with no identified limiting window is still scoped to its pool.
-    const exhausted = rows.find(row => row.pool === required.group && row.window === 'exhaustion'
-      && !row.stale && row.remaining_percent === 0);
-    if (exhausted) return 'closed';
-    const row = rows.find(row => row.pool === required.group && row.window === required.limit);
-    if (!row || row.stale || row.remaining_percent === null) unknown = true;
-    // The helper treats zero as exhaustion; a small positive allowance is still open.
-    else if (row.closed || row.remaining_percent === 0) return 'closed';
-  }
-  return unknown ? 'unknown' : 'open';
-}
-
 function mergedUsage(job: Json, ctx: RunContext, reply: Json): UsageWindow[] {
   const key = (row: UsageObservation) => JSON.stringify([row.pool, row.window]);
   const rows = new Map(ctx.usage().map(row => [key(row), row]));
@@ -101,7 +82,7 @@ function mergedUsage(job: Json, ctx: RunContext, reply: Json): UsageWindow[] {
 /** Adds a scoped exhaustion observation when a refusal did not include its updated quota row. */
 function exhaustionReply(job: Json, ctx: RunContext, reply: Json): Json {
   if (reply.error_code !== 'QUOTA_EXHAUSTED') return reply;
-  const profiles = seedProfiles();
+  const profiles = availableProfiles(ctx.home);
   const message = String(reply.error ?? '');
   const groups = [...new Set(profiles.flatMap(p => p.quota_limits.map(q => q.group)))];
   const model = reply.reported_model ?? reply.selected_model ?? job.model;
@@ -200,7 +181,7 @@ function familyRequirements(family: string, profiles: SeedProfile[], evidence: P
 }
 
 function routingProfiles(job: Json, ctx: RunContext): { profiles: SeedProfile[]; requirements: Map<string, PoolRequirement[]> } {
-  const seed = seedProfiles();
+  const seed = availableProfiles(ctx.home);
   const evidence = ctx.store.poolEvidence(job.route);
   const runs = ctx.store.consumptionRuns(job.route);
   const requirements = new Map([...new Set(seed.map(p => p.family))]
@@ -417,8 +398,32 @@ function complete(job: Json, ctx: RunContext, code: number | null, reason?: stri
     error: `${reason ?? 'AG_OUTCOME_UNCLEAR'}: helper ${helperCode}; the prompt may have been submitted, so it is never replayed` }, reply ?? undefined);
 }
 
-/** Local metadata only. Optional generated files are never created or refreshed here. */
 async function discover(ctx: ProbeContext): Promise<ModelDiscoveries> {
+  // Injected offline fixtures cover persisted legacy shapes without launching a native helper.
+  if (ctx.overrides.antigravityHelperRoot && !ctx.options?.antigravity) return discoverLocalFixture(ctx);
+  const state = path.join(ctx.home, 'helpers', 'antigravity');
+  const approvalFile = path.join(state, 'acceptance.json');
+  const readApproval = (): Json => JSON.parse(fs.readFileSync(approvalFile, 'utf8'));
+  const approval = readApproval();
+  const identity = acceptedAntigravityIdentity(approval);
+  if (!identity) throw new Error('Antigravity has no valid helper approval');
+  const command = ctx.options.antigravity ?? resolveAntigravity();
+  if (!command) throw new Error('Antigravity helper not found');
+  const observedAt = new Date().toISOString();
+  // Catalog is the same metadata-only gate the helper uses, including its one-hour provider cache.
+  const { code, reply } = await helperCall(command, ['-Action', 'Catalog'], 90_000, undefined,
+    { AC_ANTIGRAVITY_STATE: state, PYTHONDONTWRITEBYTECODE: '1' });
+  if (code !== 0 || reply?.status !== 'SUCCESS') {
+    const detail = typeof reply?.error_code === 'string' && /^[A-Z0-9_]{1,80}$/.test(reply.error_code) ? ` (${reply.error_code})` : '';
+    throw new Error(`Antigravity guarded Catalog refresh failed${detail}`);
+  }
+  if (acceptedAntigravityIdentity(readApproval()) !== identity)
+    throw new Error('Antigravity helper approval changed during the Catalog refresh');
+  const quota = quotaUsage({ quota_after: reply.quota, observed_at_utc: observedAt });
+  return saveAntigravityInventory(ctx.home, projectAntigravityInventory(reply, approval, quota, observedAt));
+}
+
+function discoverLocalFixture(ctx: ProbeContext): ModelDiscoveries {
   const helperRoot = ctx.overrides.antigravityHelperRoot ?? fileURLToPath(new URL('../../helpers/antigravity/', import.meta.url));
   const state = path.join(ctx.home, 'helpers', 'antigravity');
   const seed = metadataModels(JSON.parse(fs.readFileSync(path.join(helperRoot, 'routing-seed.json'), 'utf8')));
@@ -503,14 +508,14 @@ export const antigravity: PlatformAdapter = {
   // The helper picks the model under its Probe; profiles choose only its task category and effort.
   profiles: profileGrid(['advice'], () => null, { min: 'low', low: 'low', med: 'medium', high: 'high', max: 'xhigh' },
     intent => ({ task: ({ fast: 'explain', code: 'coding', review: 'review', deep: 'complex', edit: 'coding' } as const)[intent] })),
-  effectiveEffort(taskOrIntent: string, nativeEffort: string): string | null {
+  effectiveEffort(taskOrIntent: string, nativeEffort: string, home?: string): string | null {
     const task = ({ fast: 'explain', code: 'coding', review: 'review', deep: 'complex', edit: 'coding' } as Record<string, string>)[taskOrIntent] ?? taskOrIntent;
-    return fitAntigravityEffort(seedProfiles(), task, nativeEffort).effort ?? nativeEffort;
+    return fitAntigravityEffort(availableProfiles(home), task, nativeEffort).effort ?? nativeEffort;
   },
   estimatedCost(model: string | null, effort: string | null, promptChars: number, options?: Json) {
     const task = String(options?.task ?? 'explain');
     const eff = effort ?? 'medium';
-    const guessedModel = model ?? seedProfiles().find(p => p.tasks.includes(task) && p.effort === eff)?.family
+    const guessedModel = model ?? availableProfiles(options?.home).find(p => p.tasks.includes(task) && p.effort === eff)?.family
       ?? (task === 'explain' ? 'gemini-3.8-flash' : task === 'coding' ? 'gemini-4-argon' : 'gemini-4-neon');
     const spec = modelPricing(guessedModel);
     return spec ? { expectedUsd: estimateExpectedCostUsd(spec, promptChars, eff), basis: 'weight' as const } : null;
@@ -518,9 +523,10 @@ export const antigravity: PlatformAdapter = {
   probe,
   binaries: ctx => versionedCopies([{ path: antigravityCliPath(ctx), source: 'helper install' }], file => ({ file })),
   discover,
+  discoverySummary: ctx => antigravityInventorySummary(ctx.home),
   usage: quotaUsage,
   observeUsage,
-  reopenedQuotaPools: rows => [...new Set(seedProfiles()
+  reopenedQuotaPools: (rows, _known, home) => [...new Set(availableProfiles(home)
     .filter(profile => profileState(profile, rows) === 'open').map(profile => profile.group))],
   consumption,
   backfillConsumption,

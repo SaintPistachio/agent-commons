@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import type { Json } from '../store.ts';
-import { profileGrid, type PlatformAdapter, type ProbeContext, type RouteCommand, type RunContext, type UsageSnapshot } from './types.ts';
+import { profileGrid, type ModelDiscoveries, type PlatformAdapter, type ProbeContext, type RouteCommand, type RunContext, type UsageSnapshot } from './types.ts';
 import { helperEnv, killTree, launchCli, runCapture } from './shared.ts';
 import { cliCommand, directoryEntries, launchSelectedCli, pathCopies, registryUpstream, resolveCli, retainNativeCli, retainedCliPath, runOfficialUpdater, sameCliPath, versionedCopies, type CliRoute } from './cli-freshness.ts';
 import { catalogDiscoveries, catalogSelectionStatus, chooseCodexModel, cliEfforts, codexLine, queuedCliSelection, readCodexModels } from './cli-models.ts';
@@ -128,63 +128,174 @@ export function codexArgs(command: RouteCommand, job: Json, cwd: string, dir: st
 
 const APP_SERVER_TIMEOUT_MS = 15_000;
 const APP_SERVER_MAX_BYTES = 512 * 1024;
+const MODEL_PAGE_LIMIT = 8;
+const MODEL_PAGE_SIZE = 64;
+const MODEL_LIST_SOURCES = ['app-server', 'app-server:hidden', 'cli-cache', 'cli-cache:hidden'];
 
-/**
- * Query Codex subscription rate limits without sending a prompt via `codex app-server` (`account/rateLimits/read`).
- * Experimental RPC: any error, timeout, or schema mismatch soft-fails to `undefined` without blocking the route.
- */
-async function readAppServerUsage(ctx: ProbeContext): Promise<UsageSnapshot | undefined> {
+type AppServerMethod = 'account/rateLimits/read' | 'model/list';
+type AppServerResult<T> = { value: T } | { cursor: string };
+
+/** Only metadata requests are sent. Each child owns one bounded observation. */
+async function readAppServer<T>(ctx: ProbeContext, method: AppServerMethod,
+  read: (result: unknown) => AppServerResult<T>, reset?: () => void): Promise<T | undefined> {
   const command = ctx.options.codex ?? (ctx.selected?.path ? cli.command(ctx.selected.path, ctx.options) : undefined);
   if (!command) return undefined;
+  const readingModels = method === 'model/list';
+  return new Promise<T | undefined>((resolve, reject) => {
+    const child = spawn(command.file, [...(command.prefix ?? []), 'app-server', '-c', 'mcp_servers={}'], {
+      cwd: os.tmpdir(), env: helperEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: !windows,
+    });
+    let settled = false, exited = false, initialized = false, bytes = 0, responseId = 1;
+    let accountChanged = false, restarted = false;
+    const cursors = new Set<string>();
+    const countBytes = (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > APP_SERVER_MAX_BYTES) finish(undefined, 'output limit exceeded');
+    };
+    child.stdout.on('data', countBytes);
+    child.stderr.on('data', countBytes);
+    const lines = readline.createInterface({ input: child.stdout });
+    const finish = (snapshot?: T, failure?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      lines.close();
+      try { child.stdin.end(); } catch { /* ignore */ }
+      if (!exited && child.pid) killTree(child.pid);
+      if (failure) reject(new Error(`Codex ${method}: ${failure}`));
+      else resolve(snapshot);
+    };
+    const timer = setTimeout(() => finish(undefined, 'timed out'), APP_SERVER_TIMEOUT_MS);
+    const send = (msg: object) => {
+      try { child.stdin.write(JSON.stringify(msg) + '\n'); } catch { finish(undefined, 'write failed'); }
+    };
+    const request = (cursor?: string) => {
+      if (readingModels && responseId > MODEL_PAGE_LIMIT)
+        return finish(undefined, 'pagination did not finish within its bounds');
+      responseId++;
+      send({ id: responseId, method, ...(readingModels ? {
+        params: { limit: MODEL_PAGE_SIZE, includeHidden: true, ...(cursor === undefined ? {} : { cursor }) },
+      } : {}) });
+    };
+    child.on('error', () => finish(undefined, 'process could not start'));
+    child.on('exit', () => { exited = true; });
+    child.on('close', () => finish(undefined, 'process closed before a complete response'));
+    child.stdin.on('error', () => finish(undefined, 'write failed'));
+    child.stdout.on('error', () => finish(undefined, 'output read failed'));
+    child.stderr.on('error', () => finish(undefined, 'error output read failed'));
+    lines.on('line', line => {
+      if (settled || !line.trim()) return;
+      let msg: Json;
+      try { msg = JSON.parse(line); } catch {
+        if (readingModels) finish(undefined, 'malformed protocol frame');
+        return;
+      }
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+        if (readingModels) finish(undefined, 'malformed protocol frame');
+        return;
+      }
+      if (msg.method !== undefined) {
+        if (readingModels && initialized && msg.method === 'account/updated' && msg.id === undefined)
+          accountChanged = true;
+        return;
+      }
+      if (msg.id !== responseId) return;
+      if (msg.error !== undefined) {
+        // Older binaries can explicitly lack model/list. Do not fall back after a partial listing.
+        if (readingModels && initialized && responseId === 2 && msg.error?.code === -32601) return finish();
+        return finish(undefined, 'request was rejected');
+      }
+      if (msg.id === 1 && !initialized) {
+        if (readingModels && (!msg.result || typeof msg.result !== 'object' || Array.isArray(msg.result)))
+          return finish(undefined, 'invalid initialization response');
+        initialized = true;
+        send({ method: 'initialized' });
+        request();
+        return;
+      }
+      // A native client can announce its account as initialization settles. Repeat the
+      // whole list once, so a page from the previous account state is never carried over.
+      if (accountChanged) {
+        if (restarted) return finish(undefined, 'account changed during listing');
+        restarted = true;
+        accountChanged = false;
+        cursors.clear();
+        reset?.();
+        request();
+        return;
+      }
+      try {
+        const result = read(msg.result);
+        if ('value' in result) return finish(result.value);
+        if (cursors.has(result.cursor))
+          return finish(undefined, 'pagination did not finish within its bounds');
+        cursors.add(result.cursor);
+        request(result.cursor);
+      } catch {
+        finish(undefined, 'malformed metadata response');
+      }
+    });
+    send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'agent-commons', title: 'Agent Commons', version: ctx.cliVersion ?? '2.0.0' } } });
+  });
+}
+
+/** An invalid rate-limit observation leaves the existing quota windows untouched. */
+async function readAppServerUsage(ctx: ProbeContext): Promise<UsageSnapshot | undefined> {
   const startedAt = new Date().toISOString();
   try {
-    return await new Promise<UsageSnapshot | undefined>(resolve => {
-      const child = spawn(command.file, [...(command.prefix ?? []), 'app-server', '-c', 'mcp_servers={}'], {
-        cwd: os.tmpdir(), env: helperEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: !windows,
-      });
-      let settled = false, exited = false, initialized = false, bytes = 0;
-      const lines = readline.createInterface({ input: child.stdout });
-      const finish = (snapshot?: UsageSnapshot) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        lines.close();
-        try { child.stdin.end(); } catch { /* ignore */ }
-        if (!exited && child.pid) killTree(child.pid);
-        resolve(snapshot);
-      };
-      const timer = setTimeout(() => finish(), APP_SERVER_TIMEOUT_MS);
-      const send = (msg: object) => {
-        try { child.stdin.write(JSON.stringify(msg) + '\n'); } catch { finish(); }
-      };
-      child.on('error', () => finish());
-      child.on('exit', () => { exited = true; finish(); });
-      child.stdin.on('error', () => finish());
-      child.stdout.on('error', () => finish());
-      child.stdout.on('data', (chunk: Buffer) => {
-        bytes += chunk.length;
-        if (bytes > APP_SERVER_MAX_BYTES) finish();
-      });
-      child.stderr.on('error', () => finish());
-      child.stderr.resume();
-      lines.on('line', line => {
-        if (settled) return;
-        let msg: Json;
-        try { msg = JSON.parse(line); } catch { return; }
-        if (!msg || typeof msg !== 'object' || msg.method !== undefined || (msg.id !== 1 && msg.id !== 2)) return;
-        if (msg.error !== undefined) return finish();
-        if (msg.id === 1 && !initialized) {
-          initialized = true;
-          send({ method: 'initialized' });
-          send({ id: 2, method: 'account/rateLimits/read' });
-        } else if (msg.id === 2) {
-          const rows = parseCodexAppServerRateLimits(msg.result, ctx.usage ?? [], Date.now(), startedAt);
-          finish(rows ? { rows, source: 'app-server' } : undefined);
-        }
-      });
-      send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'agent-commons', title: 'Agent Commons', version: ctx.cliVersion ?? '2.0.0' } } });
+    return await readAppServer(ctx, 'account/rateLimits/read', result => {
+      const rows = parseCodexAppServerRateLimits(result, ctx.usage ?? [], Date.now(), startedAt);
+      return { value: rows ? { rows, source: 'app-server' } : undefined };
     });
   } catch { return undefined; }
+}
+
+async function discoverModels(ctx: ProbeContext): Promise<ModelDiscoveries> {
+  const selected = ctx.cliVersion ?? ctx.selected?.version ?? null;
+  const catalogId = /^[a-z0-9][a-z0-9._:/-]{0,199}(?![\s\S])/iu;
+  const effortId = /^[a-z][a-z0-9_-]{0,63}(?![\s\S])/u;
+  const catalogIds = new Set<string>();
+  const modelIds = new Set<string>();
+  const rows: ModelDiscoveries = [];
+  const native = await readAppServer<ModelDiscoveries>(ctx, 'model/list', result => {
+    const page = result as Json | null;
+    if (!page || !Array.isArray(page.data) || page.data.length > MODEL_PAGE_SIZE * 2)
+      throw new Error('invalid model page');
+    for (const entry of page.data) {
+      const id = entry?.id, model = entry?.model;
+      if (typeof id !== 'string' || !catalogId.test(id) || catalogIds.has(id)
+        || typeof model !== 'string' || !catalogId.test(model) || modelIds.has(model)
+        || typeof entry.hidden !== 'boolean' || !Array.isArray(entry.supportedReasoningEfforts)
+        || entry.supportedReasoningEfforts.length > 32) throw new Error('invalid model entry');
+      const efforts = entry.supportedReasoningEfforts.map((row: Json | null) => row?.reasoningEffort);
+      if (!efforts.every((effort: unknown) => typeof effort === 'string' && effortId.test(effort))
+        || new Set(efforts).size !== efforts.length) throw new Error('invalid model efforts');
+      catalogIds.add(id);
+      modelIds.add(model);
+      rows.push({ model, family: codexLine(model), efforts, hidden: entry.hidden, source: 'app-server', state: 'discovered' });
+    }
+    if (page.nextCursor === null) {
+      rows.completeSources = MODEL_LIST_SOURCES;
+      return { value: rows };
+    }
+    if (typeof page.nextCursor !== 'string' || !page.nextCursor || page.nextCursor.length > 4096
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(page.nextCursor)) throw new Error('invalid pagination cursor');
+    return { cursor: page.nextCursor };
+  }, () => {
+    rows.length = 0;
+    catalogIds.clear();
+    modelIds.clear();
+  });
+  const cache = readCodexModels(selected, ctx.overrides.cliModelHome);
+  if (!native) return catalogDiscoveries(cache);
+  // The native list can include bundled or newly advertised entries. Existing selection
+  // consults the version-matched cache and requires separate entitlement evidence.
+  const cachedIds = new Set(cache.state === 'trusted' ? cache.models.map(model => model.id) : []);
+  for (const row of native) {
+    if (cachedIds.has(row.model)) row.state = 'verified';
+    else row.hidden = true; // Display in inventory without treating it as a runnable successor.
+  }
+  return native;
 }
 
 export const codex: PlatformAdapter = {
@@ -210,7 +321,7 @@ export const codex: PlatformAdapter = {
       "$ErrorActionPreference = 'Stop'; irm https://chatgpt.com/codex/install.ps1 | iex",
     ]);
   } : undefined,
-  discover: async ctx => catalogDiscoveries(readCodexModels(ctx.cliVersion ?? null, ctx.overrides.cliModelHome)),
+  discover: discoverModels,
   selectModel: (request, version) => chooseCodexModel(request, readCodexModels(version)),
   modelSourceStatus: version => catalogSelectionStatus(readCodexModels(version)),
   validate: () => ({}),

@@ -15,7 +15,8 @@ param(
   [string]$Destination,
   [ValidateRange(1, 10000)][int]$KeepDatabase = 30,
   [ValidateRange(1, 3650)][int]$KeepDays = 30,
-  [switch]$NoFreshBackup
+  [switch]$NoFreshBackup,
+  [switch]$SkipCloud
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false   # Robocopy codes 0–7 are successes.
@@ -143,7 +144,15 @@ try {
     }
     foreach ($name in 'artifacts', 'connections', 'helpers', 'automation') {
       $from = Join-Path $DataRoot $name
-      if ([IO.Directory]::Exists($from)) { Copy-AcDirectory $from (Join-Path $mirror $name) @('/PURGE') }
+      if ([IO.Directory]::Exists($from)) {
+        $copyOptions = @('/PURGE')
+        if ($name -eq 'helpers') {
+          $copyOptions += '/XF'
+          $copyOptions += @('catalog.lock', 'candidate-attempts.lock', 'revalidation.lock') |
+            ForEach-Object { Join-Path $from "antigravity\$_" }
+        }
+        Copy-AcDirectory $from (Join-Path $mirror $name) $copyOptions
+      }
     }
     $tools = Join-Path $DataRoot 'tools.json'
     if ([IO.File]::Exists($tools)) { Copy-Item -LiteralPath $tools -Destination (Join-Path $mirror 'tools.json') -Force }
@@ -190,7 +199,7 @@ const db = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
     Write-Log "off-drive ok: copied from $source; removed $removed old database file(s)"
   }
 
-  if ($cloud) {
+  if ($cloud -and -not $SkipCloud) {
     $key = Get-AcCloudKeyPath $DataRoot
     if ($archiveMode -eq 'encrypted' -and -not $recoveryKeyFile -and -not [IO.File]::Exists($key)) { Write-Warning 'Cloud backup skipped: run Set-AcBackupPassphrase.ps1 first.' }
     elseif ($PSCmdlet.ShouldProcess($cloud, 'Publish and verify cloud backup, then apply retention')) {

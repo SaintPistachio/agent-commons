@@ -5,6 +5,7 @@
  * Only scheduled checks and explicit operator requests may also invoke an official CLI updater.
  */
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import type { Store } from './store.ts';
 import { UsageContractViolation, type CliBinary, type CliUpdateContext, type ProbeContext, type ProbeOverrides, type ProbeResult, type RunnerOptions } from './adapters/types.ts';
@@ -42,10 +43,27 @@ export function recordSdkRecovery(store: Pick<Store, 'platformState' | 'recordPr
 }
 
 const DAY = 24 * 60 * 60 * 1000;
+const CATALOG_CHECK = 60 * 1000;
+/** Match the guarded Antigravity helper's catalog lifetime. */
+const AG_CATALOG_TTL = 60 * 60 * 1000;
 /** Usage is re-read this often without a job (see refreshUsage). */
 export const USAGE_REFRESH = 30 * 60 * 1000;
 /** A failed job re-probes its route at most this often. */
 const RECHECK_AFTER_FAILURE = 10 * 60 * 1000;
+
+async function fileStamp(file: string): Promise<string> {
+  try {
+    const stat = await fs.stat(file);
+    return stat.isFile() ? `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : 'not a file';
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code ?? 'unavailable';
+  }
+}
+
+interface CatalogObservation {
+  stamp: string;
+  expired?: boolean;
+}
 
 export class Prober {
   private readonly running = new Map<string, Promise<string>>();
@@ -53,9 +71,13 @@ export class Prober {
   private readonly observing = new Map<string, Promise<void>>();
   /** Routes with a usage read waiting behind the current one (later requests join it). */
   private readonly observingQueued = new Set<string>();
+  private readonly catalogStamps = new Map<string, string>();
+  private lastAgDiscovery = -Infinity;
+  private catalogRefresh?: Promise<void>;
   private stopped = false;
   private timer?: NodeJS.Timeout;
   private usageTimer?: NodeJS.Timeout;
+  private catalogTimer?: NodeJS.Timeout;
   private readonly onJob = (id: string) => this.afterJob(id);
   private readonly store: ProbeStore;
   private readonly home: string;
@@ -67,6 +89,62 @@ export class Prober {
   }
 
   private ids(): string[] { return this.overrides.adapters ?? adapterIds(); }
+
+  /** Only watch the files each route already uses as metadata, never its credentials or settings. */
+  private async nativeCatalog(id: string, previousStamp?: string): Promise<CatalogObservation | undefined> {
+    const homeOverride = this.overrides.cliModelHome;
+    if (id === 'codex') {
+      const directory = homeOverride ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+      return { stamp: path.isAbsolute(directory) ? await fileStamp(path.join(directory, 'models_cache.json')) : 'relative' };
+    }
+    if (id === 'claude') {
+      const directory = homeOverride ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+      if (!path.isAbsolute(directory)) return { stamp: 'relative' };
+      const catalog = path.join(directory, 'cache', 'model-catalog');
+      try {
+        const files = (await fs.readdir(catalog)).filter(name => name.endsWith('.json')).sort();
+        const entries = await Promise.all(files.map(async name => [name, await fileStamp(path.join(catalog, name))]));
+        return { stamp: JSON.stringify(entries) };
+      } catch (error) {
+        return { stamp: (error as NodeJS.ErrnoException).code ?? 'unavailable' };
+      }
+    }
+    if (id === 'antigravity') {
+      const directory = path.join(this.home, 'helpers', 'antigravity');
+      const catalog = path.join(directory, 'catalog.json');
+      const files = ['routing-state.json', 'candidate-attempts.json', 'acceptance.json']
+        .map(name => path.join(directory, name));
+      files.unshift(catalog);
+      const stamp = JSON.stringify(await Promise.all(files.map(fileStamp)));
+      if (stamp !== previousStamp) return { stamp };
+      let fetchedAt = NaN;
+      try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(catalog, 'utf8')).fetched_at); }
+      catch { /* A missing or unreadable cache can be refreshed by the verified helper. */ }
+      const age = Date.now() - fetchedAt;
+      return { stamp, expired: !Number.isFinite(age) || age < 0 || age >= AG_CATALOG_TTL };
+    }
+  }
+
+  /** Re-read changed native catalogs; retry an overdue AG cache on the usage interval after a failed read. */
+  refreshModelCatalogs(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.catalogRefresh) return this.catalogRefresh;
+    const run = Promise.all(this.ids().map(async id => {
+      const canRead = () => !this.stopped && !this.running.has(id) &&
+        this.store.platformState(id)?.probe_state === 'verified' &&
+        (id !== 'antigravity' || (!this.observing.has(id) && this.usageReadAllowed(id)));
+      try {
+        if (!canRead()) return;
+        const previousStamp = this.catalogStamps.get(id);
+        const observation = await this.nativeCatalog(id, previousStamp);
+        if (!observation || !canRead()) return;
+        const overdue = observation.expired && Date.now() - this.lastAgDiscovery >= USAGE_REFRESH;
+        if (observation.stamp !== previousStamp || overdue) await this.discover(id);
+      } catch { /* A concurrent stop can close the store during a read. */ }
+    })).then(() => {}).finally(() => { this.catalogRefresh = undefined; });
+    this.catalogRefresh = run;
+    return run;
+  }
 
   /** Ordinary probes are read-only, including probes triggered by failed jobs. */
   probe(id: string): Promise<void> { return this.check(id, 'probe').then(() => {}); }
@@ -224,29 +302,43 @@ export class Prober {
 
   /** Discovery never runs a prompt, and a failed snapshot never retires any inventory entries. */
   discover(id: string): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     const pending = this.discovering.get(id);
     if (pending) return pending;
     const run = (async () => {
       const platform = adapter(id);
       if (!platform?.discover) return;
-      const selection = () => {
-        if (!platform.binaries) return null;
-        const state = this.store.platformState(id);
-        return state?.probe_state === 'verified' && state.bin_selected_path && state.bin_version
-          ? { path: state.bin_selected_path, version: state.bin_version } : null;
-      };
-      let before: ReturnType<typeof selection> = null;
+      const identity = (state: ReturnType<Store['platformState']>) => JSON.stringify([
+        state?.probe_state ?? null, usageIdentity(state), state?.last_update_at ?? null,
+        state?.last_update_result ?? null, state?.sdk_version ?? null, state?.sdk_last_update_at ?? null,
+        state?.sdk_last_update_result ?? null,
+      ]);
+      let before: ReturnType<Store['platformState']>;
+      try { before = this.store.platformState(id); }
+      catch { return; }
+      const beforeIdentity = identity(before);
       const sameSelection = () => {
-        const after = selection();
-        return before?.path === after?.path && before?.version === after?.version;
+        return !this.stopped && identity(this.store.platformState(id)) === beforeIdentity;
       };
+      const selected = platform.binaries && before?.probe_state === 'verified' && before.bin_selected_path && before.bin_version
+        ? { path: before.bin_selected_path, version: before.bin_version, source: before.bin_source ?? 'selected' }
+        : undefined;
+      const ctx: ProbeContext = { home: this.home, options: this.options, overrides: this.overrides,
+        binPath: before?.bin_path ?? null, cliVersion: selected?.version ?? null, selected };
       try {
-        before = selection();
-        const rows = await platform.discover({ home: this.home, options: this.options, overrides: this.overrides,
-          cliVersion: before?.version ?? null });
+        const observation = await this.nativeCatalog(id);
+        if (!sameSelection()) return;
+        if (observation) this.catalogStamps.set(id, observation.stamp);
+        if (id === 'antigravity') this.lastAgDiscovery = Date.now();
+        const rows = await platform.discover(ctx);
         if (!sameSelection()) return;
         this.store.recordDiscovery(id, rows);
         this.store.seedProfiles(id);
+        if (id === 'codex' && selected) {
+          // A successful native model/list may republish its own CLI cache. Acknowledge that write.
+          const published = await this.nativeCatalog(id);
+          if (published && sameSelection()) this.catalogStamps.set(id, published.stamp);
+        }
       } catch (error) {
         try {
           if (sameSelection()) this.store.recordDiscoveryFailure(id, String((error as Error)?.message ?? error));
@@ -254,7 +346,8 @@ export class Prober {
       } finally {
         if (platform.discoverySummary) {
           try {
-            this.store.recordDiscoverySummary(id, platform.discoverySummary({ home: this.home, options: this.options, overrides: this.overrides }));
+            if (sameSelection() && this.store.platformState(id)?.probe_state === 'verified')
+              this.store.recordDiscoverySummary(id, platform.discoverySummary(ctx));
           } catch { /* status must not turn a completed discovery into a failure */ }
         }
       }
@@ -273,13 +366,16 @@ export class Prober {
       this.timer.unref();
       this.usageTimer = setInterval(() => void this.refreshUsage(), USAGE_REFRESH);
       this.usageTimer.unref();
+      this.catalogTimer = setInterval(() => void this.refreshModelCatalogs(), CATALOG_CHECK);
+      this.catalogTimer.unref();
     }
     this.store.jobEvents.on('job', this.onJob);
   }
   stop(): void {
-    this.stopped = true;  // no new usage reads, and a read still in flight records nothing
+    this.stopped = true;  // In-flight metadata reads record nothing after stop.
     if (this.timer) clearInterval(this.timer);
     if (this.usageTimer) clearInterval(this.usageTimer);
+    if (this.catalogTimer) clearInterval(this.catalogTimer);
     this.store.jobEvents.off('job', this.onJob);
   }
 

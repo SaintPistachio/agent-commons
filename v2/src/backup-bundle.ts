@@ -216,6 +216,12 @@ function privateBackupStage(parent: string, prefix: string): string {
   }
 }
 
+const TRANSIENT_HELPER_LOCKS = new Set([
+  'helpers/antigravity/catalog.lock',
+  'helpers/antigravity/candidate-attempts.lock',
+  'helpers/antigravity/revalidation.lock',
+]);
+
 function copyTreeFiltered(srcDir: string, dstDir: string, relBase: string): void {
   if (!fs.existsSync(srcDir)) return;
   fs.mkdirSync(dstDir, { recursive: true });
@@ -226,7 +232,8 @@ function copyTreeFiltered(srcDir: string, dstDir: string, relBase: string): void
     const dst = path.join(dstDir, entry.name);
     if (entry.isSymbolicLink()) fail('SECRET_PATH_FORBIDDEN', 400, `symlinks/junctions are forbidden in backup staging: ${rel}`);
     if (entry.isDirectory()) copyTreeFiltered(src, dst, rel);
-    else if (entry.isFile()) fs.copyFileSync(src, dst);
+    // The helper takes byte-range locks that Windows will refuse to copy while held.
+    else if (entry.isFile() && !TRANSIENT_HELPER_LOCKS.has(rel)) fs.copyFileSync(src, dst);
   }
 }
 

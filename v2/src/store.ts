@@ -1188,7 +1188,7 @@ export class Store {
         const prof = this.db.prepare('SELECT * FROM platform_profiles WHERE adapter_id=? AND intent=? AND eff=? AND enabled=1').get(route, intent, eff) as Json | undefined;
         const cfg = this.resolveJobConfig(extra, route, prof, intent, eff);
         const taskHint = String(extra.task ?? (prof?.native_options ? JSON.parse(prof.native_options).task : undefined) ?? intent);
-        const effUsed = adapter(route)?.effectiveEffort?.(taskHint, cfg.effort ?? eff) ?? cfg.effort ?? eff;
+        const effUsed = adapter(route)?.effectiveEffort?.(taskHint, cfg.effort ?? eff, this.home) ?? cfg.effort ?? eff;
         return { model: cfg.model ?? null, effort: String(effUsed) };
       };
       const sameAsPrev = (c: { model: string | null; effort: string }, kind: string) =>
@@ -1547,7 +1547,7 @@ export class Store {
 
   private reconcileQuotaCooldown(route: string, snapshot: UsageWindow[], known: UsageWindow[], checkStartedAt: string): void {
     const positive = snapshot.filter(row => !row.closed && row.remaining_percent !== null && row.remaining_percent > 0);
-    const pools = adapter(route)?.reopenedQuotaPools?.(snapshot, known) ?? [];
+    const pools = adapter(route)?.reopenedQuotaPools?.(snapshot, known, this.home) ?? [];
     if (!pools.length) return;
     // A fully open pool supersedes a prior reply's synthetic marker for exhaustion of an unidentified window.
     const clearMarker = this.db.prepare(`DELETE FROM usage_windows WHERE route=? AND pool=?
@@ -1985,7 +1985,7 @@ export class Store {
       const prof = this.db.prepare('SELECT * FROM platform_profiles WHERE adapter_id=? AND intent=? AND eff=? AND enabled=1')
         .get(pickedRoute, profileIntent, selection.eff) as Json | undefined;
       const cfg = this.resolveJobConfig(input, pickedRoute, prof, profileIntent, selection.eff);
-      const effUsed = adapter(pickedRoute)?.effectiveEffort?.(String(cfg.effective.task ?? selection.intent), cfg.effort ?? selection.eff) ?? cfg.effort;
+      const effUsed = adapter(pickedRoute)?.effectiveEffort?.(String(cfg.effective.task ?? selection.intent), cfg.effort ?? selection.eff, this.home) ?? cfg.effort;
       const est = adapter(pickedRoute)?.estimatedCost?.(cfg.model, effUsed ?? null, info.promptChars, {
         ...input, home: this.home, ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}), ...(info.toolset ? { toolset: info.toolset } : {}),
       }) ?? null;
@@ -2000,7 +2000,7 @@ export class Store {
           });
         } catch (e) { budgetError = String((e as Error)?.message ?? e); }
       }
-      const modelsForRoute = this.routeModels(pickedRoute).filter(r => r.state !== 'retired' && !r.superseded_by);
+      const modelsForRoute = this.routeModels(pickedRoute).filter(r => r.state !== 'retired' && !r.superseded_by && !r.hidden);
       const comparisonInput: Array<{ model: string; effort: string }> = [];
       for (const m of modelsForRoute) {
         if (!modelPricing(m.model)) continue;

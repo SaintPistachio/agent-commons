@@ -32,6 +32,9 @@ test('encrypted backup bundles round-trip databases, artifacts, and local files'
   try {
     put(home, `artifacts/${artifactHash}`, artifactText);
     put(home, 'helpers/example.txt', 'helper fixture\n');
+    put(home, 'helpers/antigravity/catalog.json', '{"fixture":true}');
+    for (const lock of ['catalog.lock', 'candidate-attempts.lock', 'revalidation.lock'])
+      put(home, 'helpers/antigravity/' + lock, '0');
     put(home, 'automation/example.txt', 'automation fixture\n');
     const commons = new DatabaseSync(path.join(home, 'commons.sqlite'));
     try {
@@ -119,6 +122,9 @@ test('encrypted backup bundles round-trip databases, artifacts, and local files'
     assert.equal(restored.queued, 1);
     assert.equal(read(restoredHome, `artifacts/${artifactHash}`), artifactText);
     assert.equal(read(restoredHome, 'helpers/example.txt'), 'helper fixture\n');
+    assert.equal(read(restoredHome, 'helpers/antigravity/catalog.json'), '{"fixture":true}');
+    for (const lock of ['catalog.lock', 'candidate-attempts.lock', 'revalidation.lock'])
+      assert.equal(fs.existsSync(path.join(restoredHome, 'helpers', 'antigravity', lock)), false);
     assert.equal(read(restoredHome, 'automation/example.txt'), 'automation fixture\n');
     assert.equal(read(restoredHelper, '.local/evidence/example.txt'), 'ledger evidence fixture\n');
 
