@@ -1,0 +1,2 @@
+# Preserve the exported source bytes on Windows and Unix checkouts.
+* -text

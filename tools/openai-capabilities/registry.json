@@ -1,0 +1,989 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-10-30",
+  "currency": "USD",
+  "rate_unit": "per_1000000_tokens",
+  "notes": [
+    "Only these endpoint/model/tier combinations are admitted. Account access is not established by registry presence.",
+    "Text/JSON inputs and client-executed function tools only; hosted tools, files, media, hosted storage and background execution require separately bounded adapters.",
+    "Long-context rates apply to the whole request above 272000 input tokens.",
+    "Decisions currently supports only 30m cache lifetime and is not listed as a Batch endpoint."
+  ],
+  "models": {
+    "text-embedding-3-small": {
+      "capabilities": {
+        "embeddings": {
+          "endpoint": "/v1/embeddings",
+          "verified_at": "2026-10-30",
+          "tiers": {
+            "default": {
+              "input": "0.02",
+              "output": "0"
+            },
+            "batch": {
+              "input": "0.01",
+              "output": "0"
+            }
+          },
+          "max_input_tokens": 300000,
+          "max_input_tokens_per_item": 8192,
+          "max_output_tokens": 0,
+          "max_items": 2048,
+          "allowed_fields": [
+            "input",
+            "dimensions"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/guides/embeddings",
+            "https://developers.openai.com/api/docs/guides/batch"
+          ]
+        }
+      }
+    },
+    "gpt-6-luna": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-10-30",
+          "tiers": {
+            "default": {
+              "input": "0.1",
+              "output": "0.5",
+              "cache_read": "0.01",
+              "cache_write_30m": "0.125",
+              "cache_write_12h": "0.25"
+            },
+            "flex": {
+              "input": "0.05",
+              "output": "0.25",
+              "cache_read": "0.005",
+              "cache_write_30m": "0.0625",
+              "cache_write_12h": "0.125"
+            },
+            "batch": {
+              "input": "0.05",
+              "output": "0.25",
+              "cache_read": "0.005",
+              "cache_write_30m": "0.0625",
+              "cache_write_12h": "0.125"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "0.2",
+              "output": "0.75",
+              "cache_read": "0.02",
+              "cache_write_30m": "0.25",
+              "cache_write_12h": "0.5"
+            },
+            "flex": {
+              "input": "0.1",
+              "output": "0.375",
+              "cache_read": "0.01",
+              "cache_write_30m": "0.125",
+              "cache_write_12h": "0.25"
+            },
+            "batch": {
+              "input": "0.1",
+              "output": "0.375",
+              "cache_read": "0.01",
+              "cache_write_30m": "0.125",
+              "cache_write_12h": "0.25"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/guides/batch",
+            "https://developers.openai.com/api/docs/guides/prompt-caching",
+            "https://developers.openai.com/api/docs/models/gpt-6-luna",
+            "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+          ]
+        },
+        "decisions": {
+          "endpoint": "/v1/decisions",
+          "verified_at": "2026-10-30",
+          "tiers": {
+            "default": {
+              "input": "0.1",
+              "output": "0",
+              "cache_read": "0.01",
+              "cache_write_30m": "0.125"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "0.2",
+              "output": "0",
+              "cache_read": "0.02",
+              "cache_write_30m": "0.25"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 0,
+          "allowed_fields": [
+            "input",
+            "questions",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text",
+            "json"
+          ],
+          "cache_ttls": [
+            "30m"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/guides/decisions",
+            "https://developers.openai.com/api/docs/guides/prompt-caching"
+          ]
+        }
+      }
+    },
+    "gpt-6.1-sol": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-10-30",
+          "tiers": {
+            "default": {
+              "input": "2",
+              "output": "10",
+              "cache_read": "0.1",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "flex": {
+              "input": "1",
+              "output": "5",
+              "cache_read": "0.05",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            },
+            "batch": {
+              "input": "1",
+              "output": "5",
+              "cache_read": "0.05",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "4",
+              "output": "15",
+              "cache_read": "0.2",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            },
+            "flex": {
+              "input": "2",
+              "output": "7.5",
+              "cache_read": "0.1",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "batch": {
+              "input": "2",
+              "output": "7.5",
+              "cache_read": "0.1",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/guides/batch",
+            "https://developers.openai.com/api/docs/guides/prompt-caching",
+            "https://developers.openai.com/api/docs/models/gpt-6-luna",
+            "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+          ]
+        }
+      }
+    },
+    "gpt-6.2-sol": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "2",
+              "output": "10",
+              "cache_read": "0.1",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "batch": {
+              "input": "1",
+              "output": "5",
+              "cache_read": "0.05",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "4",
+              "output": "15",
+              "cache_read": "0.2",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            },
+            "batch": {
+              "input": "2",
+              "output": "7.5",
+              "cache_read": "0.1",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/guides/batch",
+            "https://developers.openai.com/api/docs/guides/prompt-caching",
+            "https://developers.openai.com/api/docs/models/gpt-6.2-sol"
+          ]
+        }
+      }
+    },
+    "gpt-6.2-astra": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "8",
+              "output": "40",
+              "cache_read": "0.4",
+              "cache_write_30m": "10",
+              "cache_write_12h": "20"
+            },
+            "batch": {
+              "input": "4",
+              "output": "20",
+              "cache_read": "0.2",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "16",
+              "output": "60",
+              "cache_read": "0.8",
+              "cache_write_30m": "20",
+              "cache_write_12h": "40"
+            },
+            "batch": {
+              "input": "8",
+              "output": "30",
+              "cache_read": "0.4",
+              "cache_write_30m": "10",
+              "cache_write_12h": "20"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/guides/batch",
+            "https://developers.openai.com/api/docs/guides/prompt-caching",
+            "https://developers.openai.com/api/docs/models/gpt-6.2-astra"
+          ]
+        }
+      }
+    },
+    "gpt-5.4-mini": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "0.75",
+              "output": "4.5",
+              "cache_read": "0.075"
+            },
+            "batch": {
+              "input": "0.375",
+              "output": "2.25",
+              "cache_read": "0.0375"
+            },
+            "flex": {
+              "input": "0.375",
+              "output": "2.25",
+              "cache_read": "0.0375"
+            }
+          },
+          "max_input_tokens": 272000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-5.4-mini"
+          ]
+        }
+      }
+    },
+    "gpt-5.6-cyber": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "12.5",
+              "output": "75",
+              "cache_read": "1.25",
+              "cache_write_30m": "15.625",
+              "cache_write_12h": "31.25"
+            }
+          },
+          "max_input_tokens": 272000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-5.6-cyber"
+          ]
+        }
+      }
+    },
+    "gpt-5.6-luna": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "0.2",
+              "output": "1.2",
+              "cache_read": "0.02",
+              "cache_write_30m": "0.25",
+              "cache_write_12h": "0.5"
+            },
+            "batch": {
+              "input": "0.1",
+              "output": "0.6",
+              "cache_read": "0.01",
+              "cache_write_30m": "0.125",
+              "cache_write_12h": "0.25"
+            },
+            "flex": {
+              "input": "0.1",
+              "output": "0.6",
+              "cache_read": "0.01",
+              "cache_write_30m": "0.125",
+              "cache_write_12h": "0.25"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "0.4",
+              "output": "1.8",
+              "cache_read": "0.04",
+              "cache_write_30m": "0.5",
+              "cache_write_12h": "1"
+            },
+            "batch": {
+              "input": "0.2",
+              "output": "0.9",
+              "cache_read": "0.02",
+              "cache_write_30m": "0.25",
+              "cache_write_12h": "0.5"
+            },
+            "flex": {
+              "input": "0.2",
+              "output": "0.9",
+              "cache_read": "0.02",
+              "cache_write_30m": "0.25",
+              "cache_write_12h": "0.5"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
+          ]
+        }
+      }
+    },
+    "gpt-5.6-sol": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "4",
+              "output": "20",
+              "cache_read": "0.4",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            },
+            "batch": {
+              "input": "2",
+              "output": "10",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "flex": {
+              "input": "2",
+              "output": "10",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "8",
+              "output": "30",
+              "cache_read": "0.8",
+              "cache_write_30m": "10",
+              "cache_write_12h": "20"
+            },
+            "batch": {
+              "input": "4",
+              "output": "15",
+              "cache_read": "0.4",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            },
+            "flex": {
+              "input": "4",
+              "output": "15",
+              "cache_read": "0.4",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+          ]
+        }
+      }
+    },
+    "gpt-5.6-terra": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "2",
+              "output": "12",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "batch": {
+              "input": "1",
+              "output": "6",
+              "cache_read": "0.1",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            },
+            "flex": {
+              "input": "1",
+              "output": "6",
+              "cache_read": "0.1",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "4",
+              "output": "18",
+              "cache_read": "0.4",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            },
+            "batch": {
+              "input": "2",
+              "output": "9",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "flex": {
+              "input": "2",
+              "output": "9",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
+          ]
+        }
+      }
+    },
+    "gpt-6-astra": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "10",
+              "output": "50",
+              "cache_read": "1",
+              "cache_write_30m": "12.5",
+              "cache_write_12h": "25"
+            },
+            "batch": {
+              "input": "5",
+              "output": "25",
+              "cache_read": "0.5",
+              "cache_write_30m": "6.25",
+              "cache_write_12h": "12.5"
+            },
+            "flex": {
+              "input": "5",
+              "output": "25",
+              "cache_read": "0.5",
+              "cache_write_30m": "6.25",
+              "cache_write_12h": "12.5"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "20",
+              "output": "75",
+              "cache_read": "2",
+              "cache_write_30m": "25",
+              "cache_write_12h": "50"
+            },
+            "batch": {
+              "input": "10",
+              "output": "37.5",
+              "cache_read": "1",
+              "cache_write_30m": "12.5",
+              "cache_write_12h": "25"
+            },
+            "flex": {
+              "input": "10",
+              "output": "37.5",
+              "cache_read": "1",
+              "cache_write_30m": "12.5",
+              "cache_write_12h": "25"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-6-astra"
+          ]
+        }
+      }
+    },
+    "gpt-6-cyber": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "20",
+              "output": "100",
+              "cache_read": "2",
+              "cache_write_30m": "25",
+              "cache_write_12h": "50"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "40",
+              "output": "150",
+              "cache_read": "4"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-6-cyber"
+          ]
+        }
+      }
+    },
+    "gpt-6-sol": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "2",
+              "output": "10",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "batch": {
+              "input": "1",
+              "output": "5",
+              "cache_read": "0.1",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            },
+            "flex": {
+              "input": "1",
+              "output": "5",
+              "cache_read": "0.1",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "4",
+              "output": "15",
+              "cache_read": "0.4",
+              "cache_write_30m": "5",
+              "cache_write_12h": "10"
+            },
+            "batch": {
+              "input": "2",
+              "output": "7.5",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "flex": {
+              "input": "2",
+              "output": "7.5",
+              "cache_read": "0.2",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-6-sol"
+          ]
+        }
+      }
+    },
+    "gpt-6.1-terra": {
+      "capabilities": {
+        "responses": {
+          "endpoint": "/v1/responses",
+          "verified_at": "2026-11-20",
+          "tiers": {
+            "default": {
+              "input": "1",
+              "output": "5",
+              "cache_read": "0.05",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            },
+            "batch": {
+              "input": "0.5",
+              "output": "2.5",
+              "cache_read": "0.025",
+              "cache_write_30m": "0.625",
+              "cache_write_12h": "1.25"
+            },
+            "flex": {
+              "input": "0.5",
+              "output": "2.5",
+              "cache_read": "0.025",
+              "cache_write_30m": "0.625",
+              "cache_write_12h": "1.25"
+            }
+          },
+          "long_context_threshold": 272000,
+          "long_context_rates": {
+            "default": {
+              "input": "2",
+              "output": "7.5",
+              "cache_read": "0.1",
+              "cache_write_30m": "2.5",
+              "cache_write_12h": "5"
+            },
+            "batch": {
+              "input": "1",
+              "output": "3.75",
+              "cache_read": "0.05",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            },
+            "flex": {
+              "input": "1",
+              "output": "3.75",
+              "cache_read": "0.05",
+              "cache_write_30m": "1.25",
+              "cache_write_12h": "2.5"
+            }
+          },
+          "max_input_tokens": 922000,
+          "max_output_tokens": 128000,
+          "allowed_fields": [
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "reasoning",
+            "text",
+            "prompt_cache_options",
+            "prompt_cache_key"
+          ],
+          "input_modalities": [
+            "text"
+          ],
+          "cache_ttls": [
+            "30m",
+            "12h"
+          ],
+          "sources": [
+            "https://developers.openai.com/api/docs/pricing",
+            "https://developers.openai.com/api/docs/models",
+            "https://developers.openai.com/api/docs/models/gpt-6.1-terra"
+          ]
+        }
+      }
+    }
+  },
+  "not_implemented": [
+    "images",
+    "audio",
+    "hosted_retrieval",
+    "agents"
+  ]
+}

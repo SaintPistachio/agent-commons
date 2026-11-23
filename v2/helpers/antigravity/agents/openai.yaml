@@ -1,0 +1,6 @@
+interface:
+  display_name: "Antigravity Helper"
+  short_description: "Bounce ideas, compare options, and get second opinions"
+  default_prompt: "Use $antigravity-helper to develop this idea, compare options, or independently check the supplied reasoning."
+policy:
+  allow_implicit_invocation: true

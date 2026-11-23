@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "organization_id": "org-REPLACE_WITH_YOUR_ORGANIZATION",
+  "project_id": "proj_REPLACE_WITH_YOUR_PROJECT",
+  "funding_policy": "existing_prepaid_only",
+  "allocation_margin": "0.05",
+  "max_transient_retries": 2,
+  "retry_elapsed_seconds": 60,
+  "request_timeout_seconds": 30,
+  "standard_fallback": false,
+  "credential_env_file": "tools/openai-capabilities/.local/secrets/project.env",
+  "admin_credential_env_file": "tools/openai-capabilities/.local/secrets/admin.env",
+  "credential_env_name": "OPENAI_API_KEY",
+  "api_base_url": "https://api.openai.com/v1",
+  "activation_max_usd": "1",
+  "account_cost_max_age_seconds": 300,
+  "admin_account_access": "read_only"
+}
