@@ -6,7 +6,6 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { Runner } from '../src/runner.ts';
 import { Store } from '../src/store.ts';
 import { startServer } from '../src/server.ts';
 import { editDiff, worktreeGit } from '../src/adapters/shared.ts';
@@ -21,37 +20,6 @@ function workspace(t: TestContext) {
   fs.mkdirSync(root);
   return { base, home, root, after: (cleanup: () => void | Promise<void>) => cleanups.push(cleanup) };
 }
-
-test('the production worker gate blocks direct, automatic and previously queued native jobs', t => {
-  const { home, root, after } = workspace(t);
-  const store = new Store(home);
-  after(() => store.close());
-  const operator = store.createActor('operator', 'operator').actor;
-  const participant = store.createActor('participant', 'participant').actor;
-  const project = store.call(operator, 'project_create', { name: 'Repository', root, operation_id: randomUUID() }).project;
-  const submit = (route: string, extra = {}) => store.call(participant, 'job_submit', {
-    route, project_id: project.id, prompt: 'Summarize the project.', operation_id: randomUUID(), ...extra,
-  });
-  for (const route of ['claude', 'codex', 'ag']) {
-    assert.throws(() => submit(route), { code: 'WORKER_ROUTE_GATED' });
-  }
-  assert.throws(() => submit('auto'), { code: 'NO_ELIGIBLE_ROUTE' });
-  assert.throws(() => submit('api', { tools: 'custom' }), { code: 'WORKER_TOOLSET_GATED' });
-  const room = store.call(participant, 'air_tx', {
-    project_id: project.id, packet: '@air1\n#0 ropen subj="Review" seats=claude,codex "Review the project"', operation_id: randomUUID(),
-  });
-  assert.throws(() => store.call(participant, 'air_tx', {
-    project_id: project.id, packet: `@air1\n#0 rstep g=${room.handles['0']} "Review it"`, operation_id: randomUUID(),
-  }), { code: 'ROOM_SEATS_UNAVAILABLE' });
-  const id = randomUUID();
-  store.db.prepare(`INSERT INTO jobs(id,project_id,route,mode,prompt,timeout_ms,status,created_by,created_at)
-    VALUES(?,?, 'claude','advice','legacy job',1000,'queued',?,?)`).run(id, project.id, participant.id, new Date().toISOString());
-  new Runner(store, home).tick();
-  assert.equal(store.jobRecord(id)?.status, 'failed');
-  assert.equal(store.jobRecord(id)?.error, 'WORKER_ROUTE_GATED');
-  assert.equal(store.jobRecord(id)?.pid, null);
-  assert.equal(fs.existsSync(path.join(home, 'jobs', id)), false);
-});
 
 test('only operators approve rooted projects and a redirected root must be reapproved', async t => {
   const { base, home, root, after } = workspace(t);
@@ -90,7 +58,7 @@ test('a schema upgrade preserves project history and leaves legacy roots unappro
   const operator = store.createActor('operator', 'operator').actor;
   const project = store.call(operator, 'project_create', { root, name: 'Legacy project', operation_id: randomUUID() }).project;
   store.call(operator, 'task_create', { project_id: project.id, title: 'Retained task', operation_id: randomUUID() });
-  store.db.exec('ALTER TABLE projects DROP COLUMN approved_root; PRAGMA user_version=22');
+  store.db.exec('ALTER TABLE projects DROP COLUMN approved_root; ALTER TABLE projects DROP COLUMN approved_git_dir; PRAGMA user_version=24');
   store.close();
   const upgraded = new Store(home);
   after(() => upgraded.close());

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { antigravity } from '../src/adapters/antigravity.ts';
 import { metadataFamily, metadataModel, metadataModels } from '../src/adapters/inventory.ts';
 import type { ProbeContext, RunContext, UsageWindow } from '../src/adapters/types.ts';
-import type { Json } from '../src/store.ts';
+import type { Json } from './fixtures/service.ts';
 
 const seedFile = fileURLToPath(new URL('../helpers/antigravity/routing-seed.json', import.meta.url));
 const profiles = JSON.parse(fs.readFileSync(seedFile, 'utf8')).profiles as Array<{

@@ -1,5 +1,5 @@
 /** Learn only from the rate limits actually observed in this job's event stream. */
-import type { ConsumptionRow, UsageObservation, UsageWindow } from './types.ts';
+import type { CodexResetCredit, CodexResetSummary, ConsumptionRow, UsageObservation, UsageWindow } from './types.ts';
 
 type Row = Record<string, unknown>;
 type Sample = UsageObservation & { used: number };
@@ -119,4 +119,106 @@ export function parseCodexAppServerRateLimits(result: unknown, previous: UsageWi
   const { usage } = codexLimits(events, previous, now);
   if (!usage.length) return undefined;
   return observedAt ? usage.map(u => ({ ...u, observed_at: observedAt })) : usage;
+}
+
+function isoFromEpochSeconds(value: unknown): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  const ms = value * 1000;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * Defensively parses `rateLimitResetCredits` from `account/rateLimits/read`.
+ * Malformed or absent billing metadata returns `undefined` and never breaks rate-limit parsing.
+ */
+export function parseCodexResetCredits(result: unknown, capturedAt: string): CodexResetSummary | undefined {
+  const r = row(result);
+  const raw = row(r?.rateLimitResetCredits);
+  if (!raw) return undefined;
+  const count = raw.availableCount;
+  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return undefined;
+  const credits: CodexResetCredit[] = [];
+  if (Array.isArray(raw.credits)) {
+    for (const item of raw.credits) {
+      const c = row(item);
+      if (!c || typeof c.id !== 'string' || !c.id.trim() || typeof c.status !== 'string' || !c.status.trim()) continue;
+      const grantedAt = isoFromEpochSeconds(c.grantedAt);
+      if (!grantedAt) continue;
+      const expiresAt = c.expiresAt == null ? null : isoFromEpochSeconds(c.expiresAt);
+      if (c.expiresAt != null && expiresAt === null) continue;
+      credits.push({ id: c.id, status: c.status, grantedAt, expiresAt });
+    }
+  }
+  return { availableCount: count, capturedAt, credits };
+}
+
+export interface CodexResetExpiryGroup {
+  expiresAt: string;
+  count: number;
+  remainingMs: number;
+}
+
+export interface CodexResetExpiryReport {
+  remainingCount: number;
+  expiring: CodexResetExpiryGroup[];
+  nextExpiry: string | null;
+  nonExpiringCount: number;
+  unknownCount: number;
+}
+
+/**
+ * Computes remaining available banked resets and soonest-first expiries within `leadDays`
+ * (modeled on `codex-pacer`'s `QuotaResetSummary` and `ResetExpiryReminder`).
+ */
+export function codexExpiringResets(summary: CodexResetSummary | undefined, leadDays = 3, now = Date.now()): CodexResetExpiryReport {
+  if (!summary || summary.availableCount <= 0) {
+    return { remainingCount: 0, expiring: [], nextExpiry: null, nonExpiringCount: 0, unknownCount: 0 };
+  }
+  const capturedMs = Date.parse(summary.capturedAt);
+  const newlyExpired = new Set<string>();
+  for (const c of summary.credits) {
+    if (c.status !== 'available' || !c.expiresAt) continue;
+    const expMs = Date.parse(c.expiresAt);
+    if (Number.isFinite(capturedMs) && expMs > capturedMs && expMs <= now) newlyExpired.add(c.id);
+  }
+  const remainingCount = Math.max(0, summary.availableCount - newlyExpired.size);
+  if (remainingCount === 0) {
+    return { remainingCount: 0, expiring: [], nextExpiry: null, nonExpiringCount: 0, unknownCount: 0 };
+  }
+  const seen = new Set<string>();
+  const active = summary.credits
+    .filter(c => c.status === 'available' && (c.expiresAt === null || Date.parse(c.expiresAt) > now))
+    .sort((a, b) => {
+      const left = a.expiresAt ? Date.parse(a.expiresAt) : Infinity;
+      const right = b.expiresAt ? Date.parse(b.expiresAt) : Infinity;
+      return left === right ? a.id.localeCompare(b.id) : left - right;
+    })
+    .filter(c => {
+      if (seen.has(c.id)) return false;
+      seen.add(c.id);
+      return true;
+    })
+    .slice(0, remainingCount);
+
+  const boundedDays = Math.min(30, Math.max(1, Math.trunc(leadDays)));
+  const leadMs = boundedDays * 86_400_000;
+  const groups = new Map<string, number>();
+  let nextExpiryMs = Infinity;
+  let nonExpiringCount = 0;
+  for (const c of active) {
+    if (!c.expiresAt) { nonExpiringCount++; continue; }
+    const expMs = Date.parse(c.expiresAt);
+    if (expMs < nextExpiryMs) nextExpiryMs = expMs;
+    if (expMs - now <= leadMs) groups.set(c.expiresAt, (groups.get(c.expiresAt) ?? 0) + 1);
+  }
+  const expiring = [...groups.entries()]
+    .map(([expiresAt, count]) => ({ expiresAt, count, remainingMs: Date.parse(expiresAt) - now }))
+    .sort((a, b) => a.remainingMs - b.remainingMs);
+  return {
+    remainingCount,
+    expiring,
+    nextExpiry: Number.isFinite(nextExpiryMs) ? new Date(nextExpiryMs).toISOString() : null,
+    nonExpiringCount,
+    unknownCount: Math.max(0, remainingCount - active.length),
+  };
 }

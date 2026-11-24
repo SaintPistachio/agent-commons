@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { buildContext, resolveContextRoot } from '../src/context.ts';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 
 const absent = () => undefined;
 

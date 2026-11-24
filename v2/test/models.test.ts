@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { Prober } from '../src/prober.ts';
 import { antigravity } from '../src/adapters/antigravity.ts';
 import { openaiApi } from '../src/adapters/openai-api.ts';

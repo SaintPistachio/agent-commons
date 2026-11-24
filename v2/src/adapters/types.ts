@@ -17,6 +17,8 @@ export interface RunnerOptions {
   openaiHelper?: RouteCommand;
   /** The guarded antigravity-helper (`pwsh -File Invoke-Antigravity.ps1`); reasoning only, included Google quota. */
   antigravity?: RouteCommand;
+  /** Test seam for Antigravity ACP stdio server injection. */
+  antigravityAcp?: RouteCommand;
   routeLimits?: Record<string, number>;
   /** Jobs running at once across all routes when the operator set no global limit (default 3). An operator's `limits` setting wins. */
   globalLimit?: number;
@@ -229,6 +231,7 @@ export interface ProbeResult {
 export interface ProbeOverrides {
   antigravityHelperRoot?: string;
   antigravityCli?: string;
+  antigravityAcp?: RouteCommand;
   adapters?: string[];
   schedule?: boolean;
   /** Test seams: production discovery always refreshes official documentation. */
@@ -245,6 +248,8 @@ export interface ProbeOverrides {
   /** Local interpreter and package-index seams for helper SDK maintenance. */
   openaiSdkRun?: import('./openai-sdk.ts').SdkProcessRunner;
   openaiSdkFetch?: typeof fetch;
+  /** Test seam for passive Claude state reads: explicit fixture path, null to disable, or undefined for default. */
+  claudeStatePath?: string | null;
 }
 export interface ProbeContext {
   readonly home: string;
@@ -258,6 +263,32 @@ export interface ProbeContext {
   readonly selected?: CliBinary;
   /** Latest known usage windows for this route, when available. */
   readonly usage?: UsageWindow[];
+  /** Optional diagnostic sink when a metadata usage read fails cleanly without a snapshot. */
+  readonly onUsageError?: (diagnostic: UsageDiagnostic) => void;
+}
+
+export interface UsageDiagnostic {
+  kind: string;
+  method?: string;
+  code?: number;
+  at: string;
+}
+
+export interface CodexResetCredit {
+  id: string;
+  status: string;
+  grantedAt: string;
+  expiresAt: string | null;
+}
+
+export interface CodexResetSummary {
+  availableCount: number;
+  capturedAt: string;
+  credits: CodexResetCredit[];
+}
+
+export interface UsageMetadata {
+  resetCredits?: CodexResetSummary;
 }
 
 export interface UsageSnapshot {
@@ -265,6 +296,10 @@ export interface UsageSnapshot {
   source: string;
   /** An unrecognized provider meter prevents a cooldown decision from this snapshot. */
   partial?: boolean;
+  /** Non-identifying hash of account/origin/plan scope for isolating cycle history. */
+  accountScope?: string;
+  /** Non-identifying route metadata such as Codex banked reset credits. */
+  meta?: UsageMetadata;
 }
 
 /** A native metadata command reported model work. Suspend quota reads for this executable identity. */

@@ -8,7 +8,7 @@ import { cliFreshnessLines, compareCliVersions, launchSelectedCli, parseCliVersi
 import { codex, resolveCodex } from '../src/adapters/codex.ts';
 import type { Active, CliBinary, RunContext } from '../src/adapters/types.ts';
 import { Prober } from '../src/prober.ts';
-import { Store, type Json } from '../src/store.ts';
+import { Store, type Json } from './fixtures/service.ts';
 
 const desktop: CliBinary = { path: '/desktop/codex', source: 'desktop install', version: '0.164.0' };
 const cache: CliBinary = { path: '/cache/codex', source: 'desktop cache', version: '0.167.0-alpha.4.1' };

@@ -263,11 +263,14 @@ rl.on('line', line => {
     // Server-initiated request with id:1 must be ignored rather than mistaken for initialize reply
     console.log(JSON.stringify({ id: 1, method: 'ping', params: {} }));
     console.log(JSON.stringify({ id: 1, result: {} }));
-  } else if (msg.id === 2 && msg.method === 'account/rateLimits/read') {
+  } else if (msg.method === 'account/read') {
+    console.log(JSON.stringify({ id: msg.id, result: { account: { type: 'chatgpt', planType: 'plus' }, workspaceRouting: { chatgptAccountId: 'acct-1', backendOrigin: 'https://chatgpt.com' } } }));
+  } else if (msg.method === 'account/rateLimits/read') {
     const send = () => {
       console.log(JSON.stringify({
-        id: 2,
+        id: msg.id,
         result: {
+          accountId: 'acct-1',
           rateLimits: { limitId: 'codex', primary: { usedPercent: 25, windowDurationMins: 10080, resetsAt: ${inSec} }, secondary: null, rateLimitReachedType: null },
           rateLimitsByLimitId: { codex: { limitId: 'codex', primary: { usedPercent: 25, windowDurationMins: 10080, resetsAt: ${inSec} }, secondary: null, rateLimitReachedType: null } },
         },

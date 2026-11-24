@@ -21,7 +21,7 @@ Opcodes:
       intent: fast code review deep edit; eff: min low med high max (the route's profile picks model and effort)
       route=auto (default): the service picks from the R line (local, sub, then paid; workspace-read routes preferred when ctx is empty; reviews go to another model family);
       cost=local|sub|paid (default sub; paid also needs max_usd purpose deliv); shell=yes for edit jobs that run commands
-      proto=air: the worker ends with an @air1 verdict block; ctx=file:path[:a-b],art:aN,task:tN,diff:A..B
+      proto=air: the worker ends with an @air1 verdict block; ctx=file:path[:a-b],art:aN,task:tN,diff:A..B,recall:query,graph:symbol
   jcan j=                                   cancel a queued job or stop a running one
   out j= v=accepted|rejected|redone "reason" [replacement=jN]
       Record explicit feedback on a job. For redone, j= is the original; replacement= optionally links the new job.

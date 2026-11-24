@@ -74,7 +74,7 @@ const tools: Tool[] = [
       task: { type: 'string', enum: ['explain', 'coding', 'complex', 'review'], description: 'antigravity only: the helper task category (default explain).' },
       effort_reason: str('antigravity only: one line (up to 240 characters) on why this effort fits.', 240),
       prompt: str('Complete, self-contained instructions. claude workers also see the files; openai-api workers see only this prompt.', 200000),
-      model: str('openai-api default: gpt-6-luna.', 128), effort: str(undefined, 32),
+      model: str('Optional model override (defaults to the route profile).', 128), effort: str(undefined, 32),
       timeout_minutes: { type: 'integer', minimum: 1, maximum: 240, description: 'Default 30 (claude), 10 (openai-api, max 15) or 15 (antigravity, max 60).' },
       max_cost_usd: str('openai-api only: explicit ceiling in USD, e.g. "0.25" (a limit, not an amount to spend).', 16),
       max_output_tokens: { type: 'integer', minimum: 256, maximum: 65536, description: 'openai-api only; default 8192, include room for reasoning.' },

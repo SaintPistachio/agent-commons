@@ -16,6 +16,14 @@ import { metadataEfforts, metadataFamily, metadataModel, metadataModels } from '
 import { acceptedAntigravityIdentity, antigravityInventorySummary, currentAntigravityProfiles, profileState,
   projectAntigravityInventory, saveAntigravityInventory, type SeedProfile } from './antigravity-inventory.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, modelPricing } from './model-pricing.ts';
+import {
+  acpInventorySummary,
+  launchAntigravityAcp,
+  probeAntigravityAcp,
+  projectAcpDiscoveries,
+  resolveAntigravityAcp,
+  saveAcpCatalog,
+} from './antigravity-acp.ts';
 import type { Consumption, ConsumptionRun, ModelDiscoveries, ModelDiscovery, PoolEvidence } from './types.ts';
 
 /**
@@ -309,6 +317,29 @@ export function resolveAntigravity(): RouteCommand | undefined {
 function launch(job: Json, ctx: RunContext): void {
   const steering = steer(job, ctx);
   if (steering.error) return ctx.finish('failed', { error: steering.error });
+  const acp = resolveAntigravityAcp(ctx.options);
+  if (acp) {
+    return launchAntigravityAcp(
+      job,
+      ctx,
+      acp,
+      { family: steering.family, effort: steering.effort, availableProfiles: availableProfiles(ctx.home) },
+      {
+        vendor,
+        classifyQuotaFailure(failedJob, failedCtx, message, reportedModel) {
+          const reply = exhaustionReply(failedJob, failedCtx, {
+            error_code: 'QUOTA_EXHAUSTED',
+            error: message,
+            reported_model: reportedModel,
+          });
+          const { profiles } = routingProfiles(failedJob, failedCtx);
+          const rows = mergedUsage(failedJob, failedCtx, reply);
+          const allClosed = profiles.length > 0 && profiles.every(p => profileState(p, rows) === 'closed');
+          return { error: `${allClosed ? 'QUOTA_EXHAUSTED' : 'AG_POOL_EXHAUSTED'}: ${message}`.trim(), reply };
+        },
+      },
+    );
+  }
   const command = ctx.options.antigravity ?? resolveAntigravity();
   if (!command) return ctx.finish('failed', { error: 'ROUTE_EXECUTABLE_NOT_FOUND' });
   const o = job.options ?? {};
@@ -399,6 +430,13 @@ function complete(job: Json, ctx: RunContext, code: number | null, reason?: stri
 }
 
 async function discover(ctx: ProbeContext): Promise<ModelDiscoveries> {
+  const acp = resolveAntigravityAcp(ctx.options, ctx.overrides);
+  if (acp) {
+    const res = await probeAntigravityAcp(acp);
+    if (!res.ok) throw new Error(res.reason);
+    saveAcpCatalog(ctx.home, res.snapshot, new Date().toISOString());
+    return projectAcpDiscoveries(res.snapshot, new Set(seedProfiles().map(p => p.model)));
+  }
   // Injected offline fixtures cover persisted legacy shapes without launching a native helper.
   if (ctx.overrides.antigravityHelperRoot && !ctx.options?.antigravity) return discoverLocalFixture(ctx);
   const state = path.join(ctx.home, 'helpers', 'antigravity');
@@ -460,6 +498,25 @@ function antigravityCliPath(ctx: ProbeContext): string {
  * never writes the record and never marks the route verified on its own: only the helper's Probe approves.
  */
 async function probe(ctx: ProbeContext): Promise<ProbeResult> {
+  const acp = resolveAntigravityAcp(ctx.options, ctx.overrides);
+  if (acp) {
+    const target = acp.prefix?.[0] && fs.existsSync(acp.prefix[0]) ? acp.prefix[0] : acp.file;
+    let binarySha256: string | null = null;
+    try { binarySha256 = await hashFile(target); } catch { /* unavailable handled below */ }
+    const res = await probeAntigravityAcp(acp);
+    if (!res.ok) return { state: res.state, binarySha256, reason: res.reason };
+    const cli = antigravityCliPath(ctx);
+    return {
+      state: 'verified',
+      binarySha256,
+      cliVersion: res.snapshot.cliVersion,
+      binary: ctx.installed?.find(binary => sameCliPath(binary.path, cli)) ?? {
+        path: target,
+        version: res.snapshot.cliVersion,
+        source: 'acp',
+      },
+    };
+  }
   const helperRoot = ctx.overrides.antigravityHelperRoot ?? fileURLToPath(new URL('../../helpers/antigravity/', import.meta.url));
   const cli = antigravityCliPath(ctx);
   const recordFile = path.join(ctx.home, 'helpers', 'antigravity', 'acceptance.json');
@@ -523,7 +580,13 @@ export const antigravity: PlatformAdapter = {
   probe,
   binaries: ctx => versionedCopies([{ path: antigravityCliPath(ctx), source: 'helper install' }], file => ({ file })),
   discover,
-  discoverySummary: ctx => antigravityInventorySummary(ctx.home),
+  discoverySummary: ctx => {
+    if (!ctx.overrides.antigravityHelperRoot && !ctx.options?.antigravity) {
+      const acpSummary = acpInventorySummary(ctx.home);
+      if (acpSummary) return acpSummary;
+    }
+    return antigravityInventorySummary(ctx.home);
+  },
   usage: quotaUsage,
   observeUsage,
   reopenedQuotaPools: (rows, _known, home) => [...new Set(availableProfiles(home)

@@ -70,7 +70,7 @@ if (-not (Test-Path (Join-Path $app 'v2\src\cli.ts'))) {
     $tar = "$staging.tar"
     git -C $SourceRoot archive --format=tar -o $tar HEAD v2
     if ($LASTEXITCODE) { throw "git archive failed ($LASTEXITCODE)" }
-    # Windows' own tar: Git's GNU tar (first on PATH under Git Bash) reads 'T:\...' as a remote host.
+    # Windows' own tar: Git's GNU tar (first on PATH under Git Bash) reads 'D:\...' as a remote host.
     $tarExe = if ($IsWindows) { Join-Path $env:SystemRoot 'System32\tar.exe' } else { 'tar' }
     & $tarExe -xf $tar -C $staging
     if ($LASTEXITCODE) { throw "release extraction failed ($LASTEXITCODE)" }

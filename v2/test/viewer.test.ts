@@ -8,7 +8,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store, type Actor } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
-import { listRooms, loadRoom, openViewerDb, renderRoom, roomReport, startViewer } from '../src/viewer.ts';
+import { listRooms, loadRoom, loadStatus, openViewerDb, renderRoom, renderStatus, roomReport, startViewer, statusReport } from '../src/viewer.ts';
 
 function fixture(t: any) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-viewer-'));
@@ -94,4 +94,55 @@ test('the live viewer needs its start key, checks Host, serves only GET, and nev
   assert.equal((await get(origin + '/', { cookie, host: 'evil.example' })).status, 421, 'DNS rebinding is refused');
   assert.equal((await get(origin + '/', { cookie }, 'POST')).status, 405);
   assert.equal((f.store.db.prepare('SELECT count(*) n FROM events').get() as any).n, before, 'viewing adds nothing to the database');
+});
+
+test('status view renders pace rings, 7-day cycle charts, banked resets, and escapes untrusted errors with zero JS', async t => {
+  const f = fixture(t);
+  const nowMs = Date.now();
+  const resetIso = new Date(nowMs + 4 * 86_400_000).toISOString();
+  const p1 = new Date(nowMs - 2 * 86_400_000).toISOString();
+  const p2 = new Date(nowMs - 60_000).toISOString();
+  f.store.recordUsageMeta('codex', {
+    accountScope: 'scope-1',
+    meta: {
+      resetCredits: {
+        availableCount: 1,
+        capturedAt: p2,
+        credits: [{ id: 'rc-1', status: 'available', grantedAt: p1, expiresAt: new Date(nowMs + 36 * 3600_000).toISOString() }],
+      },
+    },
+  });
+  f.store.recordUsage('codex', [{ pool: 'codex', window: '10080m', remaining_percent: 82, resets_at: resetIso, observed_at: p1 }], 'app-server');
+  f.store.recordUsage('codex', [{ pool: 'codex', window: '10080m', remaining_percent: 64, resets_at: resetIso, observed_at: p2 }], 'app-server');
+  f.store.recordUsageError('claude', { kind: 'signedOut<script>alert(1)</script>', method: 'usage', at: p2 });
+
+  const db = openViewerDb(f.home);
+  f.closers.push(() => db.close());
+  const status = loadStatus(db, f.home, nowMs);
+  assert.equal(status.cycles.length, 1);
+  assert.equal(status.cycles[0].points.length, 2);
+
+  const html = renderStatus(status, { mode: 'live' });
+  assert.ok(!html.includes('<script>'));
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /<svg[^>]*viewBox="0 0 64 64"/);
+  assert.match(html, /<svg class="chart-svg"/);
+  assert.match(html, /banked reset/);
+  assert.match(html, /href="\/status"/);
+
+  const snap = statusReport(f.home, new Date(nowMs).toISOString());
+  assert.match(snap, /Status and quota/);
+  assert.ok(!snap.includes('<script>'));
+
+  const viewer = await startViewer(f.home, 0);
+  f.closers.push(() => viewer.close());
+  const origin = new URL(viewer.url).origin;
+  assert.equal((await get(origin + '/status')).status, 401);
+  const entry = await get(viewer.url);
+  const cookie = String(entry.headers['set-cookie']).split(';')[0];
+  const res = await get(origin + '/status', { cookie });
+  assert.equal(res.status, 200);
+  assert.match(res.headers['content-security-policy'] as string, /default-src 'none'/);
+  assert.match(res.body, /Routes and quota pace/);
+  assert.equal((await get(origin + '/status', { cookie, host: 'evil.example' })).status, 421);
 });

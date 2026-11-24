@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Store, type Json } from '../src/store.ts';
+import { Store, type Json } from './fixtures/service.ts';
 import { acceptedAssignments, outcomeStats } from '../src/ops.ts';
 import { appendOutcome } from '../src/outcomes.ts';
 import { migrate, SCHEMA_VERSION } from '../src/schema.ts';

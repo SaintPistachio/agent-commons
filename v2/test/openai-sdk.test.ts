@@ -17,7 +17,7 @@ import { sdkStatusLine } from '../src/adapters/sdk-freshness.ts';
 import { recordSdkRecovery } from '../src/prober.ts';
 import { migrate } from '../src/schema.ts';
 import { sdkUpdateCommand } from '../src/sdk-update-command.ts';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 
 const route = openaiApi.capabilities.id;
 const installed = '3.41.0', target = '3.57.0', tzdata = '2026.6';
@@ -69,7 +69,6 @@ function sdkStore(t: TestContext) {
   migrate(db);
   const store: Store = Object.assign(Object.create(Store.prototype), {
     db, jobEvents: new EventEmitter(),
-    workerPolicy: () => null,
     transaction<T>(action: () => T): T {
       db.exec('BEGIN IMMEDIATE');
       try { const result = action(); db.exec('COMMIT'); return result; }

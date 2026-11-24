@@ -79,6 +79,8 @@ if (-not $SkipTests) {
   try {
     & (Join-Path $SourceRoot 'node_modules\.bin\tsc.cmd') -p v2/tsconfig.json
     if ($LASTEXITCODE) { throw "tsc failed ($LASTEXITCODE)" }
+    & $node --disable-warning=ExperimentalWarning (Join-Path $SourceRoot 'v2\scripts\check-invariants.ts')
+    if ($LASTEXITCODE) { throw "v2 invariant checks failed ($LASTEXITCODE)" }
     & $node --disable-warning=ExperimentalWarning --test (Get-ChildItem v2/test -Filter '*.test.ts' | ForEach-Object FullName)
     if ($LASTEXITCODE) { throw "v2 tests failed ($LASTEXITCODE)" }
   } finally { Pop-Location }

@@ -1,5 +1,6 @@
 import { posix } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import { cosineSimilarity, decodeVector } from './embeddings.ts';
 
 type Row = Record<string, unknown>;
 
@@ -67,6 +68,10 @@ export function indexEntity(db: DatabaseSync, item: IndexItem, skipDelete = fals
       .run(projectId, kind, entityId);
     db.prepare('DELETE FROM entity_refs WHERE project_id = ? AND kind = ? AND entity_id = ?')
       .run(projectId, kind, entityId);
+    if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'memory_vectors' AND type = 'table'").get()) {
+      db.prepare('DELETE FROM memory_vectors WHERE project_id = ? AND kind = ? AND entity_id = ?')
+        .run(projectId, kind, entityId);
+    }
   }
   db.prepare(`INSERT INTO memory_fts
     (entity_id, handle, project_id, task_id, kind, primary_text, secondary_text, refs_text)
@@ -193,29 +198,36 @@ const graphSql = `
   GROUP BY kind, id
   ORDER BY hop ASC, seq DESC, kind, id LIMIT 40`;
 
+export interface SemanticRecallQuery {
+  providerId: string;
+  queryVector: Float32Array;
+  minSimilarity?: number;
+}
+
 export function recallProjectMemory(db: DatabaseSync, options: {
   projectId: string;
   query: string;
   maxChars: number;
   renderEntity: (kind: string, id: string) => string | null;
+  semantic?: SemanticRecallQuery;
 }): { lines: string[]; hits: number } {
-  const { projectId, query, renderEntity } = options;
+  const { projectId, query, renderEntity, semantic } = options;
   const budget = Math.floor(options.maxChars);
   if (!Number.isFinite(budget) || budget <= 0) return { lines: [], hits: 0 };
 
   const words = [...new Set(query.toLowerCase().match(/[a-z0-9_]+/g) ?? [])];
   const refs = extractRefTokens([query]);
   const tokens = [...new Set([...words, ...refs])];
-  if (!tokens.length) return { lines: [], hits: 0 };
+  if (!tokens.length && !semantic) return { lines: [], hits: 0 };
 
   const lexical = words.length ? db.prepare(`
     SELECT kind, entity_id AS id FROM memory_fts WHERE memory_fts MATCH ? AND project_id = ?
     ORDER BY bm25(memory_fts), kind, entity_id LIMIT 40`)
     .all(words.map(word => `"${word}"`).join(' OR '), projectId) : [];
-  const graph = db.prepare(graphSql).all({
+  const graph = tokens.length ? db.prepare(graphSql).all({
     $project: projectId, $tokens: JSON.stringify(tokens),
     $handles: JSON.stringify(refs.filter(token => /^[tdcgaj][1-9]\d*$/.test(token))),
-  });
+  }) : [];
 
   const key = (kind: string, id: string) => `${kind}:${id}`;
   const cache = new Map<string, Candidate | null>();
@@ -247,6 +259,23 @@ export function recallProjectMemory(db: DatabaseSync, options: {
     return [...seen.values()];
   };
   const arms = [unique(lexical), unique(graph)];
+  if (semantic && semantic.queryVector.length > 0) {
+    const minSim = semantic.minSimilarity ?? 0.25;
+    const vectorRows = db.prepare(
+      'SELECT kind, entity_id AS id, dims, vector FROM memory_vectors WHERE project_id = ? AND provider_id = ? AND dims = ?',
+    ).all(projectId, semantic.providerId, semantic.queryVector.length) as Array<{
+      kind: string; id: string; dims: number; vector: Uint8Array;
+    }>;
+    const scored: Array<{ kind: string; id: string; sim: number }> = [];
+    for (const row of vectorRows) {
+      const vec = decodeVector(row.vector, Number(row.dims));
+      if (!vec) continue;
+      const sim = cosineSimilarity(semantic.queryVector, vec);
+      if (sim >= minSim) scored.push({ kind: row.kind, id: row.id, sim });
+    }
+    scored.sort((a, b) => b.sim - a.sim || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    arms.push(unique(scored.slice(0, 40)));
+  }
   // Entity sequences are local to their tables; event sequences order different kinds.
   const nextFix = db.prepare(`
     SELECT e.kind, e.entity_id AS id

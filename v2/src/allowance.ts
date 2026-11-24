@@ -38,6 +38,7 @@ export function windowLengthMs(label: string): number | null {
   if (minutes) return Number(minutes[1]) * 60_000;
   const hours = /\b(\d{1,3})[\s-]?h(?:ours?|r)?\b/i.exec(label);
   if (hours) return Number(hours[1]) * HOUR;
+  if (/\bfive[\s-]?hours?\b/i.test(label)) return 5 * HOUR;
   const days = /\b(\d{1,3})[\s-]?d(?:ays?)?\b/i.exec(label);
   if (days) return Number(days[1]) * 24 * HOUR;
   if (/\b(?:weekly|week)\b/i.test(label)) return 7 * 24 * HOUR;
@@ -48,9 +49,12 @@ export function windowLengthMs(label: string): number | null {
 const left = (w: UsageWindow) => w.closed ? 0 : w.remaining_percent!;
 const resetAt = (w: UsageWindow) => w.resets_at === null ? Infinity : Date.parse(w.resets_at);
 
-export function classifyAllowance(windows: readonly UsageWindow[], at = Date.now()): Allowance {
-  // Tightest fresh window per pool; a window without a known remaining value makes its pool unknown. On a tie the
-  // later reset binds (the conservative reading: the sooner window's surplus is still limited by the longer one).
+/**
+ * Selects the binding fresh window across pools: each pool is bound by its tightest window
+ * (a window with unknown remaining makes its pool unknown), and independent pools choose the
+ * one with the most remaining headroom (ties break to the sooner reset).
+ */
+export function bindingWindow(windows: readonly UsageWindow[]): UsageWindow | undefined {
   const pools = new Map<string, UsageWindow | null>();
   for (const w of windows) {
     if (w.stale) continue;
@@ -59,12 +63,16 @@ export function classifyAllowance(windows: readonly UsageWindow[], at = Date.now
     if (current === null) continue;
     if (!current || left(w) < left(current) || (left(w) === left(current) && resetAt(w) > resetAt(current))) pools.set(w.pool, w);
   }
-  // Independent pools are alternatives: the most remaining wins; on a tie the sooner reset (use it or lose it).
   let best: UsageWindow | undefined;
   for (const w of pools.values()) {
     if (!w) continue;
     if (!best || left(w) > left(best) || (left(w) === left(best) && resetAt(w) < resetAt(best))) best = w;
   }
+  return best;
+}
+
+export function classifyAllowance(windows: readonly UsageWindow[], at = Date.now()): Allowance {
+  const best = bindingWindow(windows);
   if (!best || best.closed || best.resets_at === null) return { cls: 'neutral' };
   const remaining = best.remaining_percent!, until = Date.parse(best.resets_at) - at;
   if (!Number.isFinite(until) || until <= 0) return { cls: 'neutral' };
@@ -76,6 +84,90 @@ export function classifyAllowance(windows: readonly UsageWindow[], at = Date.now
   if (remaining <= p.scarceMaxRemaining && until > (length ? length * p.scarceShareOfWindow : p.expiringFallbackMs))
     return { cls: 'scarce', ...detail };
   return { cls: 'neutral' };
+}
+
+export interface WindowPace {
+  elapsedPercent: number;
+  remainingTimePercent: number;
+  pacePercent: number;
+  windowMs: number;
+  remainingMs: number;
+}
+
+export type WindowProjection =
+  | { kind: 'too_early' }
+  | { kind: 'remaining_at_reset'; percent: number }
+  | { kind: 'runs_out'; afterMs: number };
+
+/** Advisory ratio of remaining allowance percent to remaining time percent (> 100% = ahead of even pace). */
+export function windowPace(window: UsageWindow, at = Date.now()): WindowPace | null {
+  if (window.stale || (!window.closed && window.remaining_percent === null) || window.resets_at === null) return null;
+  const windowMs = windowLengthMs(window.window);
+  if (windowMs === null || windowMs <= 0) return null;
+  const remainingMs = Date.parse(window.resets_at) - at;
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return null;
+  const remaining = window.closed ? 0 : Math.min(100, Math.max(0, window.remaining_percent!));
+  const remainingTimePercent = Math.min(100, Math.max(0, (remainingMs / windowMs) * 100));
+  const elapsedPercent = Math.min(100, Math.max(0, 100 - remainingTimePercent));
+  const pacePercent = remainingTimePercent > 0 ? Math.min(1000, (remaining / remainingTimePercent) * 100) : 0;
+  return { elapsedPercent, remainingTimePercent, pacePercent, windowMs, remainingMs };
+}
+
+/** Advisory linear burn-rate forecast through the end of the current window (guarded below 5% elapsed). */
+export function windowProjection(window: UsageWindow, at = Date.now()): WindowProjection | null {
+  if (window.stale || (!window.closed && window.remaining_percent === null)) return null;
+  const remaining = window.closed ? 0 : Math.min(100, Math.max(0, window.remaining_percent!));
+  if (remaining <= 0) return { kind: 'runs_out', afterMs: 0 };
+  const pace = windowPace(window, at);
+  if (!pace) return null;
+  if (pace.elapsedPercent < 5) return { kind: 'too_early' };
+  const used = 100 - remaining;
+  if (used <= 0) return { kind: 'remaining_at_reset', percent: remaining };
+  const rate = used / pace.elapsedPercent;
+  const leftAtReset = remaining - rate * pace.remainingTimePercent;
+  return leftAtReset >= 0
+    ? { kind: 'remaining_at_reset', percent: leftAtReset }
+    : { kind: 'runs_out', afterMs: (remaining / rate / 100) * pace.windowMs };
+}
+
+export function formatCompactDuration(ms: number): string {
+  const totalMinutes = Math.max(0, Math.round(ms / 60_000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return `${minutes}m`;
+}
+
+/** Human-readable advisory pace and reset forecast for CLI status and viewer cards. */
+export function formatPaceSummary(window: UsageWindow, at = Date.now()): string | null {
+  const pace = windowPace(window, at);
+  if (!pace) return null;
+  const pct = Math.round(pace.pacePercent);
+  const proj = windowProjection(window, at);
+  if (!proj || proj.kind === 'too_early') return `pace ${pct}%`;
+  if (proj.kind === 'remaining_at_reset') return `pace ${pct}%, proj +${Math.round(proj.percent)}% at reset`;
+  return `pace ${pct}%, proj runs out in ${formatCompactDuration(proj.afterMs)}`;
+}
+
+export interface UsageHistoryPoint {
+  observed_at: string;
+  remaining_percent: number;
+}
+
+export interface UsageHistoryCycle {
+  route: string;
+  pool: string;
+  window: string;
+  started_at: string;
+  resets_at: string;
+  points: UsageHistoryPoint[];
+}
+
+export function downsamplePoints<T>(points: readonly T[], limit = 240): T[] {
+  if (points.length <= limit || limit <= 1) return [...points];
+  return Array.from({ length: limit }, (_, i) => points[Math.floor((i * (points.length - 1)) / (limit - 1))]);
 }
 
 /** Sort key: lower is preferred. */

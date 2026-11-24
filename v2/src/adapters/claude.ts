@@ -10,7 +10,7 @@ import { cliCommand, compareCliVersions, launchSelectedCli, parseCliVersion, pat
 import { catalogDiscoveries, catalogSelectionStatus, chooseClaudeModel, claudeFallback, cliEfforts, queuedCliSelection, readClaudeModels } from './cli-models.ts';
 import { cooldownUntil } from '../cooldown.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, modelPricing } from './model-pricing.ts';
-import { readClaudeUsage } from './claude-usage.ts';
+import { readClaudeCachedUsage, readClaudeUsage } from './claude-usage.ts';
 
 const ADVICE_TOOLS = ['Read', 'Grep', 'Glob'];
 const EDIT_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'MultiEdit', 'Write'];
@@ -101,13 +101,18 @@ export const claude: PlatformAdapter = {
     const spec = modelPricing(model ?? 'sonnet');
     return spec ? { expectedUsd: estimateExpectedCostUsd(spec, promptChars, effort), basis: 'weight' as const } : null;
   },
-  observeUsage(ctx) {
-    if (process.env.AGENT_COMMONS_CLAUDE_USAGE !== '1') return Promise.resolve(undefined);
+  async observeUsage(ctx) {
     const version = ctx.selected && parseCliVersion(ctx.selected.version);
     // Headless /usage gained a structured report in Claude Code 2.1.273.
     const command = ctx.selected && version && compareCliVersions(version, '2.1.273') >= 0
       ? cli.command(ctx.selected.path, ctx.options) : undefined;
-    return command ? readClaudeUsage(command) : Promise.resolve(undefined);
+    if (command) {
+      const live = await readClaudeUsage(command);
+      if (live) return live;
+    }
+    const statePath = ctx.overrides.claudeStatePath !== undefined ? ctx.overrides.claudeStatePath
+      : ctx.options.claude ? null : undefined;
+    return readClaudeCachedUsage(statePath);
   },
   routeQuotaWindows: rows => rows.filter(row => !row.pool.startsWith('claude / ')),
   reopenedQuotaPools(rows, known) {

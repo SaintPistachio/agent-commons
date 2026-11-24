@@ -8,7 +8,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { Store } from './store.ts';
-import { UsageContractViolation, type CliBinary, type CliUpdateContext, type ProbeContext, type ProbeOverrides, type ProbeResult, type RunnerOptions } from './adapters/types.ts';
+import { UsageContractViolation, type CliBinary, type CliUpdateContext, type ProbeContext, type ProbeOverrides, type ProbeResult, type RunnerOptions, type UsageDiagnostic } from './adapters/types.ts';
 import { adapter, adapterIds } from './adapters/registry.ts';
 import { compareCliVersions, isStableCliVersion, pendingStableVersion } from './adapters/cli-freshness.ts';
 import { pendingSdkVersion, SdkRecoveryRequired } from './adapters/sdk-freshness.ts';
@@ -18,7 +18,7 @@ import type { SdkRecoveryEvent } from './adapters/sdk-swap.ts';
 type Check = 'probe' | 'daily' | 'now' | 'sdk-now';
 type ProbeStore = Pick<Store, 'platformState' | 'recordProbe' | 'beginCliUpdate' | 'finishCliUpdate' |
   'recordDiscovery' | 'seedProfiles' | 'recordDiscoveryFailure' | 'recordDiscoverySummary' | 'jobEvents' | 'jobState'> &
-  Partial<Pick<Store, 'db' | 'setValidationOptions' | 'recordUsage' | 'usageFor' | 'blockUsageRead' | 'recordSdkSnapshot' | 'beginSdkUpdate' | 'finishSdkUpdate'>>;
+  Partial<Pick<Store, 'db' | 'transaction' | 'setValidationOptions' | 'recordUsage' | 'recordUsageMeta' | 'recordUsageError' | 'usageFor' | 'blockUsageRead' | 'recordSdkSnapshot' | 'beginSdkUpdate' | 'finishSdkUpdate'>>;
 const errorText = (error: unknown) => String((error as Error)?.message ?? error).replace(/\s+/g, ' ').slice(0, 250);
 export const usageIdentity = (state: ReturnType<Store['platformState']>) =>
   JSON.stringify([state?.bin_selected_path ?? null, state?.bin_version ?? null, state?.binary_sha256 ?? null]);
@@ -71,6 +71,9 @@ export class Prober {
   private readonly observing = new Map<string, Promise<void>>();
   /** Routes with a usage read waiting behind the current one (later requests join it). */
   private readonly observingQueued = new Set<string>();
+  private readonly usageFailures = new Map<string, number>();
+  private readonly nextUsageRetryAt = new Map<string, number>();
+  private readonly resetTimers = new Map<string, NodeJS.Timeout>();
   private readonly catalogStamps = new Map<string, string>();
   private lastAgDiscovery = -Infinity;
   private catalogRefresh?: Promise<void>;
@@ -112,14 +115,18 @@ export class Prober {
     if (id === 'antigravity') {
       const directory = path.join(this.home, 'helpers', 'antigravity');
       const catalog = path.join(directory, 'catalog.json');
+      const acpCatalog = path.join(directory, 'acp-catalog.json');
       const files = ['routing-state.json', 'candidate-attempts.json', 'acceptance.json']
         .map(name => path.join(directory, name));
-      files.unshift(catalog);
+      files.unshift(catalog, acpCatalog);
       const stamp = JSON.stringify(await Promise.all(files.map(fileStamp)));
       if (stamp !== previousStamp) return { stamp };
       let fetchedAt = NaN;
-      try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(catalog, 'utf8')).fetched_at); }
-      catch { /* A missing or unreadable cache can be refreshed by the verified helper. */ }
+      try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(acpCatalog, 'utf8')).observedAt); }
+      catch {
+        try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(catalog, 'utf8')).fetched_at); }
+        catch { /* A missing or unreadable cache can be refreshed by the verified route. */ }
+      }
       const age = Date.now() - fetchedAt;
       return { stamp, expired: !Number.isFinite(age) || age < 0 || age >= AG_CATALOG_TTL };
     }
@@ -223,7 +230,7 @@ export class Prober {
         const sdkOutcome = await this.checkSdk(id, platform.sdk, ctx, mode);
         if (mode === 'sdk-now') return sdkOutcome;
       }
-      await this.observeUsage(id);
+      await this.observeUsage(id, true);
       await this.discover(id);
       return outcome;
     })().finally(() => this.running.delete(id));
@@ -376,6 +383,8 @@ export class Prober {
     if (this.timer) clearInterval(this.timer);
     if (this.usageTimer) clearInterval(this.usageTimer);
     if (this.catalogTimer) clearInterval(this.catalogTimer);
+    for (const timer of this.resetTimers.values()) clearTimeout(timer);
+    this.resetTimers.clear();
     this.store.jobEvents.off('job', this.onJob);
   }
 
@@ -383,8 +392,8 @@ export class Prober {
    * Re-reads usage for verified routes that have no running job (a running job reports its own quota when it ends),
    * so allowance and pool steering do not rely on the last job's numbers. Never sends a prompt.
    */
-  refreshUsage(): Promise<void> {
-    return Promise.all(this.ids().map(id => this.observeUsage(id))).then(() => {});
+  refreshUsage(force = false): Promise<void> {
+    return Promise.all(this.ids().map(id => this.observeUsage(id, force))).then(() => {});
   }
   /** A usage read can run past a queue held by a cooldown, since no job can start on that route yet. */
   private usageReadAllowed(id: string): boolean {
@@ -400,15 +409,43 @@ export class Prober {
     } catch { return false; }  // unknown: do not read
   }
 
+  /** Schedule one post-reset usage check 15s after the soonest reset/cooldown within the polling interval. */
+  scheduleResetRecheck(id: string): void {
+    const prev = this.resetTimers.get(id);
+    if (prev) { clearTimeout(prev); this.resetTimers.delete(id); }
+    if (this.stopped || this.overrides.schedule === false) return;
+    try {
+      const now = Date.now();
+      const candidates: number[] = [];
+      for (const w of this.store.usageFor?.(id) ?? []) {
+        const ms = w.resets_at ? Date.parse(w.resets_at) : NaN;
+        if (Number.isFinite(ms) && ms > now && ms <= now + USAGE_REFRESH) candidates.push(ms);
+      }
+      const cool = this.store.platformState(id)?.cooldown_until;
+      const coolMs = cool ? Date.parse(cool) : NaN;
+      if (Number.isFinite(coolMs) && coolMs > now && coolMs <= now + USAGE_REFRESH) candidates.push(coolMs);
+      if (!candidates.length) return;
+      const soonest = Math.min(...candidates);
+      const timer = setTimeout(() => {
+        this.resetTimers.delete(id);
+        void this.observeUsage(id, true);
+      }, Math.max(100, soonest - now + 15_000));
+      timer.unref();
+      this.resetTimers.set(id, timer);
+    } catch { /* store closed */ }
+  }
+
   /** Serialize local reads per route. A terminal event gets a new read, not an in-flight pre-job snapshot. */
-  private observeUsage(id: string): Promise<void> {
+  private observeUsage(id: string, force = false): Promise<void> {
     const platform = adapter(id);
     if (!platform?.observeUsage) return Promise.resolve();
-    // A read already waiting covers this request too.
-    if (this.observingQueued.has(id)) return this.observing.get(id) ?? Promise.resolve();
+    if (!force && Date.now() < (this.nextUsageRetryAt.get(id) ?? 0)) return Promise.resolve();
+    // A read already waiting covers this request too (unless a forced check needs to bypass backoff).
+    if (!force && this.observingQueued.has(id)) return this.observing.get(id) ?? Promise.resolve();
     this.observingQueued.add(id);
     const run = (this.observing.get(id) ?? Promise.resolve()).then(async () => {
       this.observingQueued.delete(id);
+      if (!force && Date.now() < (this.nextUsageRetryAt.get(id) ?? 0)) return;
       // Rechecked when the read actually starts: a job may have started (or been queued) since the request.
       if (!this.usageReadAllowed(id)) return;
       const startedAt = new Date().toISOString();
@@ -424,14 +461,16 @@ export class Prober {
         return row ? `${row.seq}|${row.st}|${row.fn}` : '';
       };
       const markBefore = jobWatermark();
+      let diagnostic: UsageDiagnostic | undefined;
       try {
         const snapshot = await platform.observeUsage!({
           home: this.home, options: this.options, overrides: this.overrides,
           binPath: (before?.bin_path as string | null | undefined) ?? null,
           cliVersion: (before?.bin_version as string | null | undefined) ?? null,
           selected, usage,
+          onUsageError: d => { diagnostic = d; },
         });
-        if (!snapshot || this.stopped || !this.usageReadAllowed(id)) return;
+        if (this.stopped || !this.usageReadAllowed(id)) return;
         const after = this.store.platformState(id);
         if ((before?.bin_selected_path ?? null) !== (after?.bin_selected_path ?? null)
           || (before?.bin_version ?? null) !== (after?.bin_version ?? null)
@@ -439,8 +478,27 @@ export class Prober {
           || (before?.last_update_at ?? null) !== (after?.last_update_at ?? null)
           || after?.last_update_result === 'running') return;
         if (jobWatermark() !== markBefore) return;
+        if (!snapshot) {
+          if (diagnostic) {
+            const failures = (this.usageFailures.get(id) ?? 0) + 1;
+            this.usageFailures.set(id, failures);
+            const backoffMs = Math.min(60 * 60_000, 5 * 60_000 * Math.pow(2, Math.min(4, failures - 1)));
+            this.nextUsageRetryAt.set(id, Date.now() + backoffMs);
+            this.store.recordUsageError?.(id, diagnostic);
+          }
+          return;
+        }
+        this.usageFailures.delete(id);
+        this.nextUsageRetryAt.delete(id);
         const rows = snapshot.rows.map(row => ({ ...row, observed_at: row.observed_at ?? startedAt }));
-        this.store.recordUsage?.(id, rows, snapshot.source, startedAt, snapshot.partial);
+        // Persist scope, authoritative meta (clearing stale resetCredits if omitted), and usage rows atomically.
+        const persist = () => {
+          this.store.recordUsageMeta?.(id, { accountScope: snapshot.accountScope, meta: snapshot.meta ?? null, clearError: true });
+          this.store.recordUsage?.(id, rows, snapshot.source, startedAt, snapshot.partial);
+        };
+        if (this.store.transaction) this.store.transaction(persist);
+        else persist();
+        this.scheduleResetRecheck(id);
       } catch (error) {
         if (error instanceof UsageContractViolation) {
           const identity = usageIdentity(before);
@@ -461,7 +519,10 @@ export class Prober {
     let job;
     try { job = this.store.jobState(id); } catch { return; }
     if (!job || !this.ids().includes(job.route)) return;
-    if (['completed', 'failed', 'cancelled', 'needs_review'].includes(job.status)) void this.observeUsage(job.route);
+    if (['completed', 'failed', 'cancelled', 'needs_review'].includes(job.status)) {
+      void this.observeUsage(job.route);
+      this.scheduleResetRecheck(job.route);
+    }
     if (job.status !== 'failed' || !String(job.error ?? '').startsWith('CLI_ERROR')) return;
     const recheck = () => {
       if (this.stopped) return;

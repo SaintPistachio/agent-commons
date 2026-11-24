@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
 Agent Commons health watchdog: checks the service, its scheduled tasks and the
-off-drive backup, then tells AJ about problems with a Windows notification and a "! health" line in air_sync.
+off-drive backup, then tells the operator about problems with a Windows notification and a "! health" line in air_sync.
 
 .DESCRIPTION
 Run every 15 minutes and at logon by the AgentCommons-Watchdog scheduled task (Register-AcAutomation.ps1). Checks:
@@ -29,6 +29,7 @@ param(
   [string]$HelperLedger,
   [ValidateRange(1, 168)][int]$HoldHours = 1,
   [ValidateRange(1, 720)][int]$UsageHours = 24,
+  [ValidateRange(1, 30)][int]$ResetExpiryDays = 3,
   [switch]$NoToast,
   [int]$RepeatHours = 6
 )
@@ -82,6 +83,52 @@ if (Test-Path -LiteralPath $commonsDb) {
       Add-Problem 'usage-stale' ("usage readings older than {0} h: {1}; update them (cli.ts usage-set) so routing uses current numbers" -f $UsageHours, ((@($staleUsage) | ForEach-Object { "$($_.route) since $(([datetime]::Parse($_.at, [Globalization.CultureInfo]::InvariantCulture)).ToLocalTime().ToString('g'))" }) -join ', '))
     }
   } catch { Add-Problem 'usage-stale' "could not read usage readings ($($_.Exception.Message))" }
+
+  $resetQuery = @'
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
+const leadDays = Math.min(30, Math.max(1, Math.trunc(Number(process.argv[2]) || 3)));
+const cols = db.prepare('PRAGMA table_info(platform_state)').all().map(c => c.name);
+if (!cols.includes('usage_meta')) { console.log('[]'); process.exit(0); }
+const row = db.prepare("SELECT usage_meta FROM platform_state WHERE adapter_id='codex'").get();
+const meta = row?.usage_meta ? JSON.parse(row.usage_meta) : null;
+const summary = meta?.resetCredits;
+if (!summary || typeof summary.availableCount !== 'number' || summary.availableCount <= 0) { console.log('[]'); process.exit(0); }
+const now = Date.now(), cap = Date.parse(summary.capturedAt);
+const credits = Array.isArray(summary.credits) ? summary.credits : [];
+const expired = new Set();
+for (const c of credits) {
+  if (c?.status === 'available' && c.expiresAt) {
+    const exp = Date.parse(c.expiresAt);
+    if (Number.isFinite(cap) && exp > cap && exp <= now) expired.add(c.id);
+  }
+}
+const rem = Math.max(0, summary.availableCount - expired.size);
+const seen = new Set();
+const active = credits
+  .filter(c => c?.status === 'available' && (c.expiresAt == null || Date.parse(c.expiresAt) > now))
+  .sort((a, b) => (a.expiresAt ? Date.parse(a.expiresAt) : Infinity) - (b.expiresAt ? Date.parse(b.expiresAt) : Infinity) || String(a.id).localeCompare(String(b.id)))
+  .filter(c => !seen.has(c.id) && seen.add(c.id))
+  .slice(0, rem);
+const leadMs = leadDays * 86400000;
+const groups = new Map();
+for (const c of active) {
+  if (!c.expiresAt) continue;
+  const left = Date.parse(c.expiresAt) - now;
+  if (left > 0 && left <= leadMs) groups.set(c.expiresAt, (groups.get(c.expiresAt) || 0) + 1);
+}
+console.log(JSON.stringify([...groups.entries()].map(([expiresAt, count]) => ({ expiresAt, count, remainingMs: Date.parse(expiresAt) - now })).sort((a, b) => a.remainingMs - b.remainingMs)));
+'@
+  try {
+    $expiringResets = & (Get-Command node.exe).Source --disable-warning=ExperimentalWarning -e $resetQuery $commonsDb $ResetExpiryDays | ConvertFrom-Json
+    if ($LASTEXITCODE) { throw "exit $LASTEXITCODE" }
+    if (@($expiringResets).Count) {
+      $first = @($expiringResets)[0]
+      $hours = [Math]::Max(1, [Math]::Round($first.remainingMs / 3600000))
+      $expLocal = ([datetime]::Parse($first.expiresAt, [Globalization.CultureInfo]::InvariantCulture)).ToLocalTime().ToString('g')
+      Add-Problem 'codex-reset-expiry' ("{0} Codex banked reset(s) expire in ~{1} h ({2})" -f $first.count, $hours, $expLocal)
+    }
+  } catch { Add-Problem 'codex-reset-expiry' "could not read Codex banked resets ($($_.Exception.Message))" }
 }
 
 # Central API helper: a reservation left unsettled holds funds and a slot until someone reconciles it. Read-only.

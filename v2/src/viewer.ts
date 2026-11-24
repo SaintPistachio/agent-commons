@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import type { CodexResetSummary, UsageDiagnostic, UsageWindow } from './adapters/types.ts';
+import { codexExpiringResets } from './adapters/codex-limits.ts';
+import { downsamplePoints, formatCompactDuration, formatPaceSummary, windowLengthMs, windowPace, type UsageHistoryCycle } from './allowance.ts';
 
 /**
  * Read-only room viewer. It opens the service database read-only (SQLite WAL lets it read while the service writes),
@@ -169,9 +172,9 @@ const ROUTE_NAME: Record<string, string> = { claude: 'Claude', codex: 'Codex', a
 const routeName = (route: string) => ROUTE_NAME[route] ?? route;
 const tone = (value: string | null) => {
   if (!value) return 'muted';
-  if (['ok', 'completed', 'converged', 'accepted', 'verify_pass', 'applied'].includes(value)) return 'good';
-  if (['chg', 'capped', 'needs_review', 'redone', 'running', 'queued', 'open', 'idle', 'stepping'].includes(value)) return 'warn';
-  if (['failed', 'rejected', 'verify_fail', 'cancelled', 'blk', 'block'].includes(value)) return 'bad';
+  if (['ok', 'completed', 'converged', 'accepted', 'verify_pass', 'applied', 'verified'].includes(value)) return 'good';
+  if (['chg', 'capped', 'needs_review', 'redone', 'running', 'queued', 'open', 'idle', 'stepping', 'drifted'].includes(value)) return 'warn';
+  if (['failed', 'rejected', 'verify_fail', 'cancelled', 'blk', 'block', 'blocked', 'unavailable'].includes(value)) return 'bad';
   return 'muted';
 };
 const badge = (value: string | null | undefined, label?: string) => value ? `<span class="badge ${tone(value)}">${esc(label ?? value)}</span>` : '';
@@ -194,6 +197,12 @@ details{margin:.35rem 0}summary{cursor:pointer;color:var(--accent);font-size:.88
 .grid{display:grid;gap:12px}.round-label{font-weight:600;margin:1.25rem 0 .25rem}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
 .card .top{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;flex-wrap:wrap}.card .sum{margin:.45rem 0}
+.nav{display:flex;gap:.75rem;align-items:center;margin-bottom:1rem;border-bottom:1px solid var(--line);padding-bottom:.5rem}
+.nav a{text-decoration:none;padding:.2rem .65rem;border-radius:6px;font-size:.9rem;font-weight:600}
+.nav a.active{background:var(--chip);color:var(--text)}
+.quota-row{display:flex;align-items:center;gap:12px;margin:.55rem 0}
+.chart-svg{width:100%;height:auto;display:block;margin-top:.35rem;background:var(--code);border:1px solid var(--line);border-radius:8px}
+.alert{border-left:4px solid var(--warn);background:var(--warn-bg);padding:10px 14px;border-radius:8px;margin:.75rem 0}
 table{border-collapse:collapse;width:100%;font-size:.9rem}th,td{text-align:left;padding:.45rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600}
 .msg{border-left:3px solid var(--line);padding:.25rem 0 .25rem .9rem;margin:.9rem 0}.msg .who{font-weight:600}
 .outcome{white-space:pre-wrap}.small{font-size:.82rem;color:var(--muted)}
@@ -212,12 +221,16 @@ export interface RenderOptions {
   generatedAt?: string;
 }
 
+const navBar = (active: 'rooms' | 'status', options: RenderOptions) => options.mode === 'live'
+  ? `<nav class="nav"><a href="/"${active === 'rooms' ? ' class="active"' : ''}>Rooms</a><a href="/status"${active === 'status' ? ' class="active"' : ''}>Status &amp; quota</a></nav>`
+  : '';
+
 export function renderRoomList(rooms: RoomSummary[], options: RenderOptions): string {
   const rows = rooms.map(r => `<tr><td><a href="/g/${esc(r.handle.slice(1))}">${esc(r.handle)}</a></td><td>${esc(r.subject)}</td>
 <td>${r.seats.length ? r.seats.map(s => `<span class="chip">${esc(s.seat)}: ${esc(routeName(s.route))}</span>`).join('') : '<span class="small">discussion</span>'}</td>
 <td>${badge(r.room_status ?? r.status)}${r.max_rounds ? ` <span class="small">r${r.round}/${r.max_rounds}</span>` : ''}</td>
 <td>${r.jobs} jobs, ${r.messages} posts</td><td>${esc(r.project)}</td><td class="small">${esc(when(r.created_at))}</td></tr>`).join('\n');
-  const body = `<div class="crumb">Agent Commons</div><h1>Rooms and discussions</h1>
+  const body = `${navBar('rooms', options)}<div class="crumb">Agent Commons</div><h1>Rooms and discussions</h1>
 <p class="small">Read-only. Newest first. Select a room to see each seat's jobs, replies, artifacts and outcome.</p>
 <div class="panel" style="overflow-x:auto"><table><thead><tr><th>Room</th><th>Subject</th><th>Seats</th><th>Status</th><th>Activity</th><th>Project</th><th>Opened</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="7">No rooms yet.</td></tr>'}</tbody></table></div>`;
@@ -315,6 +328,275 @@ export function roomReport(home: string, ref: string, generatedAt = new Date().t
   } finally { db.close(); }
 }
 
+export interface StatusRouteView {
+  id: string;
+  probeState: string;
+  cliVersion: string | null;
+  running: number;
+  queued: number;
+  cooldownUntil: string | null;
+  cooldownReason: string | null;
+  usageError: UsageDiagnostic | null;
+  resetCredits: CodexResetSummary | null;
+  windows: UsageWindow[];
+}
+
+export interface StatusJobView {
+  handle: string;
+  route: string;
+  mode: string;
+  model: string | null;
+  effort: string | null;
+  status: string;
+  verdict: string | null;
+  costUsd: number | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  roomHandle: string | null;
+  error: string | null;
+}
+
+export interface StatusView {
+  generatedAt: string;
+  routes: StatusRouteView[];
+  cycles: UsageHistoryCycle[];
+  needsReview: StatusJobView[];
+  recentJobs: StatusJobView[];
+  healthProblems: Array<{ id: string; text: string }>;
+}
+
+function tableExists(db: DatabaseSync, name: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+}
+
+function tableColumns(db: DatabaseSync, table: string): Set<string> {
+  return new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map(c => String(c.name)));
+}
+
+export function loadStatus(db: DatabaseSync, home: string, at = Date.now()): StatusView {
+  const cols = tableColumns(db, 'platform_state');
+  const hasScopeMeta = cols.has('usage_last_error') && cols.has('usage_meta');
+  const perRoute = new Map<string, { running: number; queued: number }>();
+  for (const r of db.prepare("SELECT route, sum(status='running') running, sum(status='queued') queued FROM jobs GROUP BY route").all() as Row[]) {
+    perRoute.set(String(r.route), { running: Number(r.running ?? 0), queued: Number(r.queued ?? 0) });
+  }
+  const windowRows = tableExists(db, 'usage_windows')
+    ? db.prepare('SELECT * FROM usage_windows ORDER BY route, pool, window').all() as Row[]
+    : [];
+  const windowsByRoute = new Map<string, UsageWindow[]>();
+  for (const row of windowRows) {
+    const stale = at - Date.parse(row.observed_at) > 6 * 60 * 60 * 1000
+      || (row.resets_at !== null && Date.parse(row.resets_at) <= at);
+    const markedClosed = String(row.source ?? '').endsWith(':closed');
+    const w: UsageWindow = {
+      route: row.route,
+      pool: row.pool,
+      window: row.window,
+      remaining_percent: stale ? null : row.remaining_percent,
+      resets_at: row.resets_at,
+      observed_at: row.observed_at,
+      source: markedClosed ? String(row.source).slice(0, -':closed'.length) : String(row.source),
+      stale,
+      ...(row.early_reset_observed_at ? { early_reset_observed_at: row.early_reset_observed_at, early_reset_scheduled_at: row.early_reset_scheduled_at } : {}),
+      closed: markedClosed && row.resets_at !== null && Date.parse(row.resets_at) > at,
+    };
+    const list = windowsByRoute.get(w.route) ?? [];
+    list.push(w);
+    windowsByRoute.set(w.route, list);
+  }
+
+  const routes: StatusRouteView[] = (db.prepare('SELECT * FROM platform_state ORDER BY adapter_id').all() as Row[]).map(s => {
+    const id = String(s.adapter_id);
+    const counts = perRoute.get(id) ?? { running: 0, queued: 0 };
+    const usageError = hasScopeMeta && s.usage_last_error ? parse(s.usage_last_error, null) : null;
+    const meta = hasScopeMeta && s.usage_meta ? parse(s.usage_meta, null) : null;
+    const activeCooldown = s.cooldown_until && Date.parse(s.cooldown_until) > at ? String(s.cooldown_until) : null;
+    return {
+      id,
+      probeState: String(s.probe_state ?? 'unknown'),
+      cliVersion: s.cli_version ? String(s.cli_version) : null,
+      running: counts.running,
+      queued: counts.queued,
+      cooldownUntil: activeCooldown,
+      cooldownReason: activeCooldown && s.cooldown_reason ? String(s.cooldown_reason) : null,
+      usageError,
+      resetCredits: meta?.resetCredits ?? null,
+      windows: windowsByRoute.get(id) ?? [],
+    };
+  });
+
+  const cycles: UsageHistoryCycle[] = [];
+  if (tableExists(db, 'usage_history')) {
+    const nowIso = new Date(at).toISOString();
+    const oldestIso = new Date(at - 7 * 86_400_000).toISOString();
+    const map = new Map<string, UsageHistoryCycle>();
+    for (const r of db.prepare('SELECT route, pool, window, cycle_resets_at, observed_at, remaining_percent FROM usage_history WHERE cycle_resets_at > ? AND observed_at >= ? ORDER BY route, pool, window, cycle_resets_at, bucket_index').all(nowIso, oldestIso) as Row[]) {
+      const winMs = windowLengthMs(String(r.window)) ?? 7 * 86_400_000;
+      const key = JSON.stringify([r.route, r.pool, r.window, r.cycle_resets_at]);
+      let c = map.get(key);
+      if (!c) {
+        c = {
+          route: String(r.route), pool: String(r.pool), window: String(r.window),
+          started_at: new Date(Date.parse(String(r.cycle_resets_at)) - winMs).toISOString(),
+          resets_at: String(r.cycle_resets_at), points: [],
+        };
+        map.set(key, c);
+      }
+      c.points.push({ observed_at: String(r.observed_at), remaining_percent: Number(r.remaining_percent) });
+    }
+    cycles.push(...map.values());
+  }
+
+  const mapJob = (j: Row): StatusJobView => ({
+    handle: 'j' + j.seq,
+    route: String(j.route),
+    mode: String(j.mode),
+    model: j.reported_model ?? j.resolved_model ?? j.model ?? null,
+    effort: j.resolved_eff ?? j.effort ?? null,
+    status: String(j.status),
+    verdict: j.consult_verdict ?? null,
+    costUsd: j.cost_usd ?? null,
+    createdAt: String(j.created_at),
+    startedAt: j.started_at ?? null,
+    finishedAt: j.finished_at ?? null,
+    roomHandle: j.room_seq != null ? 'g' + j.room_seq : null,
+    error: j.error ?? null,
+  });
+
+  const needsReview = (db.prepare(`SELECT j.*, d.seq room_seq FROM jobs j LEFT JOIN discussions d ON d.id=j.room_id
+    WHERE j.status='needs_review' ORDER BY j.seq DESC LIMIT 20`).all() as Row[]).map(mapJob);
+  const recentJobs = (db.prepare(`SELECT j.*, d.seq room_seq FROM jobs j LEFT JOIN discussions d ON d.id=j.room_id
+    ORDER BY CASE WHEN j.status='running' THEN 0 WHEN j.status='queued' THEN 1 ELSE 2 END, j.seq DESC LIMIT 20`).all() as Row[]).map(mapJob);
+
+  const healthProblems: Array<{ id: string; text: string }> = [];
+  try {
+    const raw = fs.readFileSync(path.join(home, 'health.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.problems)) {
+      for (const p of parsed.problems) {
+        if (p && typeof p.text === 'string') healthProblems.push({ id: String(p.id ?? 'health'), text: p.text });
+      }
+    }
+  } catch { /* health.json is optional */ }
+
+  return { generatedAt: new Date(at).toISOString(), routes, cycles, needsReview, recentJobs, healthProblems };
+}
+
+function paceRingSvg(window: UsageWindow, at: number): string {
+  const remaining = window.closed ? 0 : window.remaining_percent;
+  const pct = remaining === null || window.stale ? null : Math.min(100, Math.max(0, remaining));
+  const pace = windowPace(window, at);
+  const r = 24, cx = 32, cy = 32, circ = 2 * Math.PI * r;
+  const dash = pct === null ? 0 : (pct / 100) * circ;
+  const stroke = pct === null ? 'var(--muted)' : pct <= 15 || (pace && pace.pacePercent < 75) ? 'var(--warn)' : 'var(--good)';
+  let tick = '';
+  if (pace) {
+    const angle = (-90 + (pace.remainingTimePercent / 100) * 360) * (Math.PI / 180);
+    const x1 = (cx + (r - 5) * Math.cos(angle)).toFixed(1), y1 = (cy + (r - 5) * Math.sin(angle)).toFixed(1);
+    const x2 = (cx + (r + 5) * Math.cos(angle)).toFixed(1), y2 = (cy + (r + 5) * Math.sin(angle)).toFixed(1);
+    tick = `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--text)" stroke-width="2" stroke-linecap="round"/>`;
+  }
+  const label = pct === null ? '?' : `${Math.round(pct)}%`;
+  return `<svg viewBox="0 0 64 64" width="56" height="56" aria-hidden="true">
+<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--line)" stroke-width="6"/>
+${pct !== null ? `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${stroke}" stroke-width="6" stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${circ.toFixed(1)}" transform="rotate(-90 ${cx} ${cy})"/>` : ''}
+${tick}
+<text x="${cx}" y="${cy + 4}" text-anchor="middle" font-size="12" font-weight="700" fill="var(--text)">${esc(label)}</text>
+</svg>`;
+}
+
+function cycleChartSvg(cycle: UsageHistoryCycle): string {
+  const startMs = Date.parse(cycle.started_at), resetMs = Date.parse(cycle.resets_at), span = Math.max(1, resetMs - startMs);
+  const pts = downsamplePoints(cycle.points, 240);
+  const w = 420, h = 110, padL = 28, padR = 10, padT = 10, padB = 18;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const coords = pts.map(pt => {
+    const t = Math.min(1, Math.max(0, (Date.parse(pt.observed_at) - startMs) / span));
+    const yVal = Math.min(100, Math.max(0, pt.remaining_percent));
+    const x = padL + t * plotW;
+    const y = padT + (1 - yVal / 100) * plotH;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const last = coords[coords.length - 1].split(',');
+  return `<svg class="chart-svg" viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(cycle.route)} ${esc(cycle.pool)} ${esc(cycle.window)} cycle">
+<line x1="${padL}" y1="${padT}" x2="${w - padR}" y2="${padT}" stroke="var(--line)" stroke-width="1"/>
+<line x1="${padL}" y1="${padT + plotH / 2}" x2="${w - padR}" y2="${padT + plotH / 2}" stroke="var(--line)" stroke-width="1" stroke-dasharray="2,3"/>
+<line x1="${padL}" y1="${padT + plotH}" x2="${w - padR}" y2="${padT + plotH}" stroke="var(--line)" stroke-width="1"/>
+<line x1="${padL}" y1="${padT}" x2="${w - padR}" y2="${padT + plotH}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4,4"/>
+<polyline fill="none" stroke="var(--accent)" stroke-width="2" points="${coords.join(' ')}"/>
+<circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)"/>
+<text x="4" y="${padT + 4}" font-size="9" fill="var(--muted)">100%</text>
+<text x="8" y="${padT + plotH / 2 + 3}" font-size="9" fill="var(--muted)">50%</text>
+<text x="12" y="${padT + plotH}" font-size="9" fill="var(--muted)">0%</text>
+<text x="${padL}" y="${h - 4}" font-size="9" fill="var(--muted)">Cycle start</text>
+<text x="${w - padR}" y="${h - 4}" text-anchor="end" font-size="9" fill="var(--muted)">Reset</text>
+</svg>`;
+}
+
+export function renderStatus(view: StatusView, options: RenderOptions): string {
+  const at = Date.parse(view.generatedAt) || Date.now();
+  const alerts: string[] = [];
+  if (view.needsReview.length) alerts.push(`${view.needsReview.length} job(s) need review (${view.needsReview.map(j => j.handle).join(', ')}).`);
+  for (const r of view.routes) {
+    if (r.cooldownUntil) alerts.push(`${routeName(r.id)} in cooldown until ${when(r.cooldownUntil)}${r.cooldownReason ? ` (${r.cooldownReason})` : ''}.`);
+    if (r.usageError) alerts.push(`${routeName(r.id)} last usage read failed: ${r.usageError.kind}${r.usageError.method ? ` (${r.usageError.method})` : ''}.`);
+    if (r.resetCredits) {
+      const rep = codexExpiringResets(r.resetCredits, 3, at);
+      for (const exp of rep.expiring) {
+        alerts.push(`${exp.count} Codex banked reset(s) expire in ${formatCompactDuration(exp.remainingMs)} (${when(exp.expiresAt)}).`);
+      }
+    }
+  }
+  for (const p of view.healthProblems) alerts.push(`${p.id}: ${p.text}`);
+
+  const routeCards = view.routes.map(r => {
+    const resetsReport = r.resetCredits ? codexExpiringResets(r.resetCredits, 3, at) : null;
+    const winRows = r.windows.map(w => {
+      const pace = formatPaceSummary(w, at);
+      const resetIn = w.resets_at && Date.parse(w.resets_at) > at ? `resets in ${formatCompactDuration(Date.parse(w.resets_at) - at)}` : w.resets_at ? `reset ${when(w.resets_at)}` : 'no reset';
+      return `<div class="quota-row">${paceRingSvg(w, at)}<div><div><strong>${esc(w.pool)} / ${esc(w.window)}</strong>${w.closed ? ` ${badge('failed', 'closed')}` : ''}</div>
+<div class="small">${esc(resetIn)}${pace ? ` · ${esc(pace)}` : ''}</div>
+<div class="small">Source: ${esc(w.source)} · ${esc(when(w.observed_at))}</div></div></div>`;
+    }).join('');
+    return `<div class="card"><div class="top"><h3>${esc(routeName(r.id))}</h3><span>${badge(r.probeState)}</span></div>
+<div class="meta">${r.cliVersion ? `<span>${esc(r.cliVersion)}</span>` : ''}<span>running ${r.running}, queued ${r.queued}</span></div>
+${r.cooldownUntil ? `<div class="small" style="margin:.35rem 0">${badge('needs_review', 'cooldown')} until ${esc(when(r.cooldownUntil))}</div>` : ''}
+${resetsReport && resetsReport.remainingCount > 0 ? `<div class="small" style="margin:.35rem 0">${badge(resetsReport.expiring.length ? 'needs_review' : 'ok', `${resetsReport.remainingCount} banked reset(s)`)}${resetsReport.nextExpiry ? ` next expires ${esc(when(resetsReport.nextExpiry))}` : ''}</div>` : ''}
+${r.usageError ? `<div class="small" style="margin:.35rem 0">${badge('failed', 'usage error')} ${esc(r.usageError.kind)}${r.usageError.method ? ` (${esc(r.usageError.method)})` : ''} at ${esc(when(r.usageError.at))}</div>` : ''}
+${winRows || '<p class="small">No usage windows recorded.</p>'}</div>`;
+  }).join('');
+
+  const weeklyCycles = view.cycles.filter(c => c.points.length >= 2 && (windowLengthMs(c.window) ?? 0) >= 24 * 3600_000);
+  const cycleCards = weeklyCycles.map(c => `<div class="card"><div class="top"><h3>${esc(routeName(c.route))}: ${esc(c.pool)} / ${esc(c.window)}</h3><span class="small">${c.points.length} pts</span></div>
+<div class="small">Resets ${esc(when(c.resets_at))}</div>${cycleChartSvg(c)}</div>`).join('');
+
+  const jobRows = view.recentJobs.map(j => {
+    const room = j.roomHandle ? (options.mode === 'live' ? `<a href="/g/${esc(j.roomHandle.slice(1))}">${esc(j.roomHandle)}</a>` : esc(j.roomHandle)) : '<span class="small">-</span>';
+    return `<tr><td>${esc(j.handle)}</td><td>${esc(routeName(j.route))}</td><td>${esc(j.model ?? '-')}${j.effort ? ` <span class="small">${esc(j.effort)}</span>` : ''}</td>
+<td>${badge(j.status)}${j.verdict ? ` ${badge(j.verdict)}` : ''}</td><td>${esc(duration(j.startedAt, j.finishedAt) || '-')}</td>
+<td>${j.costUsd != null ? `$${Number(j.costUsd).toFixed(4)}` : '-'}</td><td>${room}</td><td class="small">${esc(when(j.createdAt))}</td></tr>`;
+  }).join('\n');
+
+  const body = `${navBar('status', options)}<div class="crumb">Agent Commons</div><h1>Status and quota</h1>
+${alerts.length ? `<div class="alert"><strong>Needs attention</strong><ul>${alerts.map(a => `<li>${esc(a)}</li>`).join('')}</ul></div>` : ''}
+<h2>Routes and quota pace</h2>
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">${routeCards || '<p class="small">No routes recorded.</p>'}</div>
+${cycleCards ? `<h2>Quota cycle curves</h2><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(360px,1fr))">${cycleCards}</div>` : ''}
+<h2>Active and recent jobs</h2>
+<div class="panel" style="overflow-x:auto"><table><thead><tr><th>Job</th><th>Route</th><th>Model</th><th>Status</th><th>Duration</th><th>Cost</th><th>Room</th><th>Created</th></tr></thead>
+<tbody>${jobRows || '<tr><td colspan="8">No jobs yet.</td></tr>'}</tbody></table></div>`;
+  return page('Agent Commons status', body, footer(options));
+}
+
+/** The self-contained snapshot for status-report. */
+export function statusReport(home: string, generatedAt = new Date().toISOString()): string {
+  const db = openViewerDb(home);
+  try {
+    return renderStatus(loadStatus(db, home, Date.parse(generatedAt) || Date.now()), { mode: 'snapshot', generatedAt });
+  } finally { db.close(); }
+}
+
 // ---- live viewer ------------------------------------------------------------------------------------------------
 
 export interface Viewer { url: string; token: string; close(): Promise<void> }
@@ -349,6 +631,7 @@ export async function startViewer(home: string, port = VIEWER_PORT): Promise<Vie
     try {
       let m: RegExpExecArray | null;
       if (url.pathname === '/') return send(200, renderRoomList(listRooms(db), { mode: 'live' }));
+      if (url.pathname === '/status') return send(200, renderStatus(loadStatus(db, home), { mode: 'live' }));
       if ((m = /^\/g\/(\d+)$/.exec(url.pathname))) {
         const room = loadRoom(db, 'g' + m[1]);
         return room ? send(200, renderRoom(room, { mode: 'live' })) : send(404, page('Not found', '<h1>No such room</h1><p><a href="/">All rooms</a></p>', ''));

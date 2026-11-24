@@ -4,18 +4,9 @@ Follow the [Windows quickstart](../README.md) to initialize a home and connect a
 
 ## Security defaults and upgrades
 
-Claude, Codex, and Antigravity native CLI jobs are gated until their tools can
-run without access to provider credentials. CLI discovery and quota probes can
-still report those installations. Direct submission, automatic selection, and
-background jobs use the same execution policy. If no subscription route is
-eligible, automatic selection returns an error. An OpenAI API job still needs
-explicit spend authorization and approval from the central helper. The supported
-API options include advice, the built-in `project` read tools, and edit jobs with
-an approved check run in the isolated Docker environment.
+Claude, Codex, and Antigravity native CLI routes run under the local user account with stripped provider API keys, isolated per-job Git worktrees (hooks, external smudge/clean filters, and submodules disabled), and operator-approved project roots. An OpenAI API job requires explicit spend authorization and approval from the central helper, with edit mode using approved checks run in an isolated Linux Docker container.
 
-The operator registers new projects. Existing projects keep their records and
-history. Before a migrated project can provide files or run jobs, use the local
-operator CLI to approve its physical directory:
+The operator registers new projects (`cli.ts project-create`). Existing projects keep their records and history. Before a migrated project can provide files or run jobs, use the local operator CLI to approve its physical directory:
 
 ```powershell
 node v2/src/cli.ts project-approve-root --home $acHome --project p1 --root 'C:\Projects\SampleProject'
@@ -37,7 +28,6 @@ node v2/src/cli.ts rotate-client --home $acHome --all
 ```
 
 Verify startup using `/health` and verify client authentication using `air-sync`.
-Jobs gated during an upgrade retain their status and reason in the job history.
 
 ## Configure a named check
 
@@ -71,7 +61,13 @@ The check runs offline as a non-root user in a Linux container. It receives a re
 
 The service checks supported routes every 30 minutes and after jobs finish. It defers polling while a route is busy. Codex and Antigravity provide subscription-limit metadata, and the OpenAI helper reads its local credit record. A fresh, complete observation can clear a route cooldown when all required quota windows have room.
 
-Claude polling is off by default. To enable it with Claude Code 2.1.273 or later and a Claude subscription login, set `AGENT_COMMONS_CLAUDE_USAGE=1` in the service environment before starting it. The reader accepts only a structured local `/usage` result with zero model usage and cost. Unrecognized scoped windows make the observation partial, which prevents it from lifting a cooldown. The CLI's `status` output shows scheduled resets and any refill that Agent Commons observed ahead of a scheduled reset.
+Claude polling runs automatically when Claude Code 2.1.273 or later is verified with a subscription login (and falls back to matching-account `cachedUsageUtilization` in `~/.claude.json` when available). The reader accepts only a structured local `/usage` result with zero model usage and cost. Unrecognized scoped windows make the observation partial, which prevents it from lifting a cooldown. The CLI's `status` output shows scheduled resets, advisory burn-rate pace and reset projections, and any refill that Agent Commons observed ahead of a scheduled reset. Run `node v2/src/cli.ts status-report` or `view` to inspect status and 7-day cycle history in read-only HTML.
+
+## Memory, graph, and host tools
+
+- `embed-status` / `embed-sync [--project P]`: inspect or index opt-in loopback semantic vectors (`<home>\embeddings.json`, `enabled: true`, loopback `base_url` only; schema 25) fused into `air_get` / `ctx=recall:...`.
+- `graph-status [--project P]` / `graph-query --project P --query TEXT` / `graph-refresh --project P [--force]`: inspect, query, or locally refresh (`GRAPHIFY_BACKEND=none`) staleness-verified Graphify code relationships (`air_get handles="graph:<symbol>"` or `ctx=graph:<symbol>`).
+- `audit-hosts [--app codex|claude|antigravity] [--json]`: read-only audit of host MCP configs (duplicates, missing executables, drifted `--connection`, tool-hub conflicts, and credential-marker checks).
 
 ## Model inventory
 

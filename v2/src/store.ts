@@ -17,16 +17,17 @@ import { text, optText, MAX_TEXT } from './validate.ts';
 import { adapter, adapterIds, allAdapters, DEFAULT_ROUTE } from './adapters/registry.ts';
 import { compareVersionParts, parseModelVersion, supersededBy } from './adapters/inventory.ts';
 import { compareCostEfficiency, modelPricing } from './adapters/model-pricing.ts';
-import { INTENTS, EFFORTS, type AdapterCapabilities, type ProbeResult, type UsageObservation, type UsageWindow } from './adapters/types.ts';
+import { INTENTS, EFFORTS, type AdapterCapabilities, type ProbeResult, type UsageDiagnostic, type UsageMetadata, type UsageObservation, type UsageWindow } from './adapters/types.ts';
 import { git, RESULT_LIMIT } from './adapters/shared.ts';
 import { resolvePatchCheck } from './patch-check.ts';
-import { buildContext, inside, realDirectory, redactSecrets, resolveContextRoot, same } from './context.ts';
-import { releaseWorkerPolicy, workerPolicyMessage, type WorkerPolicy } from './worker-policy.ts';
-import { activeDecisionsSql, indexMemoryRow, recallProjectMemory } from './recall.ts';
+import { buildContext, checkSecrets, inside, realDirectory, redactSecrets, resolveContextRoot, same } from './context.ts';
+import { formatGraphContext, queryGraph, resolveGraphDir } from './graph.ts';
+import { loadEmbeddingsConfig, providerId, requestEmbedding } from './embeddings.ts';
+import { activeDecisionsSql, indexMemoryRow, recallProjectMemory, type SemanticRecallQuery } from './recall.ts';
 import { inferSelection } from './selection.ts';
 import { cooldownUntil } from './cooldown.ts';
 import { checkWorkerBlock } from './air/worker.ts';
-import { allowanceLabel, allowanceRank, classifyAllowance, type Allowance } from './allowance.ts';
+import { allowanceLabel, allowanceRank, bindingWindow, classifyAllowance, downsamplePoints, formatCompactDuration, windowLengthMs, windowPace, windowProjection, type Allowance, type UsageHistoryCycle, type UsageHistoryPoint } from './allowance.ts';
 import { healthLine } from './health.ts';
 import { busySlots, findToolset, hubStatus, isBuiltinToolset, jobToolset, loadManifest, toolsAirLines, toolsetAirLine, toolsSummaryLine, type HubEnv } from './tool-hub.ts';
 import os from 'node:os';
@@ -34,6 +35,7 @@ import os from 'node:os';
 export { CommonsError } from './errors.ts';
 export type Json = Record<string, any>;
 export interface Actor { id: string; name: string; role: 'operator' | 'participant' }
+export { downsamplePoints, type UsageHistoryCycle, type UsageHistoryPoint };
 interface OutcomeCandidate {
   id: string; billing: string; priority: number; lowQuota: number;
   running: number; limit: number; queued: number; success: number; order: number;
@@ -99,10 +101,9 @@ export class Store {
   readonly home: string;
   /** Where the apps' own configuration lives, for the shared tool hub (tests replace it). */
   toolsEnv: HubEnv = { userHome: os.homedir() };
-  private readonly workerPolicy: WorkerPolicy;
-  constructor(home: string, workerPolicy: WorkerPolicy = releaseWorkerPolicy) {
+  private activeRecallVectors?: Map<string, SemanticRecallQuery>;
+  constructor(home: string) {
     this.home = home;
-    this.workerPolicy = workerPolicy;
     fs.mkdirSync(path.join(home, 'artifacts'), { recursive: true });
     this.db = new DatabaseSync(path.join(home, 'commons.sqlite'));
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
@@ -688,8 +689,6 @@ export class Store {
     const skipped: string[] = [], ready: Seat[] = [];
     for (const seat of chosen) {
       const r = status.get(seat.route)!;
-      const refusal = this.workerPolicy(seat.route, null);
-      if (refusal) { skipped.push(`${seat.seat}:${refusal}`); continue; }
       if (r.state !== 'verified') skipped.push(`${seat.seat}:${r.state}`); else if (r.cooldownUntil) skipped.push(`${seat.seat}:cooldown`); else ready.push(seat);
     }
     if (!ready.length) fail('ROOM_SEATS_UNAVAILABLE', 409, `no seat can take this round: ${skipped.join(' ')}`);
@@ -926,9 +925,6 @@ export class Store {
     const platform = adapter(requested) ?? allAdapters().find(a => a.capabilities.short === requested)
       ?? fail('ROUTE_UNAVAILABLE', 400, `route must be auto or one of ${adapterIds().join(', ')} (or ${allAdapters().map(a => a.capabilities.short).join(', ')})`);
     const route = platform.capabilities.id;
-    const toolsName = optText(input.tools, 'tools', 64);
-    const refusal = this.workerPolicy(route, toolsName);
-    if (refusal) fail(refusal, 403, workerPolicyMessage(refusal));
     if (mode !== 'advice' && mode !== 'edit') fail('INVALID_INPUT', 400, 'mode must be advice or edit');
     if (intent === 'edit' && mode !== 'edit') fail('INVALID_INPUT', 400, 'intent edit is an edit job; omit mode or set mode edit');
     // Each adapter's declared limits are enforced here, so a new platform gets them without code of its own.
@@ -936,6 +932,7 @@ export class Store {
     if (!caps.modes.includes(workerMode)) fail('INVALID_INPUT', 400, `${route} jobs are ${caps.modes.join(' or ')} only`);
     const projectRoot = this.approvedProjectRoot(project.id);
     // tools=<name>: an operator-approved tool set from the shared manifest, snapshotted (with its hash) into the job.
+    const toolsName = optText(input.tools, 'tools', 64);
     const toolset = toolsName ? jobToolset(isBuiltinToolset(toolsName) ? null : loadManifest(this.home), toolsName, route, mode) : null;
     const minutes = input.timeout_minutes ?? caps.defaultTimeoutMinutes;
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) fail('INVALID_INPUT', 400, 'timeout_minutes must be 1-240');
@@ -1014,6 +1011,7 @@ export class Store {
       task: ref => this.taskContext(project.id, ref),
       job: ref => this.projectJobText(project.id, ref),
       recall: query => this.recallContext(project.id, query),
+      graph: query => this.graphContext(projectRoot, query),
     }) : null;
     const promptChars = (primer ? primer.length + 2 : 0) + (context ? context.length + 2 : 0)
       + (primer || context ? '@request\n'.length : 0) + row.prompt.length;
@@ -1154,6 +1152,7 @@ export class Store {
         task: ref => this.taskContext(projectId, ref),
         job: ref => this.projectJobText(projectId, ref),
         recall: query => this.recallContext(projectId, query),
+        graph: query => this.graphContext(projectRoot, query),
       });
       const art = this.storeArtifact(projectId, SYSTEM_ACTOR.id, `${this.handleOf('j', job.id)}-need-context.md`, 'job_context', context, 'job_context');
       this.mergeJobOptions(job.id, { need_ctx_artifact: art.id });
@@ -1332,9 +1331,35 @@ export class Store {
       ...(this.db.prepare(`SELECT id FROM decisions WHERE task_id=? AND ${activeDecisionsSql()} ORDER BY seq DESC LIMIT 5`).all(task.id) as Json[]).map(r => this.handleOf('d', r.id)!)];
     return [handle, ...related].flatMap(h => this.airItem(h, 16000, null)).join('\n');
   }
+  withRecallVectors<T>(vectors: Map<string, SemanticRecallQuery>, fn: () => T): T {
+    const previous = this.activeRecallVectors;
+    this.activeRecallVectors = vectors;
+    try { return fn(); } finally { this.activeRecallVectors = previous; }
+  }
+  async embedRecallQueries(queries: readonly string[], fetchImpl: typeof fetch = fetch): Promise<Map<string, SemanticRecallQuery>> {
+    const vectors = new Map<string, SemanticRecallQuery>();
+    let cfg;
+    try { cfg = loadEmbeddingsConfig(this.home); } catch { return vectors; }
+    if (!cfg) return vectors;
+    const unique = [...new Set(queries.map(q => q.trim()).filter(Boolean))];
+    if (!unique.length) return vectors;
+    const provider = providerId(cfg);
+    await Promise.all(unique.map(async query => {
+      try {
+        const queryVector = await requestEmbedding(cfg!, query, cfg!.query_timeout_ms, fetchImpl);
+        vectors.set(query, { providerId: provider, queryVector, minSimilarity: cfg!.min_similarity });
+      } catch {
+        // Fall back silently to 3-arm lexical+graph+fix recall when the loopback embedder fails or times out.
+      }
+    }));
+    return vectors;
+  }
+
   private recallMemory(projectId: string, query: string, maxChars: number): ReturnType<typeof recallProjectMemory> {
+    const semantic = this.activeRecallVectors?.get(query.trim());
     return recallProjectMemory(this.db, {
       projectId, query, maxChars,
+      ...(semantic ? { semantic } : {}),
       renderEntity: (kind, id) => {
         const row = this.db.prepare(`SELECT * FROM ${ENTITY[kind].table} WHERE id=? AND project_id=?`)
           .get(id, projectId) as Json | undefined;
@@ -1350,6 +1375,10 @@ export class Store {
   }
   private recallContext(projectId: string, query: string, maxChars = 4000): string {
     return this.recallMemory(projectId, query, maxChars).lines.join('\n') || '(no matching project memory)';
+  }
+  private graphContext(projectRoot: string, query: string, maxChars = 4000): string {
+    const dir = resolveGraphDir(this.home, projectRoot);
+    return formatGraphContext(queryGraph(projectRoot, dir, query, [this.home]), query, maxChars);
   }
   /** Runner: an edit job's diff, kept as an artifact, with its short stat. */
   attachDiff(id: string, patch: string, stat: string): void {
@@ -1411,10 +1440,6 @@ export class Store {
   /** Runner: atomically move the oldest queued job whose route has a free slot to running. */
   claimQueuedJob(routeLimits: Record<string, number>, globalLimit: number): Json | null {
     return this.transaction(() => {
-      for (const row of this.db.prepare("SELECT id, route, mode, options FROM jobs WHERE status='queued'").all()) {
-        const refusal = this.queuedWorkerRefusal(jobRow(row)!);
-        if (refusal) this.failBeforeDispatch(String(row.id), refusal);
-      }
       const running = this.db.prepare("SELECT route, count(*) n FROM jobs WHERE status='running' GROUP BY route").all() as Json[];
       const counts = Object.fromEntries(running.map(r => [r.route, Number(r.n)]));
       if (running.reduce((sum, r) => sum + Number(r.n), 0) >= globalLimit) return null;
@@ -1440,11 +1465,6 @@ export class Store {
       }
       return null;
     });
-  }
-  queuedWorkerRefusal(job: Json): string | null {
-    const set = job.options?.toolset;
-    const builtin = set?.builtin === 'project' && set.name === 'project' && set.server === 'builtin';
-    return this.workerPolicy(job.route, set ? (builtin ? 'project' : 'external') : null, job.mode, !!job.options?.patch_edit);
   }
   failBeforeDispatch(id: string, code: string): void {
     this.updateJob(id, { status: 'failed', finished_at: now(), error: code });
@@ -1557,6 +1577,19 @@ export class Store {
     const previous = this.db.prepare('SELECT * FROM usage_windows WHERE route=? AND pool=? AND window=?');
     const markEarly = this.db.prepare(`UPDATE usage_windows SET early_reset_observed_at=?, early_reset_scheduled_at=?, early_reset_remaining_percent=?
       WHERE route=? AND pool=? AND window=?`);
+    const latestCycle = this.db.prepare(`SELECT cycle_resets_at FROM usage_history
+      WHERE route=? AND pool=? AND window=? AND cycle_resets_at > ? ORDER BY cycle_resets_at DESC LIMIT 1`);
+    const lastCyclePoint = this.db.prepare(`SELECT remaining_percent FROM usage_history
+      WHERE route=? AND pool=? AND window=? AND cycle_resets_at=? ORDER BY bucket_index DESC LIMIT 1`);
+    const pruneHistory = this.db.prepare(`DELETE FROM usage_history
+      WHERE route=? AND pool=? AND window=? AND (cycle_resets_at <= ? OR observed_at < ?)`);
+    const dropOtherCycles = this.db.prepare(`DELETE FROM usage_history
+      WHERE route=? AND pool=? AND window=? AND cycle_resets_at <> ?`);
+    const upsertHistory = this.db.prepare(`INSERT INTO usage_history(route,pool,window,cycle_resets_at,bucket_index,observed_at,remaining_percent)
+      VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(route,pool,window,cycle_resets_at,bucket_index) DO UPDATE SET
+        observed_at=excluded.observed_at, remaining_percent=excluded.remaining_percent
+      WHERE excluded.observed_at >= usage_history.observed_at`);
     const persist = () => {
       const observedWindows = new Map<string, UsageWindow>();
       const known = checkStartedAt ? this.usageFor(route) : [];
@@ -1575,6 +1608,30 @@ export class Store {
         const before = tracksResets ? previous.get(route, row.pool, row.window) as Json | undefined : undefined;
         const written = upsert.run(route, row.pool, row.window, row.remaining_percent, resetsAt, observedAt,
           closed ? `${source}:closed` : source, checkStartedAt ? 0 : 1);
+        if (written.changes && resetsAt !== null && row.remaining_percent !== null) {
+          const observedMs = Date.parse(observedAt);
+          const resetsMs = Date.parse(resetsAt);
+          const windowMs = windowLengthMs(row.window);
+          if (windowMs !== null && windowMs > 0 && resetsMs > observedMs) {
+            const oldestIso = new Date(observedMs - 7 * 86_400_000).toISOString();
+            pruneHistory.run(route, row.pool, row.window, observedAt, oldestIso);
+            const prevCycle = latestCycle.get(route, row.pool, row.window, observedAt) as { cycle_resets_at: string } | undefined;
+            let cycleResetsAt = resetsAt;
+            if (prevCycle) {
+              const prevResetsMs = Date.parse(prevCycle.cycle_resets_at);
+              const lastPt = lastCyclePoint.get(route, row.pool, row.window, prevCycle.cycle_resets_at) as { remaining_percent: number } | undefined;
+              const lastRemaining = lastPt?.remaining_percent ?? row.remaining_percent;
+              const earlyReset = resetsMs > prevResetsMs && row.remaining_percent >= lastRemaining + 5;
+              if (!earlyReset && Math.abs(prevResetsMs - resetsMs) <= 60_000) {
+                cycleResetsAt = prevCycle.cycle_resets_at;
+              }
+            }
+            dropOtherCycles.run(route, row.pool, row.window, cycleResetsAt);
+            const cycleStartMs = Date.parse(cycleResetsAt) - windowMs;
+            const bucketIndex = Math.max(0, Math.floor((observedMs - cycleStartMs) / 300_000));
+            upsertHistory.run(route, row.pool, row.window, cycleResetsAt, bucketIndex, observedAt, row.remaining_percent);
+          }
+        }
         if (!written.changes || !checkStartedAt || observedAt < checkStartedAt) continue;
         // A check straddling the scheduled reset cannot prove that replenishment occurred early.
         if (before && typeof before.resets_at === 'string' && before.resets_at > at && !closed && row.remaining_percent !== null
@@ -1600,6 +1657,58 @@ export class Store {
 
   blockUsageRead(route: string, identity: string): void {
     this.db.prepare('UPDATE platform_state SET usage_blocked_identity=? WHERE adapter_id=?').run(identity, route);
+  }
+
+  recordUsageMeta(route: string, opts: { accountScope?: string; meta?: UsageMetadata | null; clearError?: boolean }): void {
+    const write = () => {
+      const state = this.platformState(route);
+      if (!state) return;
+      const scopeChanged = !!(opts.accountScope && state.usage_account_scope && state.usage_account_scope !== opts.accountScope);
+      if (scopeChanged) {
+        this.db.prepare('DELETE FROM usage_history WHERE route=?').run(route);
+      }
+      const nextScope = opts.accountScope ?? state.usage_account_scope ?? null;
+      const nextMeta = opts.meta !== undefined
+        ? (opts.meta ? JSON.stringify(opts.meta) : null)
+        : (scopeChanged ? null : (state.usage_meta ?? null));
+      const nextErr = opts.clearError ? null : (state.usage_last_error ?? null);
+      this.db.prepare('UPDATE platform_state SET usage_account_scope=?, usage_meta=?, usage_last_error=? WHERE adapter_id=?')
+        .run(nextScope, nextMeta, nextErr, route);
+    };
+    if (this.db.isTransaction) write();
+    else this.transaction(write);
+  }
+
+  recordUsageError(route: string, diagnostic: UsageDiagnostic): void {
+    this.db.prepare('UPDATE platform_state SET usage_last_error=? WHERE adapter_id=?')
+      .run(JSON.stringify(diagnostic), route);
+  }
+
+  usageHistory(route?: string, at = Date.now()): UsageHistoryCycle[] {
+    const nowIso = new Date(at).toISOString();
+    const oldestIso = new Date(at - 7 * 86_400_000).toISOString();
+    const sql = route
+      ? 'SELECT route, pool, window, cycle_resets_at, observed_at, remaining_percent FROM usage_history WHERE route=? AND cycle_resets_at > ? AND observed_at >= ? ORDER BY route, pool, window, cycle_resets_at, bucket_index'
+      : 'SELECT route, pool, window, cycle_resets_at, observed_at, remaining_percent FROM usage_history WHERE cycle_resets_at > ? AND observed_at >= ? ORDER BY route, pool, window, cycle_resets_at, bucket_index';
+    const rows = (route
+      ? this.db.prepare(sql).all(route, nowIso, oldestIso)
+      : this.db.prepare(sql).all(nowIso, oldestIso)) as Json[];
+    const cycles = new Map<string, UsageHistoryCycle>();
+    for (const r of rows) {
+      const winMs = windowLengthMs(String(r.window)) ?? 7 * 86_400_000;
+      const key = JSON.stringify([r.route, r.pool, r.window, r.cycle_resets_at]);
+      let cycle = cycles.get(key);
+      if (!cycle) {
+        const startedAt = new Date(Date.parse(String(r.cycle_resets_at)) - winMs).toISOString();
+        cycle = {
+          route: String(r.route), pool: String(r.pool), window: String(r.window),
+          started_at: startedAt, resets_at: String(r.cycle_resets_at), points: [],
+        };
+        cycles.set(key, cycle);
+      }
+      cycle.points.push({ observed_at: String(r.observed_at), remaining_percent: Number(r.remaining_percent) });
+    }
+    return [...cycles.values()];
   }
 
   private reconcileQuotaCooldown(route: string, snapshot: UsageWindow[], known: UsageWindow[], checkStartedAt: string): void {
@@ -1655,9 +1764,18 @@ export class Store {
           ORDER BY latency_ms`).all(r.id, since) as Json[]).map(x => Number(x.latency_ms));
       const median = lat.length ? Math.round(lat[Math.floor(lat.length / 2)] / 1000) : null;
       const ws = adapter(r.id)?.capabilities.hasWorkspaceReadTools ? 1 : 0;
-      const alw = classifyAllowance(this.usageFor(r.id)).cls.slice(0, 3);
+      const windows = this.usageFor(r.id);
+      const alw = classifyAllowance(windows).cls.slice(0, 3);
+      const bw = bindingWindow(windows);
+      const pace = bw ? windowPace(bw) : null;
+      const proj = bw ? windowProjection(bw) : null;
+      const paceText = pace
+        ? ` pace=${Math.round(pace.pacePercent)}%${proj && proj.kind !== 'too_early'
+          ? (proj.kind === 'remaining_at_reset' ? ` proj=+${Math.round(proj.percent)}%` : ` proj=-${formatCompactDuration(proj.afterMs).replace(/\s+/g, '')}`)
+          : ''}`
+        : '';
       return `W ${r.short} fam=${r.family} bill=${r.billing} ws=${ws} alw=${alw} st=${r.state}${r.cooldownUntil ? ` cool@${r.cooldownUntil.slice(0, 16)}Z` : ''} run=${r.running}/${r.limit}`
-        + ` left%=${usage.length ? usage.map(u => q(u)).join(',') : '?'} jobs=${Number(stats.n)} ok=${Number(stats.ok ?? 0)} bad=${Number(stats.bad ?? 0)}`
+        + ` left%=${usage.length ? usage.map(u => q(u)).join(',') : '?'}${paceText} jobs=${Number(stats.n)} ok=${Number(stats.ok ?? 0)} bad=${Number(stats.bad ?? 0)}`
         + ` acc=${Number(fb.acc ?? 0)} rej=${Number(fb.rej ?? 0)}${median !== null ? ` p50=${median}s` : ''}${stats.cost != null ? ` avg$=${Number(stats.cost).toFixed(3)}` : ''}`;
     })];
   }
@@ -1837,7 +1955,7 @@ export class Store {
   routeLine(): string {
     const flag: Record<string, string> = { blocked: 'blk', drifted: 'drift', unavailable: 'na', not_probed: 'na' };
     return 'R ' + this.routeStatus().map(r => {
-      const flags = [this.workerPolicy(r.id, null) ? 'blk' : flag[r.state], r.cooldownUntil ? `cool@${r.cooldownUntil.slice(0, 16)}Z` : '', r.billing === 'paid' ? 'paid' : ''].filter(Boolean);
+      const flags = [flag[r.state], r.cooldownUntil ? `cool@${r.cooldownUntil.slice(0, 16)}Z` : '', r.billing === 'paid' ? 'paid' : ''].filter(Boolean);
       return `${r.short}=${r.running}/${r.limit}${r.queued ? `+${r.queued}q` : ''}${flags.length ? ':' + flags.join(',') : ''}`;
     }).join(' ');
   }
@@ -1847,7 +1965,7 @@ export class Store {
   /** route_hints: idle, verified, non-paid routes outside a family (default: the caller's), as short names. */
   op_route_hints(actor: Actor, input: Json): Json {
     const family = input.exclude_family ?? this.actorFamily(actor.id), mode = input.mode ?? 'advice';
-    const routes = this.routeStatus().filter(r => !this.workerPolicy(r.id, null) && r.state === 'verified' && !r.cooldownUntil && r.billing !== 'paid' && r.family !== family
+    const routes = this.routeStatus().filter(r => r.state === 'verified' && !r.cooldownUntil && r.billing !== 'paid' && r.family !== family
       && r.running < r.limit && r.queued === 0 && adapter(r.id)!.capabilities.modes.includes(mode));
     return { air: routes.map(r => r.short).join(','), routes: routes.map(r => r.id) };
   }
@@ -1929,8 +2047,6 @@ export class Store {
     const skipped: string[] = [], eligible: Candidate[] = [];
     const hasProfiles = this.hasTable('platform_profiles'), hasState = this.hasTable('platform_state');
     for (const [order, r] of this.routeStatus().entries()) {
-      const workerRefusal = this.workerPolicy(r.id, toolsetName);
-      if (workerRefusal) { skipped.push(`${r.short}:${workerRefusal}`); continue; }
       const caps = adapter(r.id)!.capabilities;
       const quota = r.state === 'verified' && !r.cooldownUntil ? this.routeQuotaState(r.id) : null;
       const storedProfile = hasProfiles
@@ -2034,12 +2150,8 @@ export class Store {
       } catch (e) { pickError = String((e as Error)?.message ?? e); }
     } else {
       const target = adapter(requestedRoute) ?? allAdapters().find(a => a.capabilities.short === requestedRoute);
-      if (!target) pickError = `unknown route ${requestedRoute}`;
-      else {
-        const refusal = this.workerPolicy(target.capabilities.id, optText(input.tools, 'tools', 64));
-        if (refusal) pickError = `${refusal}: ${workerPolicyMessage(refusal)}`;
-        else pickedRoute = target.capabilities.id;
-      }
+      pickedRoute = target?.capabilities.id ?? null;
+      if (!pickedRoute) pickError = `unknown route ${requestedRoute}`;
     }
     let resolved: Json | null = null;
     let budgetError: string | null = null;
@@ -2081,11 +2193,18 @@ export class Store {
       auto: autoMeta,
       resolved,
       budget_error: budgetError,
-      eligible: info.eligible.map(e => ({
-        route: e.id, model: e.resolvedModel, effort: e.resolvedEffort,
-        expected_usd: Number.isFinite(e.expectedCost) ? e.expectedCost : null,
-        allowance: e.allowance.cls, workspace_read: e.workspaceMismatch === 0,
-      })),
+      eligible: info.eligible.map(e => {
+        const bw = bindingWindow(this.usageFor(e.id));
+        const pace = bw ? windowPace(bw) : null;
+        const projection = bw ? windowProjection(bw) : null;
+        return {
+          route: e.id, model: e.resolvedModel, effort: e.resolvedEffort,
+          expected_usd: Number.isFinite(e.expectedCost) ? e.expectedCost : null,
+          allowance: e.allowance.cls, workspace_read: e.workspaceMismatch === 0,
+          ...(pace ? { pace_percent: Math.round(pace.pacePercent) } : {}),
+          ...(projection && projection.kind !== 'too_early' ? { projection } : {}),
+        };
+      }),
       skipped: info.skipped,
       cost_comparison: costComparison,
     };
@@ -2889,7 +3008,30 @@ export class Store {
               .find(row => !row.archived && !row.archived_at && row.status !== 'archived')
               ?? fail('PROJECT_NOT_FOUND', 404);
           const res = this.recallMemory(project.id, query, limit);
-          out.push(`@air1 recall p=${this.handleOf('p', project.id) ?? project.id} q=${q(query)} hits=${res.hits}`, ...res.lines);
+          const headerLine = `@air1 recall p=${this.handleOf('p', project.id) ?? project.id} q=${q(query)} hits=${res.hits}`;
+          checkSecrets(item, res.lines.join('\n'));
+          out.push(headerLine, ...res.lines);
+          continue;
+        }
+        const graph = /^(?:(p[1-9]\d*):)?graph:(.+)$/.exec(item);
+        if (graph) {
+          if (raw) fail('BAD_HANDLE', 400, 'raw supports only jobs and artifacts');
+          const query = graph[2].trim();
+          if (!query || query.length > 240) fail('INVALID_INPUT', 400, 'graph requires a 1-240 character query');
+          const project = graph[1] ? this.project(graph[1])
+            : (this.db.prepare('SELECT * FROM projects ORDER BY updated_at DESC, id').all() as Json[])
+              .find(row => !row.archived && !row.archived_at && row.status !== 'archived')
+              ?? fail('PROJECT_NOT_FOUND', 404);
+          if (!project.root) {
+            out.push(`@air1 graph p=${this.handleOf('p', project.id) ?? project.id} q=${q(query)} status=unavailable edges=0 reason=${q('project has no root')}`);
+            continue;
+          }
+          const dir = resolveGraphDir(this.home, project.root);
+          const res = queryGraph(project.root, dir, query, [this.home]);
+          const lines = formatGraphContext(res, query, limit).split('\n').slice(1);
+          checkSecrets(item, lines.join('\n'));
+          out.push(`@air1 graph p=${this.handleOf('p', project.id) ?? project.id} q=${q(query)} status=${res.status} edges=${res.relationships.length}`
+            + (res.reason ? ` reason=${q(res.reason)}` : ''), ...lines);
           continue;
         }
         if (item === 'routes') {
@@ -3101,6 +3243,7 @@ export class Store {
     } catch { /* Use the same error for missing and foreign repositories. */ }
     return fail('PROJECT_REPOSITORY_UNAPPROVED', 403, 'The Git repository is outside the approved project or its linked worktrees.');
   }
+  resolveProject(ref: string): Json { return this.project(ref); }
 
   recordPatchTurnContext(job: Json, turn: number, context: string): void {
     const artifact = this.storeArtifact(job.project_id, SYSTEM_ACTOR.id, `${this.handleOf('j', job.id)}-patch-turn-${turn}.md`,

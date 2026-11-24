@@ -10,11 +10,8 @@ export type { Actor, Json } from '../../src/store.ts';
 export { CommonsError } from '../../src/store.ts';
 export { checkLoopbackHeaders, releaseInfo } from '../../src/server.ts';
 
-const fakeWorkers = () => null;
-
-/** Legacy feature fixtures exercise the adapters with fake executables and seed projects as the operator. */
+/** Legacy feature fixtures seed projects as the operator while exercising real adapter routes. */
 export class Store extends ServiceStore {
-  constructor(home: string) { super(home, fakeWorkers); }
   override op_project_create(actor: Actor, input: Json): Json {
     return super.op_project_create({ ...actor, role: 'operator' }, input);
   }
@@ -30,5 +27,5 @@ export function protectFixtureHome(home: string): void {
 
 export async function startServer(home: string, port?: number, runnerOptions?: RunnerOptions | false, options: ServerOptions = {}) {
   protectFixtureHome(home);
-  return startService(home, port, runnerOptions, { workerPolicy: fakeWorkers, ...options });
+  return startService(home, port, runnerOptions, options);
 }

@@ -1,15 +1,16 @@
 /** codex: the Codex CLI on the user's ChatGPT subscription, in Codex's own sandbox, with no user config. */
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import type { Json } from '../store.ts';
-import { profileGrid, type ModelDiscoveries, type PlatformAdapter, type ProbeContext, type RouteCommand, type RunContext, type UsageSnapshot } from './types.ts';
+import { profileGrid, type ModelDiscoveries, type PlatformAdapter, type ProbeContext, type RouteCommand, type RunContext, type UsageDiagnostic, type UsageSnapshot } from './types.ts';
 import { helperEnv, killTree, launchCli, runCapture } from './shared.ts';
 import { cliCommand, directoryEntries, launchSelectedCli, pathCopies, registryUpstream, resolveCli, retainNativeCli, retainedCliPath, runOfficialUpdater, sameCliPath, versionedCopies, type CliRoute } from './cli-freshness.ts';
 import { catalogDiscoveries, catalogSelectionStatus, chooseCodexModel, cliEfforts, codexLine, queuedCliSelection, readCodexModels } from './cli-models.ts';
-import { codexLimits, parseCodexAppServerRateLimits } from './codex-limits.ts';
+import { codexLimits, parseCodexAppServerRateLimits, parseCodexResetCredits } from './codex-limits.ts';
 import { codexToolsetArgs } from '../tool-hub.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, modelPricing } from './model-pricing.ts';
 
@@ -132,17 +133,23 @@ const MODEL_PAGE_LIMIT = 8;
 const MODEL_PAGE_SIZE = 64;
 const MODEL_LIST_SOURCES = ['app-server', 'app-server:hidden', 'cli-cache', 'cli-cache:hidden'];
 
-type AppServerMethod = 'account/rateLimits/read' | 'model/list';
+type AppServerMethod = 'model/list';
 type AppServerResult<T> = { value: T } | { cursor: string };
+
+const appServerCommand = (ctx: ProbeContext): RouteCommand | undefined =>
+  ctx.options.codex ?? (ctx.selected?.path ? cli.command(ctx.selected.path, ctx.options) : undefined);
+
+const appServerArgs = (command: RouteCommand): string[] =>
+  [...(command.prefix ?? []), 'app-server', '-c', 'mcp_servers={}', '-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"'];
 
 /** Only metadata requests are sent. Each child owns one bounded observation. */
 async function readAppServer<T>(ctx: ProbeContext, method: AppServerMethod,
   read: (result: unknown) => AppServerResult<T>, reset?: () => void): Promise<T | undefined> {
-  const command = ctx.options.codex ?? (ctx.selected?.path ? cli.command(ctx.selected.path, ctx.options) : undefined);
+  const command = appServerCommand(ctx);
   if (!command) return undefined;
   const readingModels = method === 'model/list';
   return new Promise<T | undefined>((resolve, reject) => {
-    const child = spawn(command.file, [...(command.prefix ?? []), 'app-server', '-c', 'mcp_servers={}'], {
+    const child = spawn(command.file, appServerArgs(command), {
       cwd: os.tmpdir(), env: helperEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: !windows,
     });
     let settled = false, exited = false, initialized = false, bytes = 0, responseId = 1;
@@ -239,15 +246,149 @@ async function readAppServer<T>(ctx: ProbeContext, method: AppServerMethod,
   });
 }
 
-/** An invalid rate-limit observation leaves the existing quota windows untouched. */
+/**
+ * Bounded read-only quota handshake (`initialize` -> `account/read` -> `account/rateLimits/read`),
+ * verifying account scope without persisting credentials or PII, and reporting structured diagnostics.
+ */
 async function readAppServerUsage(ctx: ProbeContext): Promise<UsageSnapshot | undefined> {
+  const command = appServerCommand(ctx);
+  if (!command) return undefined;
   const startedAt = new Date().toISOString();
-  try {
-    return await readAppServer(ctx, 'account/rateLimits/read', result => {
-      const rows = parseCodexAppServerRateLimits(result, ctx.usage ?? [], Date.now(), startedAt);
-      return { value: rows ? { rows, source: 'app-server' } : undefined };
+  return new Promise<UsageSnapshot | undefined>(resolve => {
+    const child = spawn(command.file, appServerArgs(command), {
+      cwd: os.tmpdir(), env: helperEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: !windows,
     });
-  } catch { return undefined; }
+    let settled = false, exited = false, bytes = 0, responseId = 1;
+    let stage: 'initialize' | 'account' | 'rateLimits' = 'initialize';
+    let legacyRateLimits = false;
+    let verifiedAccountId: string | undefined;
+    let accountScope: string | undefined;
+
+    const fail = (kind: string, method?: string, code?: number) => {
+      const diagnostic: UsageDiagnostic = { kind, ...(method ? { method } : {}), ...(code !== undefined ? { code } : {}), at: new Date().toISOString() };
+      finish(undefined, diagnostic);
+    };
+    const finish = (snapshot?: UsageSnapshot, diagnostic?: UsageDiagnostic) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      lines.close();
+      try { child.stdin.end(); } catch { /* ignore */ }
+      if (!exited && child.pid) killTree(child.pid);
+      if (diagnostic) ctx.onUsageError?.(diagnostic);
+      resolve(snapshot);
+    };
+    const countBytes = (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > APP_SERVER_MAX_BYTES) fail('protocol', stage === 'initialize' ? 'initialize' : stage === 'account' ? 'account/read' : 'account/rateLimits/read');
+    };
+    child.stdout.on('data', countBytes);
+    child.stderr.on('data', countBytes);
+    const lines = readline.createInterface({ input: child.stdout });
+    const timer = setTimeout(() => fail('timeout', stage === 'initialize' ? 'initialize' : stage === 'account' ? 'account/read' : 'account/rateLimits/read'), APP_SERVER_TIMEOUT_MS);
+    const send = (msg: object) => {
+      try { child.stdin.write(JSON.stringify(msg) + '\n'); }
+      catch { fail('disconnected'); }
+    };
+    const sendAccountRead = () => {
+      stage = 'account';
+      responseId++;
+      send({ id: responseId, method: 'account/read', params: { refreshToken: false } });
+    };
+    const sendRateLimitsRead = (omitParams = false) => {
+      stage = 'rateLimits';
+      responseId++;
+      send({ id: responseId, method: 'account/rateLimits/read', ...(omitParams ? {} : { params: { excludeResetCreditDetails: false } }) });
+    };
+
+    child.on('error', () => fail('launch'));
+    child.on('exit', () => { exited = true; });
+    child.on('close', code => fail('processExit', undefined, typeof code === 'number' ? code : undefined));
+    child.stdin.on('error', () => fail('disconnected'));
+    child.stdout.on('error', () => fail('disconnected'));
+    child.stderr.on('error', () => fail('disconnected'));
+
+    lines.on('line', line => {
+      if (settled || !line.trim()) return;
+      let msg: Json;
+      try { msg = JSON.parse(line); } catch { return; }
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+      if (msg.method !== undefined || msg.id !== responseId) return;
+
+      if (stage === 'initialize') {
+        if (msg.error !== undefined) {
+          return fail('server', 'initialize', typeof msg.error?.code === 'number' ? msg.error.code : undefined);
+        }
+        send({ method: 'initialized' });
+        sendAccountRead();
+        return;
+      }
+
+      if (stage === 'account') {
+        if (msg.error !== undefined) {
+          if (msg.error?.code === -32601) {
+            sendRateLimitsRead();
+            return;
+          }
+          return fail('server', 'account/read', typeof msg.error?.code === 'number' ? msg.error.code : undefined);
+        }
+        const res = msg.result;
+        if (!res || typeof res !== 'object' || Array.isArray(res)) {
+          return fail('protocol', 'account/read');
+        }
+        if (res.account === null) {
+          return fail(res.requiresOpenaiAuth === false ? 'unsupportedAccount' : 'signedOut', 'account/read');
+        }
+        if (res.account && typeof res.account === 'object' && typeof res.account.type === 'string') {
+          const kind = res.account.type.toLowerCase();
+          if (kind === 'apikey' || kind === 'amazonbedrock') {
+            return fail('unsupportedAccount', 'account/read');
+          }
+        }
+        const routing = res.workspaceRouting && typeof res.workspaceRouting === 'object' && !Array.isArray(res.workspaceRouting)
+          ? res.workspaceRouting : undefined;
+        if (typeof routing?.chatgptAccountId === 'string' && routing.chatgptAccountId) {
+          verifiedAccountId = routing.chatgptAccountId;
+          const origin = typeof routing.backendOrigin === 'string' ? routing.backendOrigin : '';
+          const plan = typeof res.account?.planType === 'string' ? res.account.planType : '';
+          accountScope = createHash('sha256').update(`${verifiedAccountId}|${origin}|${plan}`).digest('hex');
+        }
+        sendRateLimitsRead();
+        return;
+      }
+
+      if (stage === 'rateLimits') {
+        if (msg.error !== undefined) {
+          if (msg.error?.code === -32600 && !legacyRateLimits) {
+            legacyRateLimits = true;
+            sendRateLimitsRead(true);
+            return;
+          }
+          return fail('server', 'account/rateLimits/read', typeof msg.error?.code === 'number' ? msg.error.code : undefined);
+        }
+        const res = msg.result;
+        if (!res || typeof res !== 'object' || Array.isArray(res)) {
+          return fail('protocol', 'account/rateLimits/read');
+        }
+        if (typeof res.accountId === 'string' && res.accountId && verifiedAccountId && res.accountId !== verifiedAccountId) {
+          return fail('accountMismatch', 'account/rateLimits/read');
+        }
+        const rows = parseCodexAppServerRateLimits(res, ctx.usage ?? [], Date.now(), startedAt);
+        if (!rows) {
+          return fail('protocol', 'account/rateLimits/read');
+        }
+        const resetCredits = parseCodexResetCredits(res, startedAt);
+        finish({
+          rows,
+          source: 'app-server',
+          ...(accountScope ? { accountScope } : {}),
+          ...(resetCredits ? { meta: { resetCredits } } : {}),
+        });
+      }
+    });
+
+    send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'agent-commons', title: 'Agent Commons', version: ctx.cliVersion ?? '2.0.0' } } });
+  });
 }
 
 async function discoverModels(ctx: ProbeContext): Promise<ModelDiscoveries> {

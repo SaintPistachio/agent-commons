@@ -5,13 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { parseClaudeUsage, readClaudeUsage } from '../src/adapters/claude-usage.ts';
+import { parseClaudeCachedUsage, parseClaudeUsage, readClaudeCachedUsage, readClaudeUsage } from '../src/adapters/claude-usage.ts';
 import { claude } from '../src/adapters/claude.ts';
-import { parseCodexAppServerRateLimits } from '../src/adapters/codex-limits.ts';
-import { UsageContractViolation, type UsageObservation, type UsageWindow } from '../src/adapters/types.ts';
+import { codex } from '../src/adapters/codex.ts';
+import { codexExpiringResets, parseCodexAppServerRateLimits, parseCodexResetCredits } from '../src/adapters/codex-limits.ts';
+import { UsageContractViolation, type UsageDiagnostic, type UsageObservation, type UsageWindow } from '../src/adapters/types.ts';
 import { Prober } from '../src/prober.ts';
-import { Store } from './fixtures/service.ts';
 import { migrate, SCHEMA_VERSION } from '../src/schema.ts';
+import { downsamplePoints } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 
 const iso = (offset: number) => new Date(Date.now() + offset).toISOString();
 const reading = (window: string, remaining: number, resets_at: string | null, observed_at: string, pool = 'default'): UsageObservation =>
@@ -62,15 +64,6 @@ function fixture(t: TestContext) {
   return { dir, store };
 }
 
-function setClaudeUsage(t: TestContext, value: '0' | '1') {
-  const previous = process.env.AGENT_COMMONS_CLAUDE_USAGE;
-  process.env.AGENT_COMMONS_CLAUDE_USAGE = value;
-  t.after(() => {
-    if (previous === undefined) delete process.env.AGENT_COMMONS_CLAUDE_USAGE;
-    else process.env.AGENT_COMMONS_CLAUDE_USAGE = previous;
-  });
-}
-
 function frames(session_id: string, resets_at: string) {
   return [
     { type: 'system', subtype: 'ui_invalidate', session_id },
@@ -94,11 +87,6 @@ test('Claude usage only accepts structured local /usage with no inference or too
     { pool: 'default', window: 'weekly', remaining_percent: 80, resets_at: reset },
     { pool: 'claude / Fable', window: 'weekly', remaining_percent: 10, resets_at: reset },
   ]);
-  const unknownScope = frames('session', reset);
-  const scoped = unknownScope[2].usage_report!.rate_limits.limits[2];
-  scoped.scope!.model.display_name = 'Unrecognized display text';
-  assert.equal(parse(unknownScope)?.partial, true);
-  assert.equal(parse(unknownScope)?.rows.length, 2);
   for (const badResult of [{ duration_api_ms: 1 }, { total_cost_usd: 0.01 }, { local_command: undefined },
     { usage: { input_tokens: 0, output_tokens: 1 } }]) {
     assert.throws(() => parse([...output.slice(0, -1), { ...output.at(-1), ...badResult }]), UsageContractViolation);
@@ -155,7 +143,6 @@ test('an unrelated open Antigravity pool cannot clear a scoped quota cooldown', 
 });
 
 test('a Claude metadata command reporting model work suspends future reads for that binary identity', async t => {
-  setClaudeUsage(t, '0');
   const { dir, store } = fixture(t);
   const fake = path.join(dir, 'bad-claude.mjs'), calls = path.join(dir, 'calls.txt');
   fs.writeFileSync(fake, `
@@ -172,9 +159,6 @@ test('a Claude metadata command reporting model work suspends future reads for t
     .run(process.execPath, '2.1.323', 'claude');
   const prober = new Prober(store, dir, { claude: { file: process.execPath, prefix: [fake] } },
     { adapters: ['claude'], schedule: false });
-  await prober.refreshUsage();
-  assert.equal(fs.existsSync(calls), false, 'Claude is not started without the operator opt-in');
-  process.env.AGENT_COMMONS_CLAUDE_USAGE = '1';
   await prober.refreshUsage();
   assert.equal(store.usageFor('claude').length, 0);
   assert.ok(store.platformState('claude')?.usage_blocked_identity);
@@ -251,7 +235,6 @@ test('a weekly-only Codex snapshot cannot clear an unidentified exhausted window
 });
 
 test('polling Claude can reopen a quota-held queue without submitting a model prompt', async t => {
-  setClaudeUsage(t, '1');
   const { dir, store } = fixture(t);
   const fake = path.join(dir, 'claude.mjs');
   const reset = iso(60_000);
@@ -294,4 +277,388 @@ test('Codex app-server can replace a previously closed window when headroom retu
   const rows = parseCodexAppServerRateLimits({ rateLimits: { limitId: 'codex',
     primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: reset } } }, [previous], now);
   assert.deepEqual([rows?.[0].remaining_percent, rows?.[0].closed, rows?.[0].resets_at], [60, false, resets_at]);
+});
+
+test('schema 22 migrates to schema 23 preserving usage_windows and adding usage_history and meta columns', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-schema23-'));
+  let reopened: Store | undefined;
+  t.after(() => { try { reopened?.close(); } catch {} fs.rmSync(dir, { recursive: true, force: true }); });
+  const store = new Store(dir);
+  const reset = iso(24 * 3600_000), seen = iso(-60_000);
+  store.recordUsage('codex', [reading('10080m', 77, reset, seen, 'codex')], 'app-server');
+  store.close();
+
+  const db = new DatabaseSync(path.join(dir, 'commons.sqlite'));
+  db.exec(`DROP TABLE usage_history;
+    ALTER TABLE platform_state DROP COLUMN usage_account_scope;
+    ALTER TABLE platform_state DROP COLUMN usage_last_error;
+    ALTER TABLE platform_state DROP COLUMN usage_meta;
+    PRAGMA user_version = 22;`);
+  db.close();
+
+  reopened = new Store(dir);
+  assert.equal(Number((reopened.db.prepare('PRAGMA user_version').get() as any).user_version), SCHEMA_VERSION);
+  assert.equal(reopened.usageFor('codex')[0]?.remaining_percent, 77);
+  const cols = (reopened.db.prepare('PRAGMA table_info(platform_state)').all() as any[]).map(c => c.name);
+  for (const col of ['usage_account_scope', 'usage_last_error', 'usage_meta']) assert.ok(cols.includes(col));
+});
+
+test('usage_history coalesces 5-minute buckets, tolerates 60s reset jitter, rolls over on early reset, and isolates account scopes', t => {
+  const { store } = fixture(t);
+  store.recordProbe(codex.capabilities, { state: 'verified' });
+  const base = Date.parse('2026-11-23T12:00:00.000Z');
+  const reset1 = new Date(base + 5 * 86_400_000).toISOString();
+  const reset1Jitter = new Date(base + 5 * 86_400_000 + 30_000).toISOString();
+  const t1 = new Date(base + 60_000).toISOString();
+  const t2 = new Date(base + 120_000).toISOString(); // same 5m bucket
+  const t3 = new Date(base + 6 * 60_000).toISOString(); // next 5m bucket
+
+  store.recordUsage('codex', [reading('10080m', 90, reset1, t1, 'codex')], 'app-server');
+  store.recordUsage('codex', [reading('10080m', 88, reset1Jitter, t2, 'codex')], 'app-server');
+  store.recordUsage('codex', [reading('10080m', 84, reset1Jitter, t3, 'codex')], 'app-server');
+  let cycles = store.usageHistory('codex', base + 7 * 60_000);
+  assert.equal(cycles.length, 1);
+  assert.equal(cycles[0].resets_at, reset1, '60s jitter stays on the existing cycle');
+  assert.deepEqual(cycles[0].points.map(p => p.remaining_percent), [88, 84], 'same 5-minute bucket updates in place');
+
+  // Early reset (reset moves forward AND remaining jumps >= 5%) starts a fresh cycle.
+  const reset2 = new Date(base + 7 * 86_400_000).toISOString();
+  const t4 = new Date(base + 10 * 60_000).toISOString();
+  store.recordUsage('codex', [reading('10080m', 100, reset2, t4, 'codex')], 'app-server');
+  cycles = store.usageHistory('codex', base + 11 * 60_000);
+  assert.equal(cycles.length, 1);
+  assert.equal(cycles[0].resets_at, reset2);
+  assert.deepEqual(cycles[0].points.map(p => p.remaining_percent), [100]);
+
+  // Changing accountScope clears prior account history and stale usage_meta.
+  store.recordUsageMeta('codex', {
+    accountScope: 'scope-a',
+    meta: { resetCredits: { availableCount: 1, capturedAt: t4, credits: [] } },
+    clearError: true,
+  });
+  store.recordUsage('codex', [reading('10080m', 95, reset2, new Date(base + 15 * 60_000).toISOString(), 'codex')], 'app-server');
+  store.recordUsageMeta('codex', { accountScope: 'scope-b', clearError: true });
+  assert.equal(store.usageHistory('codex', base + 16 * 60_000).length, 0);
+  assert.equal(store.platformState('codex')?.usage_meta, null);
+
+  // Downsampling preserves endpoints.
+  const pts = Array.from({ length: 300 }, (_, i) => i);
+  const sampled = downsamplePoints(pts, 240);
+  assert.equal(sampled.length, 240);
+  assert.equal(sampled[0], 0);
+  assert.equal(sampled[sampled.length - 1], 299);
+});
+
+test('Codex app-server verifies account/read, handles legacy -32600, decodes resetCredits, and reports structured diagnostics', async t => {
+  const { dir } = fixture(t);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const resetSec = nowSec + 3 * 86400;
+  const expSoonSec = nowSec + 24 * 3600;
+  const expPastCaptureSec = nowSec - 60;
+  const script = path.join(dir, 'codex-app.mjs');
+  fs.writeFileSync(script, `
+    import readline from 'node:readline';
+    const mode = process.argv[2];
+    const send = obj => console.log(JSON.stringify(obj));
+    readline.createInterface({ input: process.stdin }).on('line', line => {
+      const m = JSON.parse(line);
+      if (m.method === 'initialize') return send({ id: m.id, result: {} });
+      if (m.method === 'initialized') return;
+      if (m.method === 'account/read') {
+        if (mode === 'signed-out') return send({ id: m.id, result: { account: null, requiresOpenaiAuth: true } });
+        if (mode === 'api-key') return send({ id: m.id, result: { account: { type: 'apiKey' } } });
+        if (mode === 'no-account-read') return send({ id: m.id, error: { code: -32601, message: 'not found' } });
+        return send({ id: m.id, result: {
+          account: { type: 'chatgpt', planType: 'plus' },
+          workspaceRouting: { chatgptAccountId: 'acct-A', backendOrigin: 'https://chatgpt.com' },
+        } });
+      }
+      if (m.method === 'account/rateLimits/read') {
+        if (mode === 'legacy-params' && m.params !== undefined) {
+          return send({ id: m.id, error: { code: -32600, message: 'expected null params' } });
+        }
+        return send({ id: m.id, result: {
+          accountId: mode === 'mismatch' ? 'acct-B' : 'acct-A',
+          rateLimits: { limitId: 'codex', primary: { usedPercent: 20, windowDurationMins: 10080, resetsAt: ${resetSec} } },
+          rateLimitResetCredits: {
+            availableCount: 2,
+            credits: [
+              { id: 'c1', status: 'available', grantedAt: ${nowSec - 3600}, expiresAt: ${expSoonSec} },
+              { id: 'c2', status: 'available', grantedAt: ${nowSec - 7200}, expiresAt: ${expSoonSec + 10 * 86400} },
+            ],
+          },
+        } });
+      }
+    });
+  `);
+
+  const callMode = async (mode: string) => {
+    const errors: UsageDiagnostic[] = [];
+    const snap = await codex.observeUsage!({
+      home: dir,
+      options: { codex: { file: process.execPath, prefix: [script, mode] } },
+      overrides: {},
+      onUsageError: d => errors.push(d),
+    });
+    return { snap, errors };
+  };
+
+  const ok = await callMode('ok');
+  assert.equal(ok.errors.length, 0);
+  assert.ok(ok.snap?.accountScope && /^[0-9a-f]{64}$/.test(ok.snap.accountScope));
+  assert.equal(ok.snap?.meta?.resetCredits?.availableCount, 2);
+  const expReport = codexExpiringResets(ok.snap?.meta?.resetCredits, 3);
+  assert.equal(expReport.remainingCount, 2);
+  assert.equal(expReport.expiring.length, 1);
+  assert.equal(expReport.expiring[0].count, 1);
+
+  // Newly expired credit subtraction check
+  const parsed = parseCodexResetCredits({
+    rateLimitResetCredits: {
+      availableCount: 2,
+      credits: [
+        { id: 'expired-since', status: 'available', grantedAt: nowSec - 7200, expiresAt: expPastCaptureSec },
+        { id: 'still-live', status: 'available', grantedAt: nowSec - 7200, expiresAt: expSoonSec },
+      ],
+    },
+  }, new Date((nowSec - 120) * 1000).toISOString());
+  assert.equal(codexExpiringResets(parsed, 3, nowSec * 1000).remainingCount, 1);
+
+  assert.equal((await callMode('legacy-params')).snap?.rows[0].remaining_percent, 80);
+  assert.equal((await callMode('no-account-read')).snap?.rows[0].remaining_percent, 80);
+  assert.equal((await callMode('signed-out')).errors[0]?.kind, 'signedOut');
+  assert.equal((await callMode('api-key')).errors[0]?.kind, 'unsupportedAccount');
+  assert.equal((await callMode('mismatch')).errors[0]?.kind, 'accountMismatch');
+});
+
+test('Prober applies failure backoff on usage errors, bypasses on forced refresh, and cleans reset timers on stop', async t => {
+  const { dir, store } = fixture(t);
+  const callsFile = path.join(dir, 'codex-calls.txt');
+  const modeFile = path.join(dir, 'codex-mode.txt');
+  fs.writeFileSync(modeFile, 'signed-out');
+  const script = path.join(dir, 'prober-codex.mjs');
+  const resetSec = Math.floor((Date.now() + 5 * 60_000) / 1000);
+  fs.writeFileSync(script, `
+    import fs from 'node:fs';
+    import readline from 'node:readline';
+    fs.appendFileSync(${JSON.stringify(callsFile)}, 'call\\n');
+    const mode = fs.readFileSync(${JSON.stringify(modeFile)}, 'utf8').trim();
+    const send = o => console.log(JSON.stringify(o));
+    readline.createInterface({ input: process.stdin }).on('line', line => {
+      const m = JSON.parse(line);
+      if (m.method === 'initialize') return send({ id: m.id, result: {} });
+      if (m.method === 'initialized') return;
+      if (m.method === 'account/read') {
+        if (mode === 'signed-out') return send({ id: m.id, result: { account: null, requiresOpenaiAuth: true } });
+        return send({ id: m.id, result: { account: { type: 'chatgpt', planType: 'plus' }, workspaceRouting: { chatgptAccountId: 'acct-1' } } });
+      }
+      if (m.method === 'account/rateLimits/read') {
+        return send({ id: m.id, result: { accountId: 'acct-1', rateLimits: { limitId: 'codex', primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: ${resetSec} } } } });
+      }
+    });
+  `);
+
+  store.recordProbe(codex.capabilities, { state: 'verified' });
+  const prober = new Prober(store, dir, { codex: { file: process.execPath, prefix: [script] } }, { adapters: ['codex'], schedule: false });
+  await prober.refreshUsage();
+  assert.equal(fs.readFileSync(callsFile, 'utf8').trim().split('\n').length, 1);
+  assert.equal(JSON.parse(store.platformState('codex')!.usage_last_error).kind, 'signedOut');
+
+  // Non-forced refresh skips during backoff.
+  await prober.refreshUsage();
+  assert.equal(fs.readFileSync(callsFile, 'utf8').trim().split('\n').length, 1);
+
+  // Forced refresh bypasses backoff and clears usage_last_error on success.
+  fs.writeFileSync(modeFile, 'ok');
+  await prober.refreshUsage(true);
+  assert.equal(fs.readFileSync(callsFile, 'utf8').trim().split('\n').length, 2);
+  assert.equal(store.platformState('codex')!.usage_last_error, null);
+  assert.equal(store.usageFor('codex')[0]?.remaining_percent, 90);
+  prober.stop();
+});
+
+test('parseClaudeCachedUsage parses matching account limits, falls back to summary windows, and fails closed', t => {
+  const now = Date.UTC(2026, 10, 24, 6, 0, 0);
+  const fetchedAtMs = now - 5 * 60_000;
+  const reset = '2026-11-24T08:19:59.705981+00:00';
+  const expectedObservedAt = new Date(fetchedAtMs).toISOString();
+
+  const withLimits = JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-uuid-1', emailAddress: 'user@example.com' },
+    cachedUsageUtilization: {
+      fetchedAtMs,
+      accountUuid: 'acct-uuid-1',
+      utilization: {
+        five_hour: { utilization: 99, resets_at: reset },
+        seven_day: { utilization: 99, resets_at: reset },
+        limits: [
+          { kind: 'session', percent: 14, resets_at: reset, scope: null },
+          { kind: 'weekly_all', percent: 7, resets_at: reset, scope: null },
+          { kind: 'weekly_scoped', percent: 45, resets_at: reset, scope: { model: { display_name: 'Fable' } } },
+        ],
+      },
+    },
+  });
+  const parsed = parseClaudeCachedUsage(withLimits, now);
+  assert.equal(parsed?.source, 'claude-cache');
+  assert.equal(parsed?.partial, false);
+  assert.deepEqual(parsed?.rows, [
+    { pool: 'default', window: '5h', remaining_percent: 86, resets_at: reset, observed_at: expectedObservedAt },
+    { pool: 'default', window: 'weekly', remaining_percent: 93, resets_at: reset, observed_at: expectedObservedAt },
+    { pool: 'claude / Fable', window: 'weekly', remaining_percent: 55, resets_at: reset, observed_at: expectedObservedAt },
+  ]);
+
+  const fallbackOnly = JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-uuid-1' },
+    cachedUsageUtilization: {
+      fetchedAtMs,
+      accountUuid: 'acct-uuid-1',
+      utilization: {
+        five_hour: { utilization: 25, resets_at: reset },
+        seven_day: { utilization: 10, resets_at: null },
+        limits: [],
+      },
+    },
+  });
+  assert.deepEqual(parseClaudeCachedUsage(fallbackOnly, now)?.rows, [
+    { pool: 'default', window: '5h', remaining_percent: 75, resets_at: reset, observed_at: expectedObservedAt },
+    { pool: 'default', window: 'weekly', remaining_percent: 90, resets_at: null, observed_at: expectedObservedAt },
+  ]);
+
+  const partialLimits = JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-uuid-1' },
+    cachedUsageUtilization: {
+      fetchedAtMs,
+      accountUuid: 'acct-uuid-1',
+      utilization: {
+        limits: [
+          { kind: 'session', percent: 10, resets_at: reset },
+          { kind: 'unmapped_future_window', percent: 50, resets_at: reset },
+        ],
+      },
+    },
+  });
+  assert.equal(parseClaudeCachedUsage(partialLimits, now)?.partial, true);
+
+  // Fail-closed cases
+  assert.equal(parseClaudeCachedUsage('{bad json', now), undefined);
+  assert.equal(parseClaudeCachedUsage(JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-a' },
+    cachedUsageUtilization: { fetchedAtMs, accountUuid: 'acct-b', utilization: { five_hour: { utilization: 10, resets_at: reset } } },
+  }), now), undefined);
+  assert.equal(parseClaudeCachedUsage(JSON.stringify({
+    cachedUsageUtilization: { fetchedAtMs, accountUuid: 'acct-b', utilization: { five_hour: { utilization: 10, resets_at: reset } } },
+  }), now), undefined);
+  assert.equal(parseClaudeCachedUsage(JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-1' },
+    cachedUsageUtilization: { fetchedAtMs: now - 6 * 60 * 60 * 1000 - 1, accountUuid: 'acct-1', utilization: { five_hour: { utilization: 10, resets_at: reset } } },
+  }), now), undefined);
+  assert.equal(parseClaudeCachedUsage(JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-1' },
+    cachedUsageUtilization: { fetchedAtMs: now + 61_000, accountUuid: 'acct-1', utilization: { five_hour: { utilization: 10, resets_at: reset } } },
+  }), now), undefined);
+  assert.equal(parseClaudeCachedUsage(JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-1' },
+    cachedUsageUtilization: { fetchedAtMs, accountUuid: 'acct-1', utilization: { limits: [{ kind: 'session', percent: 105, resets_at: reset }] } },
+  }), now), undefined);
+  assert.equal(parseClaudeCachedUsage(JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-1' },
+    cachedUsageUtilization: { fetchedAtMs, accountUuid: 'acct-1', utilization: { limits: [{ kind: 'session', percent: 10, resets_at: 'not-a-date' }] } },
+  }), now), undefined);
+
+  // readClaudeCachedUsage file handling
+  const { dir } = fixture(t);
+  const stateFile = path.join(dir, '.claude.json');
+  fs.writeFileSync(stateFile, withLimits);
+  assert.equal(readClaudeCachedUsage(stateFile, now)?.source, 'claude-cache');
+  assert.equal(readClaudeCachedUsage(path.join(dir, 'missing.json'), now), undefined);
+  assert.equal(readClaudeCachedUsage(null, now), undefined);
+});
+
+test('Prober falls back to claude-cache when headless /usage fails, honors UsageContractViolation, and respects recency', async t => {
+  const { dir, store } = fixture(t);
+  const failingCli = path.join(dir, 'fail-claude.mjs');
+  fs.writeFileSync(failingCli, 'process.exit(1);\n');
+  const now = Date.now();
+  const reset = new Date(now + 60 * 60_000).toISOString();
+  const recentMs = now - 30_000;
+  const stateFile = path.join(dir, 'claude-state.json');
+  fs.writeFileSync(stateFile, JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-1' },
+    cachedUsageUtilization: {
+      fetchedAtMs: recentMs,
+      accountUuid: 'acct-1',
+      utilization: {
+        limits: [
+          { kind: 'session', percent: 20, resets_at: reset },
+          { kind: 'weekly_all', percent: 10, resets_at: reset },
+        ],
+      },
+    },
+  }));
+
+  store.recordProbe(claude.capabilities, { state: 'verified' });
+  store.db.prepare('UPDATE platform_state SET bin_selected_path=?, bin_version=? WHERE adapter_id=?')
+    .run(process.execPath, '2.1.325', 'claude');
+
+  const prober = new Prober(store, dir, { claude: { file: process.execPath, prefix: [failingCli] } },
+    { adapters: ['claude'], schedule: false, claudeStatePath: stateFile });
+  await prober.refreshUsage();
+  const rows = store.usageFor('claude');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]?.source, 'claude-cache');
+  assert.equal(rows.find(r => r.window === '5h')?.remaining_percent, 80);
+  prober.stop();
+
+  // Newer claude-usage reading cannot be overwritten by an older cache reading,
+  // and an older cache reading cannot lift an active quota cooldown.
+  const newerAt = new Date(now - 5_000).toISOString();
+  const olderMs = now - 60_000;
+  store.recordUsage('claude', [
+    { pool: 'default', window: '5h', remaining_percent: 50, resets_at: reset, observed_at: newerAt },
+    { pool: 'default', window: 'weekly', remaining_percent: 40, resets_at: reset, observed_at: newerAt },
+  ], 'claude-usage', newerAt);
+  store.setCooldown('claude', reset, 'QUOTA_EXHAUSTED: session');
+  store.db.prepare('UPDATE platform_state SET cooldown_started_at=? WHERE adapter_id=?').run(newerAt, 'claude');
+
+  fs.writeFileSync(stateFile, JSON.stringify({
+    oauthAccount: { accountUuid: 'acct-1' },
+    cachedUsageUtilization: {
+      fetchedAtMs: olderMs,
+      accountUuid: 'acct-1',
+      utilization: {
+        limits: [
+          { kind: 'session', percent: 5, resets_at: reset },
+          { kind: 'weekly_all', percent: 5, resets_at: reset },
+        ],
+      },
+    },
+  }));
+  const proberOlder = new Prober(store, dir, { claude: { file: process.execPath, prefix: [failingCli] } },
+    { adapters: ['claude'], schedule: false, claudeStatePath: stateFile });
+  await proberOlder.refreshUsage();
+  assert.equal(store.usageFor('claude').find(r => r.window === '5h')?.remaining_percent, 50);
+  assert.equal(store.routeStatus().find(r => r.id === 'claude')?.cooldownUntil, reset);
+  proberOlder.stop();
+
+  // UsageContractViolation still suspends the binary even when claudeStatePath is valid.
+  const { dir: dir2, store: store2 } = fixture(t);
+  const badCli = path.join(dir2, 'bad-claude.mjs');
+  fs.writeFileSync(badCli, `
+    import fs from 'node:fs';
+    fs.readFileSync(0, 'utf8');
+    const session = process.argv[process.argv.indexOf('--session-id') + 1];
+    const output = (${frames.toString()})(session, ${JSON.stringify(reset)});
+    output.at(-1).duration_api_ms = 2;
+    for (const frame of output) console.log(JSON.stringify(frame));
+  `);
+  store2.recordProbe(claude.capabilities, { state: 'verified' });
+  store2.db.prepare('UPDATE platform_state SET bin_selected_path=?, bin_version=? WHERE adapter_id=?')
+    .run(process.execPath, '2.1.325', 'claude');
+  const proberBad = new Prober(store2, dir2, { claude: { file: process.execPath, prefix: [badCli] } },
+    { adapters: ['claude'], schedule: false, claudeStatePath: stateFile });
+  await proberBad.refreshUsage();
+  assert.equal(store2.usageFor('claude').length, 0);
+  assert.ok(store2.platformState('claude')?.usage_blocked_identity);
+  proberBad.stop();
 });

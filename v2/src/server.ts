@@ -6,8 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { Store, CommonsError } from './store.ts';
 import { Runner, type RunnerOptions } from './runner.ts';
 import { Prober } from './prober.ts';
+import { MemoryEmbedder, loadEmbeddingsConfig } from './embeddings.ts';
+import { parsePacket } from './air/parser.ts';
 import { ensureTokenHome, writePrivateJson } from './token-home.ts';
-import type { WorkerPolicy } from './worker-policy.ts';
 
 export const DEFAULT_PORT = 4727;
 
@@ -52,8 +53,34 @@ export interface ServerOptions {
   probe?: boolean;
   /** Called once the service has closed after POST /api/v1/shutdown (cli.ts serve exits the process). */
   onShutdown?: () => void;
-  /** In-process test seam for fake adapters. The CLI always uses the production policy. */
-  workerPolicy?: WorkerPolicy;
+}
+
+export function extractRecallQueries(method: string, input: Record<string, unknown>): string[] {
+  const queries: string[] = [];
+  if (method === 'air_get' && typeof input.handles === 'string') {
+    for (const raw of input.handles.split(',')) {
+      const m = /^(?:p[1-9]\d*:)?(?:\?|recall:)(.+)$/.exec(raw.trim());
+      if (m?.[1]?.trim()) queries.push(m[1].trim());
+    }
+  } else if (method === 'job_submit' && Array.isArray(input.context_refs)) {
+    for (const ref of input.context_refs) {
+      if (typeof ref === 'string' && ref.startsWith('recall:') && ref.slice(7).trim()) {
+        queries.push(ref.slice(7).trim());
+      }
+    }
+  } else if (method === 'air_tx' && typeof input.packet === 'string') {
+    try {
+      const parsed = parsePacket(input.packet);
+      for (const node of parsed.nodes) {
+        for (const item of node.fields.ctx ?? []) {
+          if ('text' in item && item.text.startsWith('recall:') && item.text.slice(7).trim()) {
+            queries.push(item.text.slice(7).trim());
+          }
+        }
+      }
+    } catch { /* let store.call report syntax errors synchronously */ }
+  }
+  return [...new Set(queries)];
 }
 
 /**
@@ -64,10 +91,16 @@ export interface ServerOptions {
 export async function startServer(home: string, port = DEFAULT_PORT, runnerOptions: RunnerOptions | false = {}, serverOptions: ServerOptions = {}): Promise<Running> {
   ensureTokenHome(home);
   if (fs.existsSync(path.join(home, '.restore.lock'))) throw new Error('A backup restore is in progress for this home');
-  const store = new Store(home, serverOptions.workerPolicy);
+  const store = new Store(home);
   // Delegated jobs run inside the service, so they outlive the app that submitted them.
   const runner = runnerOptions === false ? null : new Runner(store, home, runnerOptions);
   const prober = runnerOptions !== false && serverOptions.probe ? new Prober(store, home, runnerOptions) : null;
+  let embedder: MemoryEmbedder | null = null;
+  if (runnerOptions !== false) {
+    try {
+      if (loadEmbeddingsConfig(home)) embedder = new MemoryEmbedder(store.db, home);
+    } catch { /* invalid embeddings.json does not prevent server startup */ }
+  }
   const shutdownToken = randomBytes(32).toString('hex');
   const release = releaseInfo();
   let closing: Promise<void> | undefined;
@@ -113,6 +146,13 @@ export async function startServer(home: string, port = DEFAULT_PORT, runnerOptio
           response.on('close', () => { if (!response.writableEnded) hangUp.abort(); });
           return send(200, { result: await store.airWait(actor, input, hangUp.signal) });
         }
+        const queries = extractRecallQueries(body.method, input);
+        if (queries.length) {
+          const vectors = await store.embedRecallQueries(queries);
+          if (vectors.size) {
+            return send(200, { result: store.withRecallVectors(vectors, () => store.call(actor, body.method, input)) });
+          }
+        }
         send(200, { result: store.call(actor, body.method, input) });
       } catch (error) {
         if (error instanceof CommonsError) return send(error.status, { error: { code: error.code, message: error.message } });
@@ -134,9 +174,11 @@ export async function startServer(home: string, port = DEFAULT_PORT, runnerOptio
   }
   runner?.start();
   prober?.start();
+  embedder?.start();
   // Closing twice (a shutdown request, then a signal) does the work once.
   const close = () => closing ??= new Promise<void>(resolve => {
     store.wakeWaiters(); // pending air_wait calls answer now instead of holding the shutdown open
+    embedder?.stop();
     prober?.stop();
     runner?.stop();
     server.close(() => { store.close(); try { fs.rmSync(path.join(home, 'runtime.json')); } catch {} resolve(); });

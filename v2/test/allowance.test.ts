@@ -8,7 +8,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store, type Actor } from './fixtures/service.ts';
 import { adapter } from '../src/adapters/registry.ts';
-import { classifyAllowance, windowLengthMs } from '../src/allowance.ts';
+import { bindingWindow, classifyAllowance, formatCompactDuration, formatPaceSummary, windowLengthMs, windowPace, windowProjection } from '../src/allowance.ts';
 import type { UsageWindow } from '../src/adapters/types.ts';
 
 const H = 3600_000, NOW = Date.parse('2026-11-20T12:00:00Z');
@@ -159,4 +159,50 @@ test('an outcome-history swap keeps the allowance reason unless it lands on the 
   assert.equal(swapped.allowanceDecided, true);
   without = 'c';
   assert.equal(hooks.pickRoute({ id: 'claude-desktop' }, {}, 'advice', 'code', 'med').allowanceDecided, undefined);
+});
+
+test('windowPace and windowProjection calculate advisory burn rate, early guard, and Antigravity 5h labels', () => {
+  assert.equal(windowLengthMs('Five Hour Limit Remaining'), 5 * H);
+  assert.equal(windowLengthMs('Weekly Limit Remaining'), 168 * H);
+  assert.equal(formatCompactDuration(0), '0m');
+  assert.equal(formatCompactDuration(45 * 60_000), '45m');
+  assert.equal(formatCompactDuration((18 * 60 + 20) * 60_000), '18h 20m');
+  assert.equal(formatCompactDuration((76 * 60) * 60_000), '3d 4h');
+
+  // 50% time left, 75% quota left -> 150% pace, +50% projected at reset
+  const ahead = w('default', '10080m', 75, 84 * H);
+  const pAhead = windowPace(ahead, NOW)!;
+  assert.ok(Math.abs(pAhead.elapsedPercent - 50) < 1e-6);
+  assert.ok(Math.abs(pAhead.pacePercent - 150) < 1e-6);
+  const projAhead = windowProjection(ahead, NOW)!;
+  assert.equal(projAhead.kind, 'remaining_at_reset');
+  if (projAhead.kind === 'remaining_at_reset') assert.ok(Math.abs(projAhead.percent - 50) < 1e-6);
+  assert.equal(formatPaceSummary(ahead, NOW), 'pace 150%, proj +50% at reset');
+
+  // 50% time left, 25% quota left -> 50% pace, 75% used in 84h => runs out in 28h
+  const fast = w('default', '10080m', 25, 84 * H);
+  const projFast = windowProjection(fast, NOW)!;
+  assert.equal(projFast.kind, 'runs_out');
+  if (projFast.kind === 'runs_out') assert.ok(Math.abs(projFast.afterMs - 28 * H) < 1e-3);
+  assert.equal(formatPaceSummary(fast, NOW), 'pace 50%, proj runs out in 1d 4h');
+
+  // Under 5% elapsed -> too_early projection, pace still returned
+  const early = w('default', '10080m', 98, 165 * H);
+  assert.equal(windowProjection(early, NOW)?.kind, 'too_early');
+  assert.match(formatPaceSummary(early, NOW)!, /^pace \d+%$/);
+
+  // Zero used -> projects current remaining at reset
+  const unused = w('default', '5h', 100, 2.5 * H);
+  assert.deepEqual(windowProjection(unused, NOW), { kind: 'remaining_at_reset', percent: 100 });
+
+  // Zero remaining or closed -> runs_out 0ms
+  assert.deepEqual(windowProjection(w('default', '5h', 0, 2 * H), NOW), { kind: 'runs_out', afterMs: 0 });
+  assert.deepEqual(windowProjection(w('default', '5h', 0, 2 * H, { closed: true }), NOW), { kind: 'runs_out', afterMs: 0 });
+
+  // Stale or unknown window length -> null
+  assert.equal(windowPace(w('default', '5h', 80, 2 * H, { stale: true }), NOW), null);
+  assert.equal(windowProjection(w('default', '5h', 80, 2 * H, { stale: true }), NOW), null);
+  assert.equal(windowPace(w('prepaid', 'grant', 80, 2 * H), NOW), null);
+  assert.equal(windowPace(w('default', '5h', 80, null), NOW), null);
+  assert.equal(bindingWindow([w('p', '300m', 90, 1 * H), w('p', '10080m', 25, 100 * H)])?.window, '10080m');
 });

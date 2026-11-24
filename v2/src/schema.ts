@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { backfillMemoryIndex } from './recall.ts';
 
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 25;
 
 /** Small normalized rows; list fields are JSON arrays of short strings. Each step upgrades one version. */
 export function migrate(db: DatabaseSync): void {
@@ -432,9 +432,63 @@ export function migrate(db: DatabaseSync): void {
   if (version < 23) {
     db.exec('BEGIN IMMEDIATE');
     try {
+      addColumn(db, 'platform_state', 'usage_account_scope', 'TEXT');
+      addColumn(db, 'platform_state', 'usage_last_error', 'TEXT');
+      addColumn(db, 'platform_state', 'usage_meta', 'TEXT');
+      db.exec(`CREATE TABLE IF NOT EXISTS usage_history (
+        route TEXT NOT NULL,
+        pool TEXT NOT NULL,
+        window TEXT NOT NULL,
+        cycle_resets_at TEXT NOT NULL,
+        bucket_index INTEGER NOT NULL,
+        observed_at TEXT NOT NULL,
+        remaining_percent REAL NOT NULL,
+        PRIMARY KEY(route, pool, window, cycle_resets_at, bucket_index)
+      );
+      CREATE INDEX IF NOT EXISTS usage_history_route_cycle ON usage_history(route, cycle_resets_at);
+      PRAGMA user_version = 23;`);
+      db.exec('COMMIT');
+    } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
+  }
+  if (version < 24) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      addColumn(db, 'platform_state', 'usage_account_scope', 'TEXT');
+      addColumn(db, 'platform_state', 'usage_last_error', 'TEXT');
+      addColumn(db, 'platform_state', 'usage_meta', 'TEXT');
+      db.exec(`CREATE TABLE IF NOT EXISTS usage_history (
+        route TEXT NOT NULL,
+        pool TEXT NOT NULL,
+        window TEXT NOT NULL,
+        cycle_resets_at TEXT NOT NULL,
+        bucket_index INTEGER NOT NULL,
+        observed_at TEXT NOT NULL,
+        remaining_percent REAL NOT NULL,
+        PRIMARY KEY(route, pool, window, cycle_resets_at, bucket_index)
+      );
+      CREATE INDEX IF NOT EXISTS usage_history_route_cycle ON usage_history(route, cycle_resets_at);
+      CREATE TABLE IF NOT EXISTS memory_vectors(
+        project_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        dims INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, kind, entity_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_vectors_lookup ON memory_vectors(project_id, provider_id, dims);
+      PRAGMA user_version = 24;`);
+      db.exec('COMMIT');
+    } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
+  }
+  if (version < 25) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
       addColumn(db, 'projects', 'approved_root', 'TEXT');
       addColumn(db, 'projects', 'approved_git_dir', 'TEXT');
-      db.exec('PRAGMA user_version = 23; COMMIT');
+      db.exec('PRAGMA user_version = 25; COMMIT');
     } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
   }
 }

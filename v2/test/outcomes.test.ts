@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { acceptanceHistory, appendOutcome, recordConsultOutcome } from '../src/outcomes.ts';
 import { outcomeStats } from '../src/ops.ts';
 import { parsePacket } from '../src/air/parser.ts';

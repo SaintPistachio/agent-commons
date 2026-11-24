@@ -17,9 +17,15 @@ import { errLine } from './air/format.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { applyPatchBlocks, buildRepairContext, parsePatchBlocks } from './patch.ts';
-import { roomReport, startViewer, VIEWER_PORT } from './viewer.ts';
+import { roomReport, startViewer, statusReport, VIEWER_PORT } from './viewer.ts';
+import { formatCompactDuration, formatPaceSummary } from './allowance.ts';
+import { codexExpiringResets } from './adapters/codex-limits.ts';
 import { applyInstall, describeAction, hubStatus, loadManifest, planInstall, toolsAirLines } from './tool-hub.ts';
 import { assertNotSyncedPath, createBackupBundle, verifyBackupBundle, restoreBackupBundle, type BundleCredential } from './backup-bundle.ts';
+import { embeddingsStatus, loadEmbeddingsConfig, syncMemoryVectors } from './embeddings.ts';
+import { graphStatus, queryGraph, refreshGraph, resolveGraphDir } from './graph.ts';
+import { auditHosts, formatHostAudit, type AuditApp } from './host-audit.ts';
+import { assertRegularTokenFile, connectionPath, ensureTokenHome, writePrivateJson } from './token-home.ts';
 
 /**
  * node v2/src/cli.ts <command> [--home DIR] [--port N]
@@ -54,12 +60,17 @@ import { assertNotSyncedPath, createBackupBundle, verifyBackupBundle, restoreBac
  *   tools                    the shared tool manifest (<home>\tools.json) and each app's state (read-only)
  *   tools-install --app codex|claude|antigravity [--only a,b] [--apply]   set the manifest's skills and MCP servers up for
  *                            one app; a dry run unless --apply (backups in backups\tools-install-<time>)
+ *   embed-status             report opt-in loopback embeddings config and indexed vector count (read-only)
+ *   embed-sync [--project P] index/prune project memory vectors via loopback embeddings (<home>\embeddings.json)
+ *   graph-status [--project P]   check Graphify index availability and build receipt (read-only)
+ *   graph-query --project P (--query TEXT | TEXT)   query staleness-verified Graphify code relationships (read-only)
+ *   graph-refresh --project P [--force]   run local Graphify update (GRAPHIFY_BACKEND=none) for the project
+ *   audit-hosts [--app codex|claude|antigravity] [--json]   read-only host MCP, connection, tool-hub, and secret-marker audit
  *   room-report G [--out FILE]   write a self-contained, read-only HTML snapshot of a room (default <home>\reports\G.html)
- *   view [--port 4728]       serve read-only room pages on 127.0.0.1 (prints a link with a per-start key; Ctrl+C stops)
+ *   status-report [--out FILE]   write a self-contained, read-only HTML snapshot of status and quota (default <home>\reports\status.html)
+ *   view [--port 4728]       serve read-only room and status pages on 127.0.0.1 (prints a link with a per-start key; Ctrl+C stops)
  *   air-sync, air-tx, air-get, air-result, air-wait, air-wait-until, route-hints   AIR-T clients over the loopback API (--connection FILE; see below)
  */
-import { assertRegularTokenFile, connectionPath, ensureTokenHome, writePrivateJson } from './token-home.ts';
-
 const args = process.argv.slice(2), command = args[0];
 const option = (name: string, fallback?: string) => { const i = args.indexOf('--' + name); return i >= 0 && args[i + 1] !== undefined && !args[i + 1].startsWith('--') ? args[i + 1] : fallback; };
 const flag = (name: string) => args.includes('--' + name);
@@ -68,7 +79,7 @@ const VALUED = new Set(['--home', '--port', '--keep', '--older-than-days', '--ke
   '--connection', '--root', '--packet-file', '--packet', '--op', '--handles', '--grep', '--max-chars', '--out', '--out-dir', '--wait', '--exclude-family', '--mode', '--advance', '--objective',
   '--max-minutes', '--route', '--max', '--global', '--cwd', '--verify', '--app', '--only',
   '--prompt', '--intent', '--eff', '--cost', '--ctx', '--tools', '--max-usd', '--max-tok', '--model', '--reason', '--actor',
-  '--source', '--helper-root', '--url', '--staging-parent', '--recovery-key']);
+  '--source', '--helper-root', '--url', '--staging-parent', '--recovery-key', '--query']);
 /** The first argument after the command that is neither an option nor an option's value. */
 const positional = () => args.slice(1).find((a, i, all) => !a.startsWith('--') && !VALUED.has(all[i - 1]));
 
@@ -810,6 +821,26 @@ switch (command) {
       if (s.adapter_id === 'openai-api') for (const line of publicInventorySummary(home)) console.log('    ' + line);
       for (const line of cliFreshnessLines(s, platform?.upstreamTrack)) console.log(`    ${line}`);
       if (s.usage_blocked_identity === usageIdentity(s)) console.log('    quota polling suspended: local command reported model work');
+      if (s.usage_last_error) {
+        try {
+          const err = JSON.parse(s.usage_last_error);
+          if (err?.kind) console.log(`    last usage read failed: ${err.kind}${err.method ? ` (${err.method})` : ''}${err.at ? ` at ${err.at}` : ''}`);
+        } catch { /* ignore malformed diagnostic */ }
+      }
+      if (s.usage_meta) {
+        try {
+          const meta = JSON.parse(s.usage_meta);
+          if (meta?.resetCredits) {
+            const report = codexExpiringResets(meta.resetCredits);
+            if (report.remainingCount > 0) {
+              const soon = report.expiring.length
+                ? `; ${report.expiring[0].count} expiring in ${formatCompactDuration(report.expiring[0].remainingMs)} (${report.expiring[0].expiresAt})`
+                : report.nextExpiry ? `; next expires ${report.nextExpiry}` : '';
+              console.log(`    banked resets: ${report.remainingCount} available${soon}`);
+            }
+          }
+        } catch { /* ignore malformed metadata */ }
+      }
       if (platform?.update) console.log(`    ${cliUpdateStatusLine(s, platform.upstreamTrack)}`);
       if (platform?.sdk) console.log(`    ${sdkStatusLine(s)}`);
       if (platform?.modelSourceStatus) {
@@ -821,10 +852,14 @@ switch (command) {
     const windows = store.usageWindows();
     if (windows.length) {
       console.log('usage windows:');
-      for (const w of windows) console.log(`  ${w.route} / ${w.pool} / ${w.window}: ${w.stale || w.remaining_percent === null ? 'unknown' : w.remaining_percent + '%'}` +
-        `${w.resets_at ? `, ${w.route === 'openai-api' ? 'expires' : 'scheduled reset'} ${w.resets_at}` : ''}`
-        + `${w.early_reset_observed_at ? `, early replenishment seen ${w.early_reset_observed_at} (previous schedule ${w.early_reset_scheduled_at})` : ''}`
-        + `${w.closed ? ', closed' : ''} (${w.source}, seen ${w.observed_at})`);
+      for (const w of windows) {
+        const pace = formatPaceSummary(w);
+        console.log(`  ${w.route} / ${w.pool} / ${w.window}: ${w.stale || w.remaining_percent === null ? 'unknown' : w.remaining_percent + '%'}` +
+          `${w.resets_at ? `, ${w.route === 'openai-api' ? 'expires' : 'scheduled reset'} ${w.resets_at}` : ''}`
+          + `${pace ? `, ${pace}` : ''}`
+          + `${w.early_reset_observed_at ? `, early replenishment seen ${w.early_reset_observed_at} (previous schedule ${w.early_reset_scheduled_at})` : ''}`
+          + `${w.closed ? ', closed' : ''} (${w.source}, seen ${w.observed_at})`);
+      }
     }
     for (const route of allAdapters().filter(a => a.poolEvidenceStatus)) {
       const lines = route.poolEvidenceStatus!(store.poolEvidence(route.capabilities.id), store.consumptionRuns(route.capabilities.id));
@@ -935,11 +970,78 @@ switch (command) {
     console.log(`${app}: done. Restart the app (or start a new session) so it loads the new tools.`);
     break;
   }
+  case 'embed-status': await withStore(store => {
+    print(embeddingsStatus(store.db, home));
+  }); break;
+  case 'embed-sync': await withStore(async store => {
+    let cfg;
+    try { cfg = loadEmbeddingsConfig(home); } catch (error) {
+      console.error((error as Error).message);
+      process.exit(2);
+    }
+    if (!cfg) {
+      console.error(`embeddings are disabled (create ${path.join(home, 'embeddings.json')} with {"enabled":true,"model":"..."} to enable)`);
+      process.exit(2);
+    }
+    const projectRef = option('project');
+    const projectId = projectRef ? store.resolveProject(projectRef).id : undefined;
+    print(await syncMemoryVectors(store.db, cfg, { projectId }));
+  }); break;
+  case 'graph-status': await withStore(store => {
+    const projectRef = option('project');
+    if (projectRef) {
+      const p = store.resolveProject(projectRef);
+      if (!p.root) { console.error(`project ${projectRef} has no root`); process.exit(2); }
+      print({ project: store.handleOf('p', p.id) ?? p.id, name: p.name, root: p.root, ...graphStatus(p.root, resolveGraphDir(home, p.root)) });
+      return;
+    }
+    const rows = (store.db.prepare('SELECT id, name, root FROM projects WHERE archived = 0 AND root IS NOT NULL ORDER BY updated_at DESC, id').all() as Array<{ id: string; name: string; root: string }>)
+      .map(p => ({ project: store.handleOf('p', p.id) ?? p.id, name: p.name, root: p.root, ...graphStatus(p.root, resolveGraphDir(home, p.root)) }));
+    print(rows);
+  }); break;
+  case 'graph-query': await withStore(store => {
+    const projectRef = need(option('project'), '--project P');
+    const p = store.resolveProject(projectRef);
+    if (!p.root) { console.error(`project ${projectRef} has no root`); process.exit(2); }
+    const qText = need(option('query') ?? positional(), '--query TEXT');
+    print(queryGraph(p.root, resolveGraphDir(home, p.root), qText, [home]));
+  }); break;
+  case 'graph-refresh': await withStore(store => {
+    const projectRef = need(option('project'), '--project P');
+    const p = store.resolveProject(projectRef);
+    if (!p.root) { console.error(`project ${projectRef} has no root`); process.exit(2); }
+    print(refreshGraph(p.root, resolveGraphDir(home, p.root), { force: flag('force') }));
+  }); break;
+  case 'audit-hosts': {
+    const appOpt = option('app');
+    let apps: AuditApp[] | undefined;
+    if (appOpt) {
+      const valid: AuditApp[] = ['codex', 'claude', 'antigravity'];
+      const parts = appOpt.split(',').map(s => s.trim()).filter(Boolean);
+      if (!parts.length || parts.some(p => !valid.includes(p as AuditApp))) {
+        console.error('--app must list codex, claude, or antigravity');
+        process.exit(2);
+      }
+      apps = parts as AuditApp[];
+    }
+    const report = auditHosts({ home, userHome: os.homedir(), apps });
+    if (flag('json')) print(report);
+    else console.log(formatHostAudit(report));
+    if (!report.clean) process.exit(2);
+    break;
+  }
   case 'room-report': {
     const ref = need(positional(), 'a room (g7 or its ID)');
     const out = path.resolve(option('out', path.join(home, 'reports', ref + '.html'))!);
     fs.mkdirSync(path.dirname(out), { recursive: true });
     fs.writeFileSync(out, roomReport(home, ref), 'utf8');
+    console.log(out);
+    break;
+  }
+  case 'status-report': {
+    const out = path.resolve(option('out', path.join(home, 'reports', 'status.html'))!);
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, statusReport(home), 'utf8');
     console.log(out);
     break;
   }
@@ -958,6 +1060,6 @@ switch (command) {
     break;
   }
   default:
-    console.error('usage: cli.ts init|add-client|rotate-client|import-v1|serve|stop|status|stats|backup|restore|helper-root|bundle-create|bundle-verify|bundle-restore|probe|tools|tools-install|job-diff|job-drop|job-settle|prune|rotate-log|project-create|archive-project|set-actor|air-decode|room-report|view [--home DIR] [--port N]');
+    console.error('usage: cli.ts init|add-client|rotate-client|import-v1|serve|stop|status|stats|backup|restore|helper-root|bundle-create|bundle-verify|bundle-restore|probe|tools|tools-install|embed-status|embed-sync|graph-status|graph-query|graph-refresh|audit-hosts|job-diff|job-drop|job-settle|prune|rotate-log|project-create|archive-project|set-actor|air-decode|room-report|view [--home DIR] [--port N]');
     process.exit(2);
 }

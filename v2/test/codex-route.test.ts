@@ -41,7 +41,7 @@ function fixture(t: any) {
 
 test('a codex advice job runs read-only, ephemeral, without user config or API keys', async t => {
   const f = fixture(t);
-  const before = process.env.OPENAI_API_KEY; process.env.OPENAI_API_KEY = 'synthetic';
+  const before = process.env.OPENAI_API_KEY; process.env.OPENAI_API_KEY = 'sk-should-not-leak';
   t.after(() => { if (before === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = before; });
   const job = f.submit('ARGS please', { model: 'gpt-6.1-sol', effort: 'high' });
   f.runner().start();

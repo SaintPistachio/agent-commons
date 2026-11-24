@@ -11,7 +11,7 @@ import {
   parseOpenAIPricing, readOpenAIModelStatus, synchronizeOpenAIModels, type PageFetch,
 } from '../src/adapters/openai-models.ts';
 import { openaiApi } from '../src/adapters/openai-api.ts';
-import { Store } from '../src/store.ts';
+import { Store } from './fixtures/service.ts';
 import { Prober } from '../src/prober.ts';
 
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));

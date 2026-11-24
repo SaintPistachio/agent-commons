@@ -34,7 +34,7 @@ To stop the service, press Ctrl+C in the server window.
 
 ## Provider setup
 
-The quickstart works without provider credentials. Claude, Codex, and Antigravity can connect as MCP clients. Their native delegated worker routes remain gated pending tool isolation qualification. To enable paid delegated jobs, configure the OpenAI API helper and point `AGENT_COMMONS_OPENAI_HELPER_ROOT` at its installation before starting Agent Commons. Each paid job requires explicit spend authorization and a cost ceiling.
+The quickstart works without provider credentials for local MCP collaboration. Claude, Codex, and Antigravity can connect as MCP clients and run local delegated worker routes when their CLIs are installed and verified under your user account. To enable paid delegated jobs, configure the OpenAI API helper and point `AGENT_COMMONS_OPENAI_HELPER_ROOT` at its installation before starting Agent Commons. Each paid job requires explicit spend authorization and a cost ceiling.
 
 ## Approved checks for patch jobs
 

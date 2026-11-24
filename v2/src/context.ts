@@ -21,6 +21,8 @@ export interface ContextSources {
   job?(ref: string): string | undefined;
   /** Bounded, project-scoped memory matching a query. */
   recall?(query: string): string | undefined;
+  /** Bounded, staleness-verified Graphify relationships for a symbol or topic. */
+  graph?(query: string): string | undefined;
 }
 
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
@@ -220,14 +222,18 @@ function diff(ref: string, range: string, root: string, deny: string[]): string 
 export function buildContext(refs: string[], sources: ContextSources): string {
   const deny = sources.deny ?? [];
   return refs.map(ref => {
-    const m = /^(file|grep|job|art|task|diff|recall):(.+)$/.exec(ref);
-    if (!m) return fail('CTX_BAD_REF', 400, `${ref}: use file:, grep:, job:, art:, task:, diff: or recall:`);
+    const m = /^(file|grep|job|art|task|diff|recall|graph):(.+)$/.exec(ref);
+    if (!m) return fail('CTX_BAD_REF', 400, `${ref}: use file:, grep:, job:, art:, task:, diff:, recall: or graph:`);
     const [, kind, value] = m;
     let resolved: string;
     if (kind === 'recall') {
       const query = value.trim();
       if (!query) return fail('CTX_BAD_REF', 400, 'recall context requires a query');
       resolved = block(ref, sources.recall?.(query) ?? fail('CTX_NOT_ALLOWED', 400, 'recall context is unavailable'));
+    } else if (kind === 'graph') {
+      const query = value.trim();
+      if (!query || query.length > 240) return fail('CTX_BAD_REF', 400, 'graph context requires a 1-240 character query');
+      resolved = block(ref, sources.graph?.(query) ?? fail('CTX_NOT_ALLOWED', 400, 'graph context is unavailable'));
     } else if (kind === 'file') resolved = file(ref, value, sources.root, deny);
     else if (kind === 'grep') resolved = grep(ref, value, sources.root, deny);
     else if (kind === 'diff') resolved = diff(ref, value, sources.root, deny);

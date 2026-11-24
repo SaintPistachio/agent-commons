@@ -220,8 +220,7 @@ test('3 Google keys are stripped; ctx= refuses secret-looking content and the se
   t.after(() => { for (const [k, v] of [['GEMINI_API_KEY', saved.g], ['GOOGLE_API_KEY', saved.k]] as const) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
   for (const env of [workerEnv('j'), helperEnv()]) { assert.equal(env.GEMINI_API_KEY, undefined); assert.equal(env.GOOGLE_API_KEY, undefined); }
   const secrets = { 'openai.txt': 'key = sk-' + 'a'.repeat(40), 'google.txt': 'AIza' + 'b'.repeat(35), 'github.txt': 'ghp_' + 'c'.repeat(36),
-    'pk.txt': ['-----BEGIN', 'RSA', 'PRIVATE KEY-----'].join(' ') + '\nabc\n-----END RSA PRIVATE KEY-----',
-    'aws.txt': 'AKIA' + 'D'.repeat(16) };
+    'pk.txt': '-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----', 'aws.txt': 'AKIA' + 'D'.repeat(16) };
   for (const [name, content] of Object.entries(secrets)) {
     fs.writeFileSync(path.join(f.repo, name), content);
     assert.equal(code(() => f.submit({ context_refs: [`file:${name}`] })), 'CTX_SECRET', name);

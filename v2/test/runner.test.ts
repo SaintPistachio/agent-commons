@@ -53,7 +53,7 @@ test('an advice job runs read-only in the project root and records the result', 
 
 test('the CLI gets the prompt over stdin, read-only tools and no API credentials', async t => {
   const f = fixture(t);
-  const before = process.env.ANTHROPIC_API_KEY; process.env.ANTHROPIC_API_KEY = 'synthetic';
+  const before = process.env.ANTHROPIC_API_KEY; process.env.ANTHROPIC_API_KEY = 'sk-should-not-leak';
   t.after(() => { if (before === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = before; });
   const job = f.submit('ENV check', { model: 'opus' });
   f.runner().start();

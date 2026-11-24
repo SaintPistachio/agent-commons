@@ -1,12 +1,17 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { helperEnv, killTree } from './shared.ts';
 import { UsageContractViolation, type RouteCommand, type UsageObservation, type UsageSnapshot } from './types.ts';
 
 const ENVIRONMENT = /^(PATH|SYSTEMROOT|WINDIR|TEMP|TMP|LOCALAPPDATA|APPDATA|USERPROFILE|HOMEDRIVE|HOMEPATH|HOME|PATHEXT|COMSPEC|PROGRAMFILES(X86)?|PROGRAMDATA|CLAUDE_CONFIG_DIR|CLAUDE_CODE_GIT_BASH_PATH|HTTPS?_PROXY|NO_PROXY)$/i;
 const MAX_BYTES = 512 * 1024;
 const TIMEOUT_MS = 20_000;
+const STATE_FILE_MAX_BYTES = 32 * 1024 * 1024;
+const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const CACHE_MAX_FUTURE_MS = 60_000;
 const MODEL_SCOPES = new Map([
   ['fable', 'Fable'], ['haiku', 'Haiku'], ['opus', 'Opus'], ['sonnet', 'Sonnet'],
   ['claude fable', 'Fable'], ['claude haiku', 'Haiku'], ['claude opus', 'Opus'], ['claude sonnet', 'Sonnet'],
@@ -21,6 +26,36 @@ function nonzeroUsage(value: unknown): boolean {
   const usage = record(value);
   return ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']
     .some(key => typeof usage?.[key] === 'number' && usage[key] !== 0);
+}
+
+function parseClaudeLimits(limits: unknown): Pick<UsageSnapshot, 'rows' | 'partial'> | undefined {
+  if (!Array.isArray(limits) || !limits.length) return undefined;
+  const rows = new Map<string, UsageObservation>();
+  let partial = false;
+  for (const value of limits) {
+    const meter = record(value);
+    if (!meter || typeof meter.percent !== 'number' || !Number.isFinite(meter.percent)
+      || meter.percent < 0 || meter.percent > 100 || (meter.resets_at !== null
+        && (typeof meter.resets_at !== 'string' || !Number.isFinite(Date.parse(meter.resets_at))))) return;
+    const scope = record(meter.scope);
+    const modelLabel = record(scope?.model)?.display_name;
+    const surfaceLabel = record(scope?.surface)?.display_name;
+    const model = typeof modelLabel === 'string' ? MODEL_SCOPES.get(modelLabel.trim().toLowerCase()) : undefined;
+    const surface = typeof surfaceLabel === 'string' ? SURFACE_SCOPES.get(surfaceLabel.trim().toLowerCase()) : undefined;
+    const labels = [model, surface].filter(Boolean);
+    if (meter.kind === 'weekly_scoped' && (!labels.length
+      || (scope?.model !== undefined && !model) || (scope?.surface !== undefined && !surface))) {
+      partial = true;
+      continue;
+    }
+    const pool = meter.kind === 'weekly_scoped' ? `claude / ${labels.join(' / ')}` : 'default';
+    const window = meter.kind === 'session' ? '5h' : meter.kind === 'weekly_all' || pool !== 'default' ? 'weekly' : undefined;
+    if (!window) { partial = true; continue; }
+    const key = JSON.stringify([pool, window]);
+    if (rows.has(key)) return;
+    rows.set(key, { pool, window, remaining_percent: 100 - meter.percent, resets_at: meter.resets_at as string | null });
+  }
+  return rows.size ? { rows: [...rows.values()], partial } : undefined;
 }
 
 export function parseClaudeUsage(output: string, session: string): Pick<UsageSnapshot, 'rows' | 'partial'> | undefined {
@@ -59,34 +94,83 @@ export function parseClaudeUsage(output: string, session: string): Pick<UsageSna
       finished = true;
     } else return;
   }
-  const limits = record(report?.rate_limits)?.limits;
-  if (!finished || !Array.isArray(limits) || !limits.length) return;
-  const rows = new Map<string, UsageObservation>();
-  let partial = false;
-  for (const value of limits) {
-    const meter = record(value);
-    if (!meter || typeof meter.percent !== 'number' || !Number.isFinite(meter.percent)
-      || meter.percent < 0 || meter.percent > 100 || (meter.resets_at !== null
-        && (typeof meter.resets_at !== 'string' || !Number.isFinite(Date.parse(meter.resets_at))))) return;
-    const scope = record(meter.scope);
-    const modelLabel = record(scope?.model)?.display_name;
-    const surfaceLabel = record(scope?.surface)?.display_name;
-    const model = typeof modelLabel === 'string' ? MODEL_SCOPES.get(modelLabel.trim().toLowerCase()) : undefined;
-    const surface = typeof surfaceLabel === 'string' ? SURFACE_SCOPES.get(surfaceLabel.trim().toLowerCase()) : undefined;
-    const labels = [model, surface].filter(Boolean);
-    if (meter.kind === 'weekly_scoped' && (!labels.length
-      || (scope?.model !== undefined && !model) || (scope?.surface !== undefined && !surface))) {
-      partial = true;
-      continue;
-    }
-    const pool = meter.kind === 'weekly_scoped' ? `claude / ${labels.join(' / ')}` : 'default';
-    const window = meter.kind === 'session' ? '5h' : meter.kind === 'weekly_all' || pool !== 'default' ? 'weekly' : undefined;
-    if (!window) { partial = true; continue; }
-    const key = JSON.stringify([pool, window]);
-    if (rows.has(key)) return;
-    rows.set(key, { pool, window, remaining_percent: 100 - meter.percent, resets_at: meter.resets_at as string | null });
+  if (!finished) return;
+  return parseClaudeLimits(record(report?.rate_limits)?.limits);
+}
+
+function parseSummaryWindow(entry: unknown, window: '5h' | 'weekly'): UsageObservation | undefined {
+  const row = record(entry);
+  if (!row || typeof row.utilization !== 'number' || !Number.isFinite(row.utilization)
+    || row.utilization < 0 || row.utilization > 100) return undefined;
+  if (row.resets_at !== null && (typeof row.resets_at !== 'string' || !Number.isFinite(Date.parse(row.resets_at)))) {
+    return undefined;
   }
-  return rows.size ? { rows: [...rows.values()], partial } : undefined;
+  return {
+    pool: 'default',
+    window,
+    remaining_percent: 100 - row.utilization,
+    resets_at: row.resets_at as string | null,
+  };
+}
+
+/**
+ * Parses only account-matching `cachedUsageUtilization` from Claude Code's local state file;
+ * ignores and discards all emails, tokens, and unrelated profile fields.
+ */
+export function parseClaudeCachedUsage(rawJson: string, nowMs = Date.now()): UsageSnapshot | undefined {
+  let root: Record<string, unknown> | undefined;
+  try { root = record(JSON.parse(rawJson)); } catch { return undefined; }
+  if (!root) return undefined;
+  const oauthAccount = record(root.oauthAccount);
+  const cached = record(root.cachedUsageUtilization);
+  const accountId = oauthAccount?.accountUuid;
+  const cachedAccountId = cached?.accountUuid;
+  if (typeof accountId !== 'string' || !accountId.trim() || accountId !== cachedAccountId) return undefined;
+  const fetchedAtMs = cached?.fetchedAtMs;
+  if (typeof fetchedAtMs !== 'number' || !Number.isSafeInteger(fetchedAtMs) || fetchedAtMs <= 0) return undefined;
+  if (fetchedAtMs > nowMs + CACHE_MAX_FUTURE_MS || nowMs - fetchedAtMs > CACHE_MAX_AGE_MS) return undefined;
+  const utilization = record(cached?.utilization);
+  if (!utilization) return undefined;
+
+  let parsed: Pick<UsageSnapshot, 'rows' | 'partial'> | undefined;
+  if (Array.isArray(utilization.limits) && utilization.limits.length > 0) {
+    parsed = parseClaudeLimits(utilization.limits);
+  } else {
+    const fallbackRows: UsageObservation[] = [];
+    const fiveHour = parseSummaryWindow(utilization.five_hour, '5h');
+    if (fiveHour) fallbackRows.push(fiveHour);
+    const sevenDay = parseSummaryWindow(utilization.seven_day, 'weekly');
+    if (sevenDay) fallbackRows.push(sevenDay);
+    if (fallbackRows.length) parsed = { rows: fallbackRows, partial: false };
+  }
+  if (!parsed || !parsed.rows.length) return undefined;
+  const observedAt = new Date(fetchedAtMs).toISOString();
+  return {
+    ...parsed,
+    rows: parsed.rows.map(row => ({ ...row, observed_at: observedAt })),
+    source: 'claude-cache',
+  };
+}
+
+export function resolveClaudeStatePath(override?: string | null): string | undefined {
+  if (override === null) return undefined;
+  if (typeof override === 'string' && override.trim()) return override;
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  if (configDir && path.isAbsolute(configDir)) return path.join(configDir, '.claude.json');
+  return path.join(os.homedir(), '.claude.json');
+}
+
+export function readClaudeCachedUsage(statePath?: string | null, nowMs = Date.now()): UsageSnapshot | undefined {
+  const resolved = resolveClaudeStatePath(statePath);
+  if (!resolved) return undefined;
+  try {
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile() || stat.size > STATE_FILE_MAX_BYTES) return undefined;
+    const raw = fs.readFileSync(resolved, 'utf8');
+    return parseClaudeCachedUsage(raw, nowMs);
+  } catch {
+    return undefined;
+  }
 }
 
 /** The fixed native command runs outside the model loop. An invalid model and zero turns guard the fallback path. */

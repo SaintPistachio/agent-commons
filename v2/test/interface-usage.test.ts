@@ -163,7 +163,6 @@ test('both wait commands can omit display options or send only the flags supplie
 function routing(t: TestContext, ids: string[]) {
   const { store, db } = fixture(t);
   Object.assign(store, {
-    workerPolicy: () => null,
     routeStatus: () => ids.map(id => ({
       id, short: id === 'openai-api' ? 'api' : id,
       state: 'verified', billing: id === 'openai-api' ? 'paid' : 'sub', family: id,
