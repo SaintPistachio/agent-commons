@@ -4,7 +4,15 @@ Follow the [Windows quickstart](../README.md) to initialize a home and connect a
 
 ## Security defaults and upgrades
 
-Claude, Codex, and Antigravity native CLI routes run under the local user account with stripped provider API keys, isolated per-job Git worktrees (hooks, external smudge/clean filters, and submodules disabled), and operator-approved project roots. An OpenAI API job requires explicit spend authorization and approval from the central helper, with edit mode using approved checks run in an isolated Linux Docker container.
+Local delegated worker routes (`claude`, `codex`, and `antigravity`), host-side native edits, and MCP job toolsets other than the built-in `project` set default to fail-closed (`release` safe mode) until explicitly enabled by the local operator via `<home>/worker-policy.json`. `<home>/worker-policy.json` has no HTTP or MCP write endpoint and is ACL-protected at the local OS user-account boundary by `Protect-AcTokenHome.ps1` (processes running under the same OS user account retain filesystem access under that account's ACL). When enabled, native CLI routes run under the local user account with stripped provider API keys, isolated per-job Git worktrees (hooks, external smudge/clean filters, and submodules disabled), operator-approved project roots, and `--tools Read,Grep,Glob` plus `--disallowedTools Bash Edit MultiEdit Write NotebookEdit` on Claude `advice` turns. An OpenAI API job requires explicit spend authorization and approval from the central helper, with edit mode using approved checks run in an isolated Linux Docker container.
+
+The service loads `<home>/worker-policy.json` once at startup, so enabling, narrowing, or resetting (`--reset`) the policy takes effect after restarting the Agent Commons service (`cli.ts status` reads the policy on disk). Use the local operator CLI to manage this file:
+
+```powershell
+node v2/src/cli.ts worker-policy --home $acHome --allow-local-cli
+node v2/src/cli.ts worker-policy --home $acHome --allow-local-cli --routes claude,codex --no-native-edit --no-toolsets
+node v2/src/cli.ts worker-policy --home $acHome --reset
+```
 
 The operator registers new projects (`cli.ts project-create`). Existing projects keep their records and history. Before a migrated project can provide files or run jobs, use the local operator CLI to approve its physical directory:
 

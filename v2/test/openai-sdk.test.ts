@@ -69,6 +69,7 @@ function sdkStore(t: TestContext) {
   migrate(db);
   const store: Store = Object.assign(Object.create(Store.prototype), {
     db, jobEvents: new EventEmitter(),
+    workerPolicy: () => null,
     transaction<T>(action: () => T): T {
       db.exec('BEGIN IMMEDIATE');
       try { const result = action(); db.exec('COMMIT'); return result; }

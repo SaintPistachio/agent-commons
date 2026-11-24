@@ -173,6 +173,7 @@
     "v2/src/tools.ts",
     "v2/src/validate.ts",
     "v2/src/viewer.ts",
+    "v2/src/worker-policy.ts",
     "v2/test/adapters-2b.test.ts",
     "v2/test/adapters.test.ts",
     "v2/test/ag-pools.test.ts",

@@ -26,6 +26,7 @@ import { embeddingsStatus, loadEmbeddingsConfig, syncMemoryVectors } from './emb
 import { graphStatus, queryGraph, refreshGraph, resolveGraphDir } from './graph.ts';
 import { auditHosts, formatHostAudit, type AuditApp } from './host-audit.ts';
 import { assertRegularTokenFile, connectionPath, ensureTokenHome, writePrivateJson } from './token-home.ts';
+import { loadWorkerPolicy, NATIVE_WORKER_ROUTES, releaseWorkerPolicy, resetLocalWorkerPolicy, saveLocalWorkerPolicy, type WorkerPolicy } from './worker-policy.ts';
 
 /**
  * node v2/src/cli.ts <command> [--home DIR] [--port N]
@@ -51,6 +52,8 @@ import { assertRegularTokenFile, connectionPath, ensureTokenHome, writePrivateJs
  *   prune [--older-than-days 14] [--keep-releases 5] [--dry-run] [--force]   remove old job folders, releases, worktrees
  *   rotate-log [--max-mb 10] move logs\service.log to service.log.1 when it is too big (service stopped)
  *   project-create --name N [--root DIR] [--objective TEXT]   create a project (apps on the AIR profile cannot)
+ *   project-approve-root --project ID --root DIR   approve a migrated project root (local operator only)
+ *   worker-policy [--allow-local-cli [--routes claude,codex,antigravity] [--no-native-edit] [--no-toolsets] | --reset]   inspect or update local CLI worker policy
  *   archive-project P [--unarchive]   hide a project from discovery (or show it again)
  *   set-actor ACTOR [--family F] [--adapter A]   tag an app's actor with its model family and headless adapter
  *   air-decode --project P [--since N] [--limit N]   print the activity feed in plain English (read-only)
@@ -77,7 +80,7 @@ const flag = (name: string) => args.includes('--' + name);
 /** Options that take a value; anything else starting with -- is a flag. */
 const VALUED = new Set(['--home', '--port', '--keep', '--older-than-days', '--keep-releases', '--max-mb', '--family', '--adapter', '--name', '--profile', '--from', '--project', '--since', '--limit',
   '--connection', '--root', '--packet-file', '--packet', '--op', '--handles', '--grep', '--max-chars', '--out', '--out-dir', '--wait', '--exclude-family', '--mode', '--advance', '--objective',
-  '--max-minutes', '--route', '--max', '--global', '--cwd', '--verify', '--app', '--only',
+  '--max-minutes', '--route', '--routes', '--max', '--global', '--cwd', '--verify', '--app', '--only',
   '--prompt', '--intent', '--eff', '--cost', '--ctx', '--tools', '--max-usd', '--max-tok', '--model', '--reason', '--actor',
   '--source', '--helper-root', '--url', '--staging-parent', '--recovery-key', '--query']);
 /** The first argument after the command that is neither an option nor an option's value. */
@@ -447,7 +450,7 @@ const home = path.resolve(chosenHome);
 const port = Number(option('port', String(DEFAULT_PORT)));
 const url = `http://127.0.0.1:${port}`;
 const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
-const withStore = async (work: (store: Store) => unknown) => { const store = new Store(home); try { await work(store); } finally { store.close(); } };
+const withStore = async (work: (store: Store) => unknown, policy?: WorkerPolicy) => { const store = new Store(home, policy); try { await work(store); } finally { store.close(); } };
 function inventoryFreshness(store: Store, route: string): string {
   const discovery = store.modelDiscoveryState(route);
   const latest = (store.db.prepare('SELECT max(last_seen_at) AS last_seen FROM route_models WHERE route=?')
@@ -810,6 +813,14 @@ switch (command) {
     let live = 'not running';
     try { const runtime = JSON.parse(fs.readFileSync(path.join(home, 'runtime.json'), 'utf8')); live = `running at ${runtime.url} (pid ${runtime.pid}, since ${runtime.started_at})`; } catch { /* stopped */ }
     console.log(`service: ${live}; schema ${counts.schema_version}; jobs running ${counts.running_jobs}, queued ${counts.queued_jobs}, needs review ${counts.needs_review_jobs}`);
+    try {
+      const loadedPolicy = loadWorkerPolicy(home);
+      console.log(loadedPolicy.source === 'local-file' && loadedPolicy.config
+        ? `worker policy (on disk, applies on service start): local opt-in (routes: ${loadedPolicy.config.allowRoutes.join(', ') || 'none'}; native edit: ${loadedPolicy.config.allowNativeEdit ? 'on' : 'off'}; toolsets: ${loadedPolicy.config.allowApprovedToolsets ? 'on' : 'off'})`
+        : 'worker policy (on disk, applies on service start): default (native routes gated; enable with cli.ts worker-policy --allow-local-cli)');
+    } catch (error) {
+      console.log(`worker policy (on disk): INVALID (${(error as Error).message})`);
+    }
     const perRoute = store.db.prepare("SELECT route, sum(status='running') running, sum(status='queued') queued FROM jobs GROUP BY route").all() as Array<Record<string, any>>;
     console.log('platforms:');
     for (const s of store.platformStates()) {
@@ -879,7 +890,7 @@ switch (command) {
     console.log(`apps last seen: ${seen.length ? seen.map(s => `${s.actor_id} ${ago(s.last_seen_at)}`).join(', ') : 'none yet'}`);
     const limits = store.effectiveLimits(allAdapters().map(a => a.capabilities.id));
     console.log(`running limits: ${limits.rows.map(r => `${r.route} ${r.effective}${r.override === null ? '' : '*'}`).join(', ')}; global ${limits.global}${limits.globalOverride === null ? '' : '*'} (* set by the operator; change with limits)`);
-  }); break;
+  }, releaseWorkerPolicy); break;
   case 'job-diff': await withStore(store => console.log(jobDiff(store, need(positional(), 'a job (j5 or its ID)')))); break;
   case 'job-settle': await withStore(store => {
     const operator = store.db.prepare("SELECT id FROM actors WHERE role='operator' LIMIT 1").get() as any;
@@ -942,6 +953,31 @@ switch (command) {
     if (!operator) throw new Error('project-approve-root needs an initialized home (run init first)');
     print(store.approveProjectRoot(operator, need(option('project'), '--project ID'), need(option('root'), '--root DIR')));
   }); break;
+  case 'worker-policy': {
+    if (flag('reset')) {
+      ensureTokenHome(home);
+      const removed = resetLocalWorkerPolicy(home);
+      print({ source: 'default', removed, file: path.join(home, 'worker-policy.json'), note: 'Restart the Agent Commons service if it is running so the fail-closed default takes effect.' });
+    } else if (flag('allow-local-cli')) {
+      ensureTokenHome(home, true);
+      const rawRoutes = option('routes');
+      const allowRoutes = rawRoutes !== undefined
+        ? rawRoutes.split(',').map(x => x.trim()).filter(Boolean)
+        : [...NATIVE_WORKER_ROUTES];
+      const config = {
+        schemaVersion: 1 as const,
+        allowRoutes,
+        allowNativeEdit: !flag('no-native-edit'),
+        allowApprovedToolsets: !flag('no-toolsets'),
+      };
+      const file = saveLocalWorkerPolicy(home, config);
+      print({ source: 'local-file', file, config, note: 'Restart the Agent Commons service if it is running so the updated policy takes effect.' });
+    } else {
+      const loaded = loadWorkerPolicy(home);
+      print({ source: loaded.source, file: loaded.file, config: loaded.config });
+    }
+    break;
+  }
   case 'archive-project': await withStore(store => print(store.setArchived(need(positional(), 'a project (p3 or its ID)'), !flag('unarchive')))); break;
   case 'set-actor': await withStore(store => {
     const actor = need(positional(), 'an actor ID');

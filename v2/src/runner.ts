@@ -177,6 +177,8 @@ export class Runner {
   }
 
   private launch(job: Json): void {
+    const refusal = this.store.queuedWorkerRefusal(job);
+    if (refusal) return this.store.failBeforeDispatch(job.id, refusal);
     try { this.store.approvedProjectRoot(job.project_id); }
     catch (error) {
       if (error instanceof CommonsError) return this.store.failBeforeDispatch(job.id, error.code);

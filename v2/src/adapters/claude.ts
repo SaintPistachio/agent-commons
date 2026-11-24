@@ -14,6 +14,7 @@ import { readClaudeCachedUsage, readClaudeUsage } from './claude-usage.ts';
 
 const ADVICE_TOOLS = ['Read', 'Grep', 'Glob'];
 const EDIT_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'MultiEdit', 'Write'];
+const ADVICE_DENIED_TOOLS = ['Bash', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit'];
 const PACKAGE = '@anthropic-ai/claude-code';
 
 /** Pick the highest installed Claude version that satisfies the headless CLI contract. */
@@ -57,7 +58,7 @@ function complete(job: Json, ctx: RunContext, cwd: string, code: number | null, 
 const QUOTA = /\b\d+-hour limit\b|usage limit|rate limit|limit reached|quota|too many requests|\b429\b/i;
 
 /** Flags launch() passes; the probe checks that `claude --help` still documents each one. */
-const FLAGS = ['-p, --print', '--output-format', '--permission-mode', '--allowedTools', '--model', '--effort', '--no-session-persistence', '--strict-mcp-config', '--setting-sources', '--settings', '--mcp-config', '--disallowedTools', '--add-dir'];
+const FLAGS = ['-p, --print', '--output-format', '--permission-mode', '--tools', '--allowedTools', '--model', '--effort', '--no-session-persistence', '--strict-mcp-config', '--setting-sources', '--settings', '--mcp-config', '--disallowedTools', '--add-dir'];
 
 const cli: CliRoute = {
   id: 'claude', helpArgs: ['--help'], flags: FLAGS,
@@ -76,13 +77,20 @@ const cli: CliRoute = {
 /** mcpConfig: the per-job file holding only an approved tool set's server (strict: nothing else is loaded). */
 export function claudeArgs(command: RouteCommand, job: Json, mcpConfig?: string): string[] {
   const toolset = job.options?.toolset;
+  const denied = [
+    ...(toolset && mcpConfig ? claudeToolsetDenied(toolset) : []),
+    ...(job.mode === 'advice' && !job.options?.patch_turn ? ADVICE_DENIED_TOOLS : []),
+  ];
   return [...(command.prefix ?? []), '-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config',
     '--setting-sources', 'user', '--settings', '{"disableAllHooks":true}',
     ...(toolset && mcpConfig ? ['--mcp-config', mcpConfig] : []),
     '--permission-mode', job.mode === 'edit' ? 'acceptEdits' : 'default',
-    ...(job.options?.patch_turn ? ['--tools', ''] : ['--allowedTools', ...(job.mode === 'edit' ? EDIT_TOOLS : ADVICE_TOOLS),
-      ...(toolset && mcpConfig ? claudeToolsetAllowed(toolset) : [])]),
-    ...(toolset && mcpConfig && claudeToolsetDenied(toolset).length ? ['--disallowedTools', ...claudeToolsetDenied(toolset)] : []),
+    ...(job.options?.patch_turn ? ['--tools', ''] : [
+      ...(job.mode === 'advice' ? ['--tools', ADVICE_TOOLS.join(',')] : []),
+      '--allowedTools', ...(job.mode === 'edit' ? EDIT_TOOLS : ADVICE_TOOLS),
+      ...(toolset && mcpConfig ? claudeToolsetAllowed(toolset) : []),
+    ]),
+    ...(denied.length ? ['--disallowedTools', ...denied] : []),
     ...(toolset && mcpConfig ? (toolset.write_roots ?? []).flatMap((root: string) => ['--add-dir', root]) : []),
     ...(job.model ? ['--model', job.model] : []), ...(job.effort ? ['--effort', job.effort] : [])];
 }

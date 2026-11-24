@@ -41,7 +41,7 @@ if ($Action -eq 'Create' -and -not (Test-Path -LiteralPath $root)) { Set-AcPriva
 if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "Data directory does not exist: $root" }
 
 $paths = @($root, $connections)
-$files = @(foreach ($name in 'runtime.json', 'commons.sqlite', 'commons.sqlite-wal', 'commons.sqlite-shm') {
+$files = @(foreach ($name in 'runtime.json', 'commons.sqlite', 'commons.sqlite-wal', 'commons.sqlite-shm', 'worker-policy.json') {
   $candidate = Join-Path $root $name
   if (Test-Path -LiteralPath $candidate) { Get-Item -LiteralPath $candidate -Force }
 })

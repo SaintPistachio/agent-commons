@@ -9,6 +9,7 @@ import { Prober } from './prober.ts';
 import { MemoryEmbedder, loadEmbeddingsConfig } from './embeddings.ts';
 import { parsePacket } from './air/parser.ts';
 import { ensureTokenHome, writePrivateJson } from './token-home.ts';
+import type { WorkerPolicy } from './worker-policy.ts';
 
 export const DEFAULT_PORT = 4727;
 
@@ -53,6 +54,8 @@ export interface ServerOptions {
   probe?: boolean;
   /** Called once the service has closed after POST /api/v1/shutdown (cli.ts serve exits the process). */
   onShutdown?: () => void;
+  /** In-process test seam for fake adapters. The CLI always uses the configured local or default policy. */
+  workerPolicy?: WorkerPolicy;
 }
 
 export function extractRecallQueries(method: string, input: Record<string, unknown>): string[] {
@@ -91,7 +94,7 @@ export function extractRecallQueries(method: string, input: Record<string, unkno
 export async function startServer(home: string, port = DEFAULT_PORT, runnerOptions: RunnerOptions | false = {}, serverOptions: ServerOptions = {}): Promise<Running> {
   ensureTokenHome(home);
   if (fs.existsSync(path.join(home, '.restore.lock'))) throw new Error('A backup restore is in progress for this home');
-  const store = new Store(home);
+  const store = new Store(home, serverOptions.workerPolicy);
   // Delegated jobs run inside the service, so they outlive the app that submitted them.
   const runner = runnerOptions === false ? null : new Runner(store, home, runnerOptions);
   const prober = runnerOptions !== false && serverOptions.probe ? new Prober(store, home, runnerOptions) : null;

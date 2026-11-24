@@ -21,6 +21,7 @@ import { INTENTS, EFFORTS, type AdapterCapabilities, type ProbeResult, type Usag
 import { git, RESULT_LIMIT } from './adapters/shared.ts';
 import { resolvePatchCheck } from './patch-check.ts';
 import { buildContext, checkSecrets, inside, realDirectory, redactSecrets, resolveContextRoot, same } from './context.ts';
+import { loadWorkerPolicy, workerPolicyMessage, type WorkerPolicy } from './worker-policy.ts';
 import { formatGraphContext, queryGraph, resolveGraphDir } from './graph.ts';
 import { loadEmbeddingsConfig, providerId, requestEmbedding } from './embeddings.ts';
 import { activeDecisionsSql, indexMemoryRow, recallProjectMemory, type SemanticRecallQuery } from './recall.ts';
@@ -101,9 +102,11 @@ export class Store {
   readonly home: string;
   /** Where the apps' own configuration lives, for the shared tool hub (tests replace it). */
   toolsEnv: HubEnv = { userHome: os.homedir() };
+  private readonly workerPolicy: WorkerPolicy;
   private activeRecallVectors?: Map<string, SemanticRecallQuery>;
-  constructor(home: string) {
+  constructor(home: string, workerPolicy?: WorkerPolicy) {
     this.home = home;
+    this.workerPolicy = workerPolicy ?? loadWorkerPolicy(home).policy;
     fs.mkdirSync(path.join(home, 'artifacts'), { recursive: true });
     this.db = new DatabaseSync(path.join(home, 'commons.sqlite'));
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
@@ -689,6 +692,8 @@ export class Store {
     const skipped: string[] = [], ready: Seat[] = [];
     for (const seat of chosen) {
       const r = status.get(seat.route)!;
+      const refusal = this.workerPolicy(seat.route, null);
+      if (refusal) { skipped.push(`${seat.seat}:${refusal}`); continue; }
       if (r.state !== 'verified') skipped.push(`${seat.seat}:${r.state}`); else if (r.cooldownUntil) skipped.push(`${seat.seat}:cooldown`); else ready.push(seat);
     }
     if (!ready.length) fail('ROOM_SEATS_UNAVAILABLE', 409, `no seat can take this round: ${skipped.join(' ')}`);
@@ -930,9 +935,11 @@ export class Store {
     // Each adapter's declared limits are enforced here, so a new platform gets them without code of its own.
     const caps = platform.capabilities;
     if (!caps.modes.includes(workerMode)) fail('INVALID_INPUT', 400, `${route} jobs are ${caps.modes.join(' or ')} only`);
-    const projectRoot = this.approvedProjectRoot(project.id);
     // tools=<name>: an operator-approved tool set from the shared manifest, snapshotted (with its hash) into the job.
     const toolsName = optText(input.tools, 'tools', 64);
+    const refusal = this.workerPolicy(route, toolsName, mode, patchEdit);
+    if (refusal) fail(refusal, 403, workerPolicyMessage(refusal));
+    const projectRoot = this.approvedProjectRoot(project.id);
     const toolset = toolsName ? jobToolset(isBuiltinToolset(toolsName) ? null : loadManifest(this.home), toolsName, route, mode) : null;
     const minutes = input.timeout_minutes ?? caps.defaultTimeoutMinutes;
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) fail('INVALID_INPUT', 400, 'timeout_minutes must be 1-240');
@@ -1440,6 +1447,10 @@ export class Store {
   /** Runner: atomically move the oldest queued job whose route has a free slot to running. */
   claimQueuedJob(routeLimits: Record<string, number>, globalLimit: number): Json | null {
     return this.transaction(() => {
+      for (const row of this.db.prepare("SELECT id, route, mode, options FROM jobs WHERE status='queued'").all()) {
+        const refusal = this.queuedWorkerRefusal(jobRow(row)!);
+        if (refusal) this.failBeforeDispatch(String(row.id), refusal);
+      }
       const running = this.db.prepare("SELECT route, count(*) n FROM jobs WHERE status='running' GROUP BY route").all() as Json[];
       const counts = Object.fromEntries(running.map(r => [r.route, Number(r.n)]));
       if (running.reduce((sum, r) => sum + Number(r.n), 0) >= globalLimit) return null;
@@ -1465,6 +1476,11 @@ export class Store {
       }
       return null;
     });
+  }
+  queuedWorkerRefusal(job: Json): string | null {
+    const set = job.options?.toolset;
+    const builtin = set?.builtin === 'project' && set.name === 'project' && set.server === 'builtin';
+    return this.workerPolicy(job.route, set ? (builtin ? 'project' : 'external') : null, job.mode, !!job.options?.patch_edit);
   }
   failBeforeDispatch(id: string, code: string): void {
     this.updateJob(id, { status: 'failed', finished_at: now(), error: code });
@@ -1955,7 +1971,7 @@ export class Store {
   routeLine(): string {
     const flag: Record<string, string> = { blocked: 'blk', drifted: 'drift', unavailable: 'na', not_probed: 'na' };
     return 'R ' + this.routeStatus().map(r => {
-      const flags = [flag[r.state], r.cooldownUntil ? `cool@${r.cooldownUntil.slice(0, 16)}Z` : '', r.billing === 'paid' ? 'paid' : ''].filter(Boolean);
+      const flags = [this.workerPolicy(r.id, null) ? 'blk' : flag[r.state], r.cooldownUntil ? `cool@${r.cooldownUntil.slice(0, 16)}Z` : '', r.billing === 'paid' ? 'paid' : ''].filter(Boolean);
       return `${r.short}=${r.running}/${r.limit}${r.queued ? `+${r.queued}q` : ''}${flags.length ? ':' + flags.join(',') : ''}`;
     }).join(' ');
   }
@@ -1965,7 +1981,7 @@ export class Store {
   /** route_hints: idle, verified, non-paid routes outside a family (default: the caller's), as short names. */
   op_route_hints(actor: Actor, input: Json): Json {
     const family = input.exclude_family ?? this.actorFamily(actor.id), mode = input.mode ?? 'advice';
-    const routes = this.routeStatus().filter(r => r.state === 'verified' && !r.cooldownUntil && r.billing !== 'paid' && r.family !== family
+    const routes = this.routeStatus().filter(r => !this.workerPolicy(r.id, null, mode) && r.state === 'verified' && !r.cooldownUntil && r.billing !== 'paid' && r.family !== family
       && r.running < r.limit && r.queued === 0 && adapter(r.id)!.capabilities.modes.includes(mode));
     return { air: routes.map(r => r.short).join(','), routes: routes.map(r => r.id) };
   }
@@ -2046,7 +2062,12 @@ export class Store {
     };
     const skipped: string[] = [], eligible: Candidate[] = [];
     const hasProfiles = this.hasTable('platform_profiles'), hasState = this.hasTable('platform_state');
+    const requestedMode = input.mode ?? (input.intent === 'edit' ? 'edit' : 'advice');
+    const patchEdit = requestedMode === 'edit' && typeof input.check === 'string';
+    const policyMode = patchEdit ? 'edit' : mode;
     for (const [order, r] of this.routeStatus().entries()) {
+      const workerRefusal = this.workerPolicy(r.id, toolsetName, policyMode, patchEdit);
+      if (workerRefusal) { skipped.push(`${r.short}:${workerRefusal}`); continue; }
       const caps = adapter(r.id)!.capabilities;
       const quota = r.state === 'verified' && !r.cooldownUntil ? this.routeQuotaState(r.id) : null;
       const storedProfile = hasProfiles
@@ -2150,8 +2171,12 @@ export class Store {
       } catch (e) { pickError = String((e as Error)?.message ?? e); }
     } else {
       const target = adapter(requestedRoute) ?? allAdapters().find(a => a.capabilities.short === requestedRoute);
-      pickedRoute = target?.capabilities.id ?? null;
-      if (!pickedRoute) pickError = `unknown route ${requestedRoute}`;
+      if (!target) pickError = `unknown route ${requestedRoute}`;
+      else {
+        const refusal = this.workerPolicy(target.capabilities.id, optText(input.tools, 'tools', 64), mode, shared);
+        if (refusal) pickError = `${refusal}: ${workerPolicyMessage(refusal)}`;
+        else pickedRoute = target.capabilities.id;
+      }
     }
     let resolved: Json | null = null;
     let budgetError: string | null = null;

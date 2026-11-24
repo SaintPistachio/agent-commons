@@ -60,8 +60,9 @@ test('the CLI gets the prompt over stdin, read-only tools and no API credentials
   const done = await f.until(job.id, ['completed', 'failed']);
   const seen = JSON.parse(done.result);
   assert.equal(seen.apiKey, false); assert.equal(seen.jobId, job.id);
-  assert.deepEqual(seen.args.slice(seen.args.indexOf('--allowedTools') + 1, seen.args.indexOf('--allowedTools') + 4), ['Read', 'Grep', 'Glob']);
-  assert(!seen.args.includes('Bash') && !seen.args.includes('Write'));
+  assert.deepEqual(seen.args.slice(seen.args.indexOf('--tools'), seen.args.indexOf('--tools') + 2), ['--tools', 'Read,Grep,Glob']);
+  assert.deepEqual(seen.args.slice(seen.args.indexOf('--allowedTools') + 1, seen.args.indexOf('--disallowedTools')), ['Read', 'Grep', 'Glob']);
+  assert.deepEqual(seen.args.slice(seen.args.indexOf('--disallowedTools') + 1, seen.args.indexOf('--disallowedTools') + 6), ['Bash', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
   assert.equal(seen.args[seen.args.indexOf('--model') + 1], 'opus');
   assert.equal(seen.args[seen.args.indexOf('--permission-mode') + 1], 'default');
 });
