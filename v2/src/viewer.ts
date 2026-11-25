@@ -6,6 +6,9 @@ import { DatabaseSync } from 'node:sqlite';
 import type { CodexResetSummary, UsageDiagnostic, UsageWindow } from './adapters/types.ts';
 import { codexExpiringResets } from './adapters/codex-limits.ts';
 import { downsamplePoints, formatCompactDuration, formatPaceSummary, windowLengthMs, windowPace, type UsageHistoryCycle } from './allowance.ts';
+import { git } from './adapters/shared.ts';
+import { realDirectory, same } from './context.ts';
+import { commitAt, prerequisiteIssues, type EditBase, type TaskDependency } from './task-prerequisites.ts';
 
 /**
  * Read-only room viewer. It opens the service database read-only (SQLite WAL lets it read while the service writes),
@@ -221,9 +224,61 @@ export interface RenderOptions {
   generatedAt?: string;
 }
 
-const navBar = (active: 'rooms' | 'status', options: RenderOptions) => options.mode === 'live'
-  ? `<nav class="nav"><a href="/"${active === 'rooms' ? ' class="active"' : ''}>Rooms</a><a href="/status"${active === 'status' ? ' class="active"' : ''}>Status &amp; quota</a></nav>`
+const navBar = (active: 'rooms' | 'status' | 'tasks', options: RenderOptions) => options.mode === 'live'
+  ? `<nav class="nav"><a href="/"${active === 'rooms' ? ' class="active"' : ''}>Rooms</a><a href="/tasks"${active === 'tasks' ? ' class="active"' : ''}>Tasks</a><a href="/status"${active === 'status' ? ' class="active"' : ''}>Status &amp; quota</a></nav>`
   : '';
+
+export function renderProjectTasks(db: DatabaseSync, projectNumber?: number, baseJob?: string): string | null {
+  const projects = db.prepare(`SELECT p.*, s.num FROM projects p
+    JOIN short_ids s ON s.kind='p' AND s.id=p.id ORDER BY p.name,s.num`).all() as Row[];
+  const project = projects.find(item => item.num === projectNumber);
+  const nav = navBar('tasks', { mode: 'live' });
+  if (projectNumber === undefined) {
+    const links = projects.map(item => `<li><a href="/p/${item.num}/tasks">${esc(item.name)}</a></li>`).join('');
+    return page('Project tasks', `${nav}<h1>Project tasks</h1>${links ? `<ul>${links}</ul>` : '<p>No projects yet.</p>'}`, footer({ mode: 'live' }));
+  }
+  if (!project) return null;
+  const tasks = db.prepare('SELECT * FROM tasks WHERE project_id=? ORDER BY seq').all(project.id) as Row[];
+  const handles = new Map(tasks.map(task => [task.id, `t${task.seq}`]));
+  const editJobs = db.prepare(`SELECT seq,task_id,json_extract(options,'$.edit_base') revision
+    FROM jobs WHERE project_id=? AND mode='edit' AND task_id IS NOT NULL AND json_type(options,'$.edit_base')='text' ORDER BY seq DESC`)
+    .all(project.id) as Row[];
+  const selected = baseJob ? editJobs.find(job => `j${job.seq}` === baseJob) : undefined;
+  if (baseJob && !selected) return null;
+  const latest = new Map<string, number>();
+  for (const job of editJobs) if (!latest.has(job.task_id)) latest.set(job.task_id, job.seq);
+  let base: EditBase | null = null;
+  try {
+    const root = project.approved_root && realDirectory(project.root ?? '');
+    if (root && same(root) === same(project.approved_root)) {
+      const common = realDirectory(git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+      const top = realDirectory(git(root, ['rev-parse', '--show-toplevel']));
+      const approvedGit = project.approved_git_dir && same(project.approved_git_dir);
+      if (top && same(top) === same(root) && common && [same(path.join(root, '.git')), approvedGit].includes(same(common)))
+        base = { root, revision: commitAt(root, selected?.revision ?? 'HEAD') };
+    }
+  } catch { /* A moved or unavailable checkout is shown as unavailable. */ }
+  const rows = tasks.map(task => {
+    const deps: TaskDependency[] = parse(task.depends_on, []);
+    const issues = new Map(prerequisiteIssues(db, deps, base).map(issue => [issue.task, issue.reason]));
+    const links = deps.map(dep => {
+      const handle = handles.get(dep.task_id);
+      const label = handle ? `<a href="#${handle}">${handle}</a>` : esc(dep.task_id);
+      const reason = issues.get(handle ?? dep.task_id) ?? 'ready';
+      return `<li>${label} ${esc(reason)}</li>`;
+    }).join('');
+    const job = latest.get(task.id);
+    const jobLink = job === undefined ? '' : `<a href="?base_job=j${job}#t${task.seq}">Check base of j${job}</a>`;
+    return `<tr id="t${task.seq}"><td>t${task.seq}</td><td>${esc(task.title)}</td><td>${esc(task.owner ?? 'Unassigned')}</td>
+<td>${badge(task.status)}</td><td>${links ? `<ul>${links}</ul>` : ''}${jobLink}</td><td>${esc(task.next_action ?? '')}</td></tr>`;
+  }).join('');
+  const baseLabel = selected ? `job j${selected.seq}'s base` : 'project HEAD';
+  return page(`${project.name} tasks`, `${nav}<a href="/tasks">All projects</a><h1>${esc(project.name)} tasks</h1>
+<p>${base ? `Git prerequisites checked against ${baseLabel} <code>${esc(base.revision.slice(0, 12))}</code>.` : `Git base unavailable for ${baseLabel}.`}
+${selected ? ` <a href="/p/${project.num}/tasks">Check project HEAD</a>` : ''}</p>
+<div class="panel" style="overflow-x:auto"><table><thead><tr><th>Task</th><th>Title</th><th>Owner</th><th>Status</th><th>Prerequisites</th><th>Next action</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="6">No tasks yet.</td></tr>'}</tbody></table></div>`, footer({ mode: 'live' }));
+}
 
 export function renderRoomList(rooms: RoomSummary[], options: RenderOptions): string {
   const rows = rooms.map(r => `<tr><td><a href="/g/${esc(r.handle.slice(1))}">${esc(r.handle)}</a></td><td>${esc(r.subject)}</td>
@@ -632,6 +687,11 @@ export async function startViewer(home: string, port = VIEWER_PORT): Promise<Vie
       let m: RegExpExecArray | null;
       if (url.pathname === '/') return send(200, renderRoomList(listRooms(db), { mode: 'live' }));
       if (url.pathname === '/status') return send(200, renderStatus(loadStatus(db, home), { mode: 'live' }));
+      if (url.pathname === '/tasks') return send(200, renderProjectTasks(db)!);
+      if ((m = /^\/p\/(\d+)\/tasks$/.exec(url.pathname))) {
+        const tasks = renderProjectTasks(db, Number(m[1]), url.searchParams.get('base_job') ?? undefined);
+        return tasks ? send(200, tasks) : send(404, page('Not found', '<h1>Project or edit base unavailable</h1><p><a href="/tasks">All projects</a></p>', ''));
+      }
       if ((m = /^\/g\/(\d+)$/.exec(url.pathname))) {
         const room = loadRoom(db, 'g' + m[1]);
         return room ? send(200, renderRoom(room, { mode: 'live' })) : send(404, page('Not found', '<h1>No such room</h1><p><a href="/">All rooms</a></p>', ''));

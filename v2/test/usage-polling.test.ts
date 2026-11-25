@@ -8,9 +8,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { parseClaudeCachedUsage, parseClaudeUsage, readClaudeCachedUsage, readClaudeUsage } from '../src/adapters/claude-usage.ts';
 import { claude } from '../src/adapters/claude.ts';
 import { codex } from '../src/adapters/codex.ts';
-import { codexExpiringResets, parseCodexAppServerRateLimits, parseCodexResetCredits } from '../src/adapters/codex-limits.ts';
+import { codexExpiringResets, codexUsageInventoryComplete, parseCodexAppServerRateLimits, parseCodexResetCredits } from '../src/adapters/codex-limits.ts';
 import { UsageContractViolation, type UsageDiagnostic, type UsageObservation, type UsageWindow } from '../src/adapters/types.ts';
-import { Prober } from '../src/prober.ts';
+import { setImmediate as nextTurn } from 'node:timers/promises';
+import { Prober, USAGE_REFRESH } from '../src/prober.ts';
 import { migrate, SCHEMA_VERSION } from '../src/schema.ts';
 import { downsamplePoints } from '../src/store.ts';
 import { Store } from './fixtures/service.ts';
@@ -25,6 +26,7 @@ test('schema 22 preserves quota readings and carries forward an active schema 21
   db.exec(`
     CREATE TABLE platform_state (adapter_id TEXT PRIMARY KEY, cooldown_until TEXT, updated_at TEXT);
     CREATE TABLE projects (id TEXT PRIMARY KEY);
+    CREATE TABLE tasks (id TEXT PRIMARY KEY, depends_on TEXT NOT NULL DEFAULT '[]');
     CREATE TABLE usage_windows (route TEXT, pool TEXT, window TEXT, source TEXT, remaining_percent REAL, resets_at TEXT);
     PRAGMA user_version = 21;
   `);
@@ -63,6 +65,108 @@ function fixture(t: TestContext) {
   t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return { dir, store };
 }
+
+test('a fresh complete usage inventory retires absent meters while retaining history and operator rows', t => {
+  const { store } = fixture(t);
+  const route = 'antigravity', reset = iso(60_000), old = iso(-5_000), readAt = iso(-2_000);
+  const argon = reading('weekly', 60, reset, old, 'Gemini 4 Argon');
+  const current = reading('weekly', 50, reset, readAt, 'Gemini Models');
+  store.recordUsage(route, [argon], 'status');
+  store.recordUsage(route, [reading('5h', 40, reset, old, 'operator override')], 'operator');
+  store.recordUsage(route, [reading('weekly', 80, reset, iso(-500), 'newer reply')], 'reply');
+  assert.equal(store.recordUsage(route, [current], 'status', readAt, false, true), true);
+  assert.deepEqual(store.usageFor(route).map(row => row.pool), ['Gemini Models', 'newer reply', 'operator override']);
+  assert.equal(store.db.prepare("SELECT count(*) AS n FROM usage_history WHERE pool='Gemini 4 Argon'").get()?.n, 1);
+});
+
+test('partial, rejected or out-of-order reads cannot retire an omitted meter', t => {
+  const { store } = fixture(t);
+  const route = 'codex', reset = iso(60_000);
+  store.recordUsage(route, [reading('weekly', 60, reset, iso(-5_000), 'retained')], 'app-server');
+  const current = reading('weekly', 50, reset, iso(-4_000), 'codex');
+  store.recordUsage(route, [current], 'app-server', current.observed_at, true, true);
+  assert.ok(store.usageFor(route).some(row => row.pool === 'retained'));
+  const fresh = { ...current, observed_at: iso(-2_000) };
+  store.recordUsage(route, [fresh, { ...fresh, pool: 'invalid', remaining_percent: -1 }], 'app-server', fresh.observed_at, false, true);
+  store.recordUsage(route, [current], 'app-server', current.observed_at, false, true);
+  assert.ok(store.usageFor(route).some(row => row.pool === 'retained'));
+});
+
+test('an omitted pool stays retired after an older report, and cooldown evidence survives omission', t => {
+  const { store } = fixture(t);
+  const route = 'codex', reset = iso(60_000), oldAt = iso(-5000), reportAt = iso(-1000);
+  store.recordProbe(codex.capabilities, { state: 'verified' });
+  const removed = reading('weekly', 10, reset, oldAt, 'removed');
+  const exhausted = reading('weekly', 0, reset, oldAt, 'exhausted');
+  store.recordUsage(route, [removed, exhausted], 'app-server');
+  store.setCooldown(route, reset, 'QUOTA_EXHAUSTED: exhausted');
+  const current = reading('weekly', 50, reset, reportAt, 'codex');
+  assert.equal(store.recordUsage(route, [current], 'app-server', reportAt, false, true), true);
+  store.recordUsageMeta(route, { meta: null });
+  store.recordUsage(route, [removed], 'reply');
+  assert.deepEqual(store.usageFor(route).map(row => row.pool), ['codex', 'exhausted']);
+  assert.equal(store.platformState(route)?.cooldown_until, reset);
+});
+
+test('usage and model inventory changes recheck the other inventory once per polling interval', async t => {
+  const { store, dir } = fixture(t);
+  const route = 'claude';
+  const base = Date.now();
+  t.mock.timers.enable({ apis: ['Date'], now: base });
+  store.recordProbe(claude.capabilities, { state: 'verified' });
+  let model = 'first', pool = 'default', usageReads = 0, discoveries = 0;
+  const usage = () => reading('weekly', 50, null, iso(0), pool);
+  const models = () => [{ model, efforts: ['medium'], source: 'test' }];
+  const platform = claude as Required<Pick<typeof claude, 'observeUsage' | 'discover'>>;
+  t.mock.method(platform, 'observeUsage', async () => {
+    usageReads++;
+    return { source: 'claude-usage', rows: [usage()], completeInventory: true };
+  });
+  t.mock.method(platform, 'discover', async () => {
+    discoveries++;
+    return models();
+  });
+  const prober = new Prober(store, dir, {}, { adapters: [route], schedule: false, cliModelHome: dir });
+  t.after(() => prober.stop());
+  await prober.refreshUsage();
+  await prober.discover(route);
+  assert.deepEqual([usageReads, discoveries], [1, 1]);
+
+  t.mock.timers.setTime(base + 1000);
+  pool = 'new pool';
+  model = 'second';
+  const discover = prober.discover.bind(prober);
+  const calls = t.mock.method(prober, 'discover', discover);
+  await prober.refreshUsage();
+  assert.equal(calls.mock.callCount(), 1);
+  await calls.mock.calls[0].result;
+  assert.deepEqual([usageReads, discoveries], [2, 2]);
+
+  t.mock.timers.setTime(base + 2000);
+  model = 'third';
+  await prober.discover(route);
+  await nextTurn();
+  assert.deepEqual([usageReads, discoveries], [2, 3]);
+
+  t.mock.timers.setTime(base + 1000 + USAGE_REFRESH);
+  pool = 'another pool';
+  model = 'fourth';
+  await prober.discover(route);
+  await nextTurn();
+  assert.deepEqual([usageReads, discoveries], [3, 4]);
+});
+
+test('Codex requires the explicit complete pool map before retiring omitted meters', () => {
+  const now = Date.now();
+  const primary = { usedPercent: 25, windowDurationMins: 10080, resetsAt: Math.floor(now / 1000) + 60 };
+  const snap = { limitId: 'codex', primary, secondary: null };
+  const full = { rateLimits: snap, rateLimitsByLimitId: { codex: snap } };
+  const rows = parseCodexAppServerRateLimits(full, [], now)!;
+  assert.equal(codexUsageInventoryComplete(full, rows, now), true);
+  assert.equal(codexUsageInventoryComplete({ rateLimits: snap }, rows, now), false);
+  const malformed = { ...full, rateLimitsByLimitId: { ...full.rateLimitsByLimitId, unknown: null } };
+  assert.equal(codexUsageInventoryComplete(malformed, rows, now), false);
+});
 
 function frames(session_id: string, resets_at: string) {
   return [

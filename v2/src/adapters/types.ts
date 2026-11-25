@@ -15,6 +15,8 @@ export interface RunnerOptions {
   /** The original central OpenAI helper (`python run.py`); it alone admits and accounts for API spending.
    * Its status reports sync_concurrency_limit 8, the source for the openai-api route's unchanged ceiling. */
   openaiHelper?: RouteCommand;
+  /** Injected helper command for Gemini adapter tests. */
+  geminiHelper?: RouteCommand;
   /** The guarded antigravity-helper (`pwsh -File Invoke-Antigravity.ps1`); reasoning only, included Google quota. */
   antigravity?: RouteCommand;
   /** Test seam for Antigravity ACP stdio server injection. */
@@ -36,6 +38,8 @@ export interface AdapterCapabilities {
   billing: BillingClass;
   modes: Array<'advice' | 'edit'>;
   supportsShellInEdit: boolean;
+  /** Whether the service may schedule another request automatically after a bad result. */
+  automaticRepair?: boolean;
   /** Advice jobs can inspect repository files directly without ctx= (read-only tools or sandbox). */
   hasWorkspaceReadTools?: boolean;
   maxPromptChars: number;
@@ -289,6 +293,8 @@ export interface CodexResetSummary {
 
 export interface UsageMetadata {
   resetCredits?: CodexResetSummary;
+  /** Latest verified complete inventory read, used to reject older provider rows. */
+  inventoryStartedAt?: string;
 }
 
 export interface UsageSnapshot {
@@ -296,6 +302,8 @@ export interface UsageSnapshot {
   source: string;
   /** An unrecognized provider meter prevents a cooldown decision from this snapshot. */
   partial?: boolean;
+  /** The adapter verified that this is the route's complete current meter list. */
+  completeInventory?: boolean;
   /** Non-identifying hash of account/origin/plan scope for isolating cycle history. */
   accountScope?: string;
   /** Non-identifying route metadata such as Codex banked reset credits. */

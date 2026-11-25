@@ -184,6 +184,8 @@ export class Runner {
       if (error instanceof CommonsError) return this.store.failBeforeDispatch(job.id, error.code);
       throw error;
     }
+    const editRefusal = this.store.queuedEditRefusal(job);
+    if (editRefusal) return this.store.failBeforeDispatch(job.id, editRefusal);
     const dir = path.join(this.home, 'jobs', job.id);
     fs.mkdirSync(dir, { recursive: true });
     const route = adapter(job.route);
@@ -215,8 +217,10 @@ export class Runner {
     const projectRoot = this.store.approvedProjectRoot(job.project_id);
     const root = job.options?.cwd ? resolveContextRoot(projectRoot, job.options.cwd, [this.home]) : projectRoot;
     if (job.mode === 'advice') { this.store.updateJob(job.id, { workdir: root }); return root; }
+    const refusal = this.store.queuedEditRefusal(job);
+    if (refusal) throw new CommonsError('TASK_PREREQUISITES_BLOCKED', refusal, 409);
     this.store.assertJobRepository(job.project_id, root);
-    const base = job.options?.patch_edit?.base ?? worktreeGit(root, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    const base = job.options?.edit_base ?? job.options?.patch_edit?.base ?? worktreeGit(root, ['rev-parse', '--verify', 'HEAD^{commit}']);
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base)) throw new Error('The job base is not a commit ID.');
     const branch = `ac/job-${job.id.slice(0, 8)}`, workdir = path.join(this.home, 'worktrees', job.id);
     fs.mkdirSync(path.dirname(workdir), { recursive: true });

@@ -29,8 +29,12 @@ test('window lengths come from labels only when the label states them', () => {
 test('the binding window decides: expiring, scarce, or neutral', () => {
   // A 5-hour window with 80% left resetting within the last quarter of its length would lapse unused.
   assert.equal(classifyAllowance([w('p', '300m', 80, 1 * H)], NOW).cls, 'expiring');
-  assert.equal(classifyAllowance([w('p', '300m', 80, 3 * H)], NOW).cls, 'neutral', 'too early to call it lapsing');
-  assert.equal(classifyAllowance([w('p', '300m', 40, 1 * H)], NOW).cls, 'neutral', 'not enough left');
+  // Not lapsing yet, but at the current burn rate half the window (80 - 20/2h * 3h) would go unused: surplus.
+  assert.equal(classifyAllowance([w('p', '300m', 80, 3 * H)], NOW).cls, 'surplus', 'projected to go unused');
+  assert.equal(Math.round(classifyAllowance([w('p', '300m', 80, 3 * H)], NOW).projected!), 50);
+  assert.equal(classifyAllowance([w('p', '300m', 40, 1 * H)], NOW).cls, 'surplus', '25% projected unused');
+  assert.equal(classifyAllowance([w('p', '300m', 30, 1 * H)], NOW).cls, 'neutral', 'only ~12% projected unused');
+  assert.equal(classifyAllowance([w('p', '300m', 99, 4.9 * H)], NOW).cls, 'neutral', 'too early to project');
   // The weekly window binds the pool, so a generous 5-hour window does not make the pool expiring.
   assert.equal(classifyAllowance([w('p', '300m', 90, 1 * H), w('p', '10080m', 25, 100 * H)], NOW).cls, 'scarce');
   assert.equal(classifyAllowance([w('p', '10080m', 25, 20 * H)], NOW).cls, 'neutral', 'scarce allowance that refills soon is not held back');
@@ -62,7 +66,7 @@ function fixture(t: any) {
     store.call(claude, 'job_submit', { project_id: 'p1', prompt: 'x', route: 'auto', operation_id: randomUUID(), ...extra }).job;
   const usage = (route: string, window: string, remaining: number, resetsInMs: number) =>
     store.recordUsage(route, [{ pool: 'main', window, remaining_percent: remaining, resets_at: new Date(Date.now() + resetsInMs).toISOString() }], 'test');
-  return { store, auto, usage };
+  return { store, auto, usage, repo };
 }
 
 test('route=auto prefers a comparable route whose allowance would lapse unused, and records why', t => {
@@ -118,8 +122,9 @@ test('ties and loose labels classify the same whatever the input order', () => {
   assert.equal(windowLengthMs('daily'), 24 * H);
   // Within a pool, an equal-remaining tie binds to the later reset (not expiring), in either order.
   const short = w('p', '300m', 80, 1 * H), long = w('p', 'weekly', 80, 100 * H);
-  assert.equal(classifyAllowance([short, long], NOW).cls, 'neutral');
-  assert.equal(classifyAllowance([long, short], NOW).cls, 'neutral');
+  assert.equal(bindingWindow([short, long], NOW), long);
+  assert.equal(bindingWindow([long, short], NOW), long);
+  assert.equal(classifyAllowance([short, long], NOW).cls, classifyAllowance([long, short], NOW).cls);
   // Across pools, an equal-remaining tie prefers the sooner reset (use it or lose it), in either order.
   const a = w('a', '300m', 80, 1 * H), b = w('b', '300m', 80, 3 * H);
   assert.equal(classifyAllowance([a, b], NOW).cls, 'expiring');
@@ -205,4 +210,79 @@ test('windowPace and windowProjection calculate advisory burn rate, early guard,
   assert.equal(windowPace(w('prepaid', 'grant', 80, 2 * H), NOW), null);
   assert.equal(windowPace(w('default', '5h', 80, null), NOW), null);
   assert.equal(bindingWindow([w('p', '300m', 90, 1 * H), w('p', '10080m', 25, 100 * H)])?.window, '10080m');
+});
+
+test('prepaid spend-down: an unused weekly grant budget joins the subscription band only when cost is omitted', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.repo, 'a.md'), 'context');
+  const ctx = { context_refs: ['file:a.md'] };
+  const prepaid = (remaining: number, resetsInMs: number, extra: Record<string, unknown> = {}) => f.store.recordUsage('openai-api', [
+    { pool: 'prepaid', window: 'grant', remaining_percent: 95, resets_at: new Date(Date.now() + 20 * 24 * H).toISOString() },
+    { pool: 'prepaid', window: 'weekly', remaining_percent: remaining, resets_at: new Date(Date.now() + resetsInMs).toISOString(), ...extra },
+  ], 'test');
+  const clear = () => f.store.db.prepare("UPDATE jobs SET status='cancelled'").run();
+  // 90% of the week's budget left a day before it resets: it would lapse, so the API wins on allowance.
+  prepaid(90, 24 * H);
+  const job = f.auto(ctx);
+  assert.equal(job.route, 'openai-api');
+  assert.equal(job.options.spend_down, true);
+  assert.equal(job.options.max_cost_usd, '2.00');
+  assert.equal(job.options.purpose, `prepaid grant spend-down: x [ac:${job.id.slice(0, 8)}]`);
+  assert.equal(job.options.deliverable, 'Agent Commons job result');
+  clear();
+  // A second job gets its own purpose, so the helper never sees a duplicate request.
+  const second = f.auto(ctx);
+  assert.equal(second.route, 'openai-api');
+  assert.notEqual(second.options.purpose, job.options.purpose);
+  clear();
+  // An explicit cost=sub never reaches the paid route.
+  assert.notEqual(f.auto({ ...ctx, cost: 'sub' }).route, 'openai-api');
+  clear();
+  // Little left, or on pace: no spend-down.
+  prepaid(10, 24 * H);
+  assert.notEqual(f.auto(ctx).route, 'openai-api');
+  clear();
+  prepaid(20, 24 * H);
+  assert.notEqual(f.auto(ctx).route, 'openai-api', '20% left a day before reset is on pace');
+  clear();
+  // A stale reading never qualifies.
+  prepaid(90, 24 * H);
+  f.store.db.prepare("UPDATE usage_windows SET observed_at='2000-01-01T00:00:00.000Z' WHERE route='openai-api'").run();
+  assert.notEqual(f.auto(ctx).route, 'openai-api');
+  clear();
+  // A job without context prefers a route that can read the workspace.
+  prepaid(90, 24 * H);
+  assert.notEqual(f.auto().route, 'openai-api');
+  clear();
+  // Edit jobs never spend down.
+  assert.notEqual(f.auto({ ...ctx, mode: 'edit' }).route, 'openai-api');
+  clear();
+  // Only the weekly row decides: a grant about to lapse does not qualify a weekly budget that is on pace.
+  f.store.recordUsage('openai-api', [
+    { pool: 'prepaid', window: 'grant', remaining_percent: 60, resets_at: new Date(Date.now() + 12 * H).toISOString() },
+    { pool: 'prepaid', window: 'weekly', remaining_percent: 65, resets_at: new Date(Date.now() + 96 * H).toISOString() },
+  ], 'test');
+  assert.notEqual(f.auto(ctx).route, 'openai-api');
+  clear();
+  // A caller's partial spend fields cannot raise the ceiling; a smaller ceiling is kept.
+  prepaid(90, 24 * H);
+  assert.equal(f.auto({ ...ctx, max_cost_usd: '9.00' }).options.max_cost_usd, '2.00');
+  clear();
+  assert.equal(f.auto({ ...ctx, max_cost_usd: '0.50' }).options.max_cost_usd, '0.50');
+  clear();
+  assert.equal(f.auto({ ...ctx, max_cost_usd: '0.506' }).options.max_cost_usd, '0.50', 'never rounded up');
+  clear();
+  assert.throws(() => f.auto({ ...ctx, max_cost_usd: '0' }), /max_cost_usd/);
+  assert.equal(f.auto(ctx).options.cost_class, 'omitted');
+  clear();
+  assert.equal(f.auto({ ...ctx, cost: 'sub' }).options.cost_class, 'sub');
+});
+
+test('the paced-window preference applies only to the prepaid pool', () => {
+  // Elsewhere an unknown-length window still binds its pool, so scarce quota is not hidden.
+  const odd = w('p', 'monthly-ish', 20, 72 * H), five = w('p', '300m', 90, 3 * H);
+  assert.equal(bindingWindow([odd, five], NOW), odd);
+  const grant = w('prepaid', 'grant', 60, 20 * 24 * H), weekly = w('prepaid', 'weekly', 90, 24 * H);
+  assert.equal(bindingWindow([grant, weekly], NOW), weekly);
+  assert.equal(bindingWindow([w('prepaid', 'grant', 10, 20 * 24 * H), weekly], NOW)!.window, 'grant', 'a nearly used grant still binds');
 });

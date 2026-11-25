@@ -287,3 +287,29 @@ test('j118 fixes: exact-model unentitlement, 24h expiry, preferred protection, m
   assert.equal(repair.req_intent, 'code');
   assert.equal(repair.req_eff, 'max');
 });
+
+test('route failover reaches prepaid spend-down only for a job that omitted cost', t => {
+  const { store, actor, repo, db } = setupStore(t, ['antigravity', 'codex', 'openai-api']);
+  store.recordUsage('openai-api', [{ pool: 'prepaid', window: 'weekly', remaining_percent: 90,
+    resets_at: new Date(Date.now() + 24 * 3600_000).toISOString() }], 'test');
+  store.setCooldown('codex', '2100-01-01T00:00:00.000Z', 'exhausted');
+  const fail = (extra: Json) => {
+    const orig = store.call(actor, 'job_submit', {
+      project_id: 'p1', route: 'antigravity', intent: 'code', eff: 'med', task: 'explain', context_refs: ['file:index.ts'],
+      protocol: 'air', prompt: `Explain this bounded behavior ${randomUUID()}.`, operation_id: randomUUID(), ...extra,
+    }).job as Json;
+    store.updateJob(orig.id, { status: 'running', workdir: repo });
+    store.updateJob(orig.id, { status: 'completed', result: 'Missing air block', finished_at: new Date().toISOString() });
+    return db.prepare('SELECT * FROM jobs WHERE repair_of=?').get(orig.id) as Json | undefined;
+  };
+  // An explicit cost=sub job never gets a paid repair.
+  const strict = fail({ cost: 'sub' });
+  assert.ok(!strict || strict.route !== 'openai-api');
+  // A job that omitted cost may fail over into spend-down, with AC's ceiling and its own purpose.
+  const open = fail({});
+  assert.equal(open?.route, 'openai-api');
+  const opts = JSON.parse(open!.options);
+  assert.equal(opts.spend_down, true);
+  assert.equal(opts.max_cost_usd, '2.00');
+  assert.match(opts.purpose, /^prepaid grant spend-down: /);
+});

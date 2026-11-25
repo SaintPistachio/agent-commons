@@ -24,7 +24,7 @@ export interface LoadedWorkerPolicy {
 }
 
 const ALLOWED_KEYS = new Set(['schemaVersion', 'allowRoutes', 'allowNativeEdit', 'allowApprovedToolsets']);
-const ALLOWED_NATIVE = new Set<string>(NATIVE_WORKER_ROUTES);
+const OPERATOR_ROUTES = new Set<string>([...NATIVE_WORKER_ROUTES, 'gemini-api']);
 
 export const releaseWorkerPolicy: WorkerPolicy = (route, toolset, mode, patchEdit) => {
   if (route !== 'openai-api') return 'WORKER_ROUTE_GATED';
@@ -47,12 +47,12 @@ export function parseLocalWorkerPolicy(raw: unknown): LocalWorkerPolicyConfig {
     throw new CommonsError('WORKER_POLICY_INVALID', 'Worker policy schemaVersion must be 1.', 400);
   }
   if (!Array.isArray(obj.allowRoutes)) {
-    throw new CommonsError('WORKER_POLICY_INVALID', 'Worker policy allowRoutes must be an array of native route IDs.', 400);
+    throw new CommonsError('WORKER_POLICY_INVALID', 'Worker policy allowRoutes must be an array of operator-opt-in route IDs.', 400);
   }
   const allowRoutes: string[] = [];
   const seen = new Set<string>();
   for (const entry of obj.allowRoutes) {
-    if (typeof entry !== 'string' || !ALLOWED_NATIVE.has(entry)) {
+    if (typeof entry !== 'string' || !OPERATOR_ROUTES.has(entry)) {
       throw new CommonsError('WORKER_POLICY_INVALID', `Unsupported route in worker policy allowRoutes: ${String(entry)}`, 400);
     }
     if (seen.has(entry)) {
@@ -79,6 +79,10 @@ export function workerPolicyFromConfig(config: LocalWorkerPolicyConfig): WorkerP
   const allowed = new Set(config.allowRoutes);
   return (route, toolset, mode, patchEdit) => {
     if (route !== 'openai-api' && !allowed.has(route)) return 'WORKER_ROUTE_GATED';
+    if (route === 'gemini-api') {
+      if (mode === 'edit' || patchEdit) return 'WORKER_MODE_GATED';
+      return toolset === null ? null : 'WORKER_TOOLSET_GATED';
+    }
     if (toolset !== null && toolset !== 'project' && !config.allowApprovedToolsets) return 'WORKER_TOOLSET_GATED';
     if (patchEdit && (mode !== 'edit' || toolset !== null)) return 'WORKER_MODE_GATED';
     if (mode === 'edit' && !patchEdit && (!config.allowNativeEdit || route === 'openai-api')) return 'WORKER_MODE_GATED';

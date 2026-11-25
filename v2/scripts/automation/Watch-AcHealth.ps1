@@ -149,6 +149,61 @@ console.log(JSON.stringify(rows));
       Add-Problem 'api-hold' ("{0} API helper reservation(s) unsettled for over {1} h (`${2:N2} held: {3}); reconcile or write off with the operator's approval" -f @($stuck).Count, $HoldHours, $usd, ((@($stuck) | ForEach-Object { "$($_.job_id.Substring(0, 8)) $($_.status)" }) -join ', '))
     }
   } catch { Add-Problem 'api-hold' "could not read the API helper ledger ($($_.Exception.Message))" }
+
+  # Recorded prepaid grants: the helper pauses new API jobs once a recorded grant expires, until AJ's newest Credit
+  # grants page is recorded (the OpenAI monthly grant renews on the 18th). Read-only: reads settings.funding.
+  $grantQuery = @'
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
+const row = db.prepare("SELECT value FROM settings WHERE key='funding'").get();
+const funding = row ? JSON.parse(row.value) : {};
+const now = Date.now(), lead = Number(process.argv[2]) * 86400000;
+const out = [];
+for (const g of Array.isArray(funding.grants) ? funding.grants : []) {
+  const balance = Number(g.balance_usd);
+  const end = Date.parse(g.expires_at ?? (g.expires_on ? g.expires_on + 'T00:00:00Z' : ''));
+  if (!(balance > 0) || !Number.isFinite(end) || end - now > lead) continue;
+  out.push({ balance: g.balance_usd, expires: new Date(end).toISOString(), expired: end <= now });
+}
+console.log(JSON.stringify(out));
+'@
+  try {
+    $grants = & (Get-Command node.exe).Source --disable-warning=ExperimentalWarning -e $grantQuery $HelperLedger $ResetExpiryDays | ConvertFrom-Json
+    if ($LASTEXITCODE) { throw "exit $LASTEXITCODE" }
+    foreach ($g in @($grants)) {
+      $when = ([datetime]::Parse($g.expires, [Globalization.CultureInfo]::InvariantCulture)).ToLocalTime().ToString('g')
+      if ($g.expired) {
+        Add-Problem 'api-grant-expired' ("a recorded OpenAI API grant (`${0} at last reading) expired {1}; API jobs are paused until AJ shares the current Credit grants page and it is recorded with refresh-funding" -f $g.balance, $when)
+      } else {
+        Add-Problem 'api-grant-expiry' ("a recorded OpenAI API grant (`${0} at last reading) expires {1}; route spare work to the API before then, and record the renewed grant after it" -f $g.balance, $when)
+      }
+    }
+  } catch { Add-Problem 'api-grant-expiry' "could not read recorded API grants ($($_.Exception.Message))" }
+}
+if ($selection -and $selection.root) {
+  $geminiRoot = if ($env:AGENT_COMMONS_GEMINI_HELPER_ROOT) {
+    [IO.Path]::GetFullPath($env:AGENT_COMMONS_GEMINI_HELPER_ROOT.Trim(), $DataRoot)
+  } else { Join-Path (Split-Path $selection.root -Parent) 'gemini-capabilities' }
+  $geminiPin = Join-Path $geminiRoot '.local\python-path.txt'
+  if (Test-Path -LiteralPath $geminiPin -PathType Leaf) {
+    try {
+      $python = [IO.File]::ReadAllText($geminiPin).Trim()
+      if (-not [IO.Path]::IsPathFullyQualified($python) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw 'Configured Gemini Python interpreter is unavailable.'
+      }
+      $gemini = & $python -I (Join-Path $geminiRoot 'run.py') status | ConvertFrom-Json
+      if ($LASTEXITCODE -notin 0, 2 -or $gemini.status -notin 'ready', 'blocked') { throw 'Invalid Gemini helper status.' }
+      if ($gemini.enabled -and $gemini.blockers.Count) {
+        Add-Problem 'gemini-funding' ('Gemini jobs are paused: ' + ($gemini.blockers -join ', '))
+      } elseif ($gemini.enabled -and @($gemini.credits.grants | Where-Object {
+        [decimal]$_.balance_usd -gt 0 -and $_.days_to_expiration -le $ResetExpiryDays
+      }).Count) { Add-Problem 'gemini-funding' 'A recorded Gemini credit expires soon. Refresh both balances from Google Billing.' }
+      $old = @($gemini.unsettled_jobs | Where-Object {
+        $_.status -eq 'uncertain' -or [datetimeoffset]$_.created_at -lt [datetimeoffset]$now.AddHours(-$HoldHours)
+      })
+      if ($old.Count) { Add-Problem 'gemini-hold' "$($old.Count) Gemini reservation(s) need settlement with Google billing evidence." }
+    } catch { Add-Problem 'gemini-funding' "Could not read Gemini helper status ($($_.Exception.Message))" }
+  }
 }
 $serviceTask = Get-ScheduledTask -TaskName 'AgentCommonsV2' -ErrorAction SilentlyContinue
 if (-not $serviceTask) { Add-Problem 'service-task' 'the AgentCommonsV2 scheduled task is missing' }
@@ -204,6 +259,20 @@ if ($Destination) {
       elseif ($newest.LastWriteTimeUtc -lt $now.ToUniversalTime().AddHours(-26)) { Add-Problem 'backup' ("the newest database backup is from {0:g}" -f $newest.LastWriteTime) }
     }
   } catch { Add-Problem 'backup' "Could not inspect off-drive backups: $($_.Exception.Message)" }
+  # The task's result code does not survive the conhost/pwsh wrapper, so read the backup's own log: a run whose
+  # last status line is "failed: ..." is reported now, not only when a backup later ages past 26 hours. With a cloud
+  # destination a run ends at "cloud ok", so "off-drive ok" alone does not clear an earlier failure.
+  try {
+    $runLog = Join-Path $Destination '_offdrive-backup.log'
+    if ([IO.File]::Exists($runLog)) {
+      $ends = if ($CloudDestination) { 'failed|cloud ok' } else { 'failed|off-drive ok|cloud ok' }
+      $last = Get-Content -LiteralPath $runLog -Tail 5000 | Where-Object { $_ -match "^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d ($ends)" } | Select-Object -Last 1
+      if ($last -match '^(\S+) failed: (.*)$') {
+        $detail = $Matches[2]; if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) + '...' }
+        Add-Problem 'backup-run' "the last backup run failed at $($Matches[1]): $detail"
+      }
+    }
+  } catch { Add-Problem 'backup-run' "Could not read the backup run log: $($_.Exception.Message)" }
 }
 if ($CloudDestination) {
   try {

@@ -64,6 +64,7 @@ function sdkStore(t: TestContext) {
   );
   CREATE TABLE jobs (seq INTEGER PRIMARY KEY, id TEXT, route TEXT NOT NULL, status TEXT NOT NULL, consult_verdict TEXT, finished_at TEXT, created_at TEXT);
   CREATE TABLE projects (id TEXT PRIMARY KEY);
+  CREATE TABLE tasks (id TEXT PRIMARY KEY, depends_on TEXT NOT NULL DEFAULT '[]');
   CREATE TABLE usage_windows (route TEXT, pool TEXT, window TEXT, remaining_percent REAL, resets_at TEXT, observed_at TEXT, source TEXT);
   PRAGMA user_version=16;`);
   migrate(db);

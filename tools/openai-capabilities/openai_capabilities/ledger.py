@@ -203,13 +203,13 @@ class Ledger:
         return {"spent_microusd": max(0, self._all_spent(db) - baseline["local_spent_baseline"]),
                 "reserved_microusd": pending}
 
-    def _prepaid_cost_position(self, db, funding, now):
+    def _prepaid_cost_position(self, db, funding, now, *, allow_stale_costs=False):
         totals = self._prepaid_totals(db, funding)
         evidence = self._setting(db, "account_costs")
         if not evidence or evidence.get("funding_window_id") != funding_identity(funding):
             raise PolicyError("account_costs_unverified", "Refresh supported account costs before each new billable job")
         snapshot = evidence["snapshot"]
-        account = self._validate_account_costs(snapshot, funding, now)
+        account = self._validate_account_costs(snapshot, funding, now, allow_stale_costs=allow_stale_costs)
         baseline = funding["account_cost_baseline"]
         # An API observation after the balance could include intervening spending.
         # Count the full queried window when the observations cannot be aligned.
@@ -244,8 +244,8 @@ class Ledger:
         week_micros = WEEKLY_BUDGET_DAYS * 86400 * 1_000_000
         return (micros + week_micros - 1) // week_micros
 
-    def _weekly_grant_schedule(self, db, funding, now, window_start):
-        totals, _evidence, _snapshot, consumed = self._prepaid_cost_position(db, funding, now)
+    def _weekly_grant_schedule(self, db, funding, now, window_start, *, allow_stale_costs=False):
+        totals, _evidence, _snapshot, consumed = self._prepaid_cost_position(db, funding, now, allow_stale_costs=allow_stale_costs)
         committed = consumed + totals["reserved_microusd"]
         allocation = min(self._weekly_usd_floor(funding["allocation_usd"]),
                          sum(self._weekly_usd_floor(grant["balance_usd"]) for grant in funding["grants"]))
@@ -283,7 +283,7 @@ class Ledger:
             "FROM jobs WHERE created_at>=? AND created_at<?", (start_utc, reset_utc)).fetchone()
         return row[0], row[1]
 
-    def _weekly_budget_candidate(self, db, funding, now):
+    def _weekly_budget_candidate(self, db, funding, now, *, allow_stale_costs=False):
         if funding.get("funding_policy") != "existing_prepaid_only":
             return None, 0, False
         stored = self._setting(db, WEEKLY_BUDGET_STATE_KEY)
@@ -331,7 +331,7 @@ class Ledger:
                     or timestamp(state.get("reset_at"), "weekly reset") != reset.astimezone(timezone.utc)):
                 raise PolicyError("weekly_budget_state_invalid", "The saved weekly window does not match its activation anchor")
         else:
-            cap, contributions = self._weekly_grant_schedule(db, funding, now, start)
+            cap, contributions = self._weekly_grant_schedule(db, funding, now, start, allow_stale_costs=allow_stale_costs)
             state = {
                 "schema_version": WEEKLY_BUDGET_SCHEMA,
                 "activated_at": anchor.isoformat(),
@@ -346,12 +346,12 @@ class Ledger:
         current = spent + held
         return state, current, activation_pending
 
-    def _weekly_budget_status(self, db, funding, now):
+    def _weekly_budget_status(self, db, funding, now, *, allow_stale_costs=False):
         if funding.get("funding_policy") != "existing_prepaid_only":
             return None
         try:
-            state, current, activation_pending = self._weekly_budget_candidate(db, funding, now)
-            global_available = self._prepaid_available(db, funding, now)
+            state, current, activation_pending = self._weekly_budget_candidate(db, funding, now, allow_stale_costs=allow_stale_costs)
+            global_available = self._prepaid_available(db, funding, now, allow_stale_costs=allow_stale_costs)
             weekly_remaining = state["weekly_limit_microusd"] - current
             available = max(0, min(weekly_remaining, global_available))
             start = timestamp(state["window_start"], "weekly window start")
@@ -444,7 +444,7 @@ class Ledger:
             raise PolicyError("hard_limit_unverified", f"The {scope} monthly hard limit must be positive")
         return amount, source
 
-    def _validate_account_costs(self, snapshot, funding, now):
+    def _validate_account_costs(self, snapshot, funding, now, *, allow_stale_costs=False):
         if not isinstance(snapshot, dict) or snapshot.get("source") != "official_admin_api" or snapshot.get("status") != "observed":
             raise PolicyError("account_costs_unverified", "Refresh supported organization Costs and enforced limits before a new submission")
         for key in ("organization_id", "project_id"):
@@ -456,7 +456,7 @@ class Ledger:
         baseline = funding["account_cost_baseline"]
         if start != timestamp(baseline["window_start"]) or end < timestamp(baseline["observed_at"]) or end > observed:
             raise PolicyError("account_cost_window_mismatch", "Account-cost evidence does not extend the verified baseline window")
-        if observed > now or (now - end).total_seconds() > account_cost_max_age(self.policy):
+        if observed > now or ((now - end).total_seconds() > account_cost_max_age(self.policy) and not allow_stale_costs):
             raise PolicyError("account_costs_stale", "Refresh account costs immediately before submitting new work")
         amount = decimal_amount(snapshot.get("cost_total_usd"), "account cost_total_usd")
         if amount < decimal_amount(baseline["cost_total_usd"]):
@@ -522,8 +522,8 @@ class Ledger:
                 return timestamp(funding["platform_limit_reset_at"])
             return self._effective_cycle_reset(db, funding, now)
 
-    def _prepaid_available(self, db, funding, now):
-        totals, evidence, snapshot, consumed = self._prepaid_cost_position(db, funding, now)
+    def _prepaid_available(self, db, funding, now, *, allow_stale_costs=False):
+        totals, evidence, snapshot, consumed = self._prepaid_cost_position(db, funding, now, allow_stale_costs=allow_stale_costs)
         baseline = funding["account_cost_baseline"]
         margin = 1 - decimal_amount(self.policy.get("allocation_margin", "0.05"))
         available = usd_to_microusd(decimal_amount(funding["allocation_usd"]) * margin) - consumed - totals["reserved_microusd"]
@@ -609,6 +609,20 @@ class Ledger:
         if type(limit) is not int or not 1 <= limit <= 8:
             raise PolicyError('sync_capacity_invalid', 'max_sync_jobs must be an operator-configured integer from 1 through 8')
         return limit
+
+    def weekly_budget_display(self):
+        """Weekly budget for display (Agent Commons paces the prepaid grant by it). A stale Costs read is tolerated
+        here only; admission keeps the freshness check, since every submission refreshes Costs first."""
+        with self._db() as db:
+            funding = self._setting(db, "funding", {})
+            now = datetime.now(timezone.utc)
+            weekly = self._weekly_budget_status(db, funding, now)
+            if weekly and weekly.get("error_code") == "account_costs_stale":
+                # Only this display call tolerates stale Costs; admission paths never pass the flag.
+                weekly = self._weekly_budget_status(db, funding, now, allow_stale_costs=True)
+                if weekly and weekly.get("status") != "unverified":
+                    weekly["display_from_stale_costs"] = True
+            return weekly
 
     def status(self):
         with self._db() as db:

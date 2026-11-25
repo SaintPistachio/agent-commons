@@ -116,11 +116,13 @@ export const claude: PlatformAdapter = {
       ? cli.command(ctx.selected.path, ctx.options) : undefined;
     if (command) {
       const live = await readClaudeUsage(command);
-      if (live) return live;
+      if (live) return { ...live, completeInventory: !live.partial && live.rows.some(row => row.pool === 'default') };
     }
     const statePath = ctx.overrides.claudeStatePath !== undefined ? ctx.overrides.claudeStatePath
       : ctx.options.claude ? null : undefined;
-    return readClaudeCachedUsage(statePath);
+    const cached = await readClaudeCachedUsage(statePath);
+    if (!cached) ctx.onUsageError?.({ kind: command ? 'usage_unreadable' : 'cli_too_old_and_no_cache', method: '/usage', at: new Date().toISOString() });
+    return cached;
   },
   routeQuotaWindows: rows => rows.filter(row => !row.pool.startsWith('claude / ')),
   reopenedQuotaPools(rows, known) {

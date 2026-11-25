@@ -98,4 +98,14 @@ process.stdout.write(${JSON.stringify(JSON.stringify(credits))});
   assert.deepEqual(openAICreditUsage({ observed_balance_usd: '0' }).rows, [{
     pool: 'prepaid', window: 'grant', remaining_percent: null, resets_at: null,
   }]);
+  // The helper's weekly spend budget becomes a paced row (display figures; the helper still admits each request).
+  const weekly = openAICreditUsage({ observed_balance_usd: '90', spendable_estimate_after_reservations_usd: '90',
+    weekly_budget: { status: 'active', weekly_limit_usd: '20', available_for_new_requests_usd: '15', reset_at: '2030-01-08T04:00:00-06:00',
+      display_from_stale_costs: true } });
+  assert.deepEqual(weekly.rows[1], { pool: 'prepaid', window: 'weekly', remaining_percent: 75, resets_at: '2030-01-08T10:00:00.000Z' });
+  assert.match(weekly.source, /this week \$15 of \$20 \(from the last Costs read\)/);
+  assert.equal(openAICreditUsage({ observed_balance_usd: '90', weekly_budget: { status: 'active', weekly_limit_usd: '0', reset_at: '2030-01-08T10:00:00Z' } }).rows.length, 1);
+  // The weekly row never makes the route look exhausted: its cap is advisory.
+  assert.deepEqual(openaiApi.routeQuotaWindows!(weekly.rows.map(row => ({ ...row, route: 'openai-api', observed_at: '', source: '', stale: false })))
+    .map(row => row.window), ['grant']);
 });

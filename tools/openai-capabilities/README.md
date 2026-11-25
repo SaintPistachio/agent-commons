@@ -7,5 +7,5 @@ The `examples/` directory contains synthetic request templates for Responses, De
 `demo_embedding_index.py` reads a completed synthetic embedding artifact and builds a small local similarity index. It makes zero API calls.
 
 ```powershell
-python tools/openai-capabilities/demo_embedding_index.py --embedding-artifact C:/Temp/example-vectors.json --output C:/Temp/example-index.json
+python tools/openai-capabilities/demo_embedding_index.py --embedding-artifact C:/ExampleWorkspace/example-vectors.json --output C:/ExampleWorkspace/example-index.json
 ```

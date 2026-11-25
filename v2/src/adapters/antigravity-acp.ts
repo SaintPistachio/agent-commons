@@ -285,6 +285,11 @@ function isAuthError(code: unknown, message: string): boolean {
   return code === -32000 || /\b(auth|sign.?in|log.?in|unauthorized|credentials)\b/i.test(message);
 }
 
+function retryableSessionStart(error: Record<string, unknown>): boolean {
+  const message = typeof error.message === 'string' ? error.message.trim() : '';
+  return !isAuthError(error.code, message) && /^failed to start antigravity conversation[.!]?$/i.test(message);
+}
+
 export function probeAntigravityAcp(
   command: RouteCommand,
   timeoutMs = 20_000,
@@ -332,6 +337,7 @@ export function probeAntigravityAcp(
     };
 
     let initResult: unknown;
+    let sessionRequestId = 2;
 
     child.on('error', (error: NodeJS.ErrnoException) => {
       if (successResult) return done(successResult);
@@ -366,10 +372,15 @@ export function probeAntigravityAcp(
             });
           }
           initResult = msg.result;
-          send(2, 'session/new', { cwd: command.cwd ?? os.tmpdir(), mcpServers: [] });
-        } else if (msg.id === 2) {
+          send(sessionRequestId, 'session/new', { cwd: command.cwd ?? os.tmpdir(), mcpServers: [] });
+        } else if (msg.id === sessionRequestId) {
           const err = record(msg.error);
           if (err) {
+            if (sessionRequestId === 2 && retryableSessionStart(err)) {
+              sessionRequestId = 4;
+              send(sessionRequestId, 'session/new', { cwd: command.cwd ?? os.tmpdir(), mcpServers: [] });
+              continue;
+            }
             const m = String(err.message ?? 'session/new error');
             return done({
               ok: false,
@@ -428,10 +439,12 @@ function resolveTargetModelAndEffort(
 
   if (typeof job.model === 'string' && job.model.trim()) {
     const raw = job.model.trim();
+    const split = splitAcpModelId(raw);
+    // An advertised exact variant selects its effort even when the job profile supplied a default.
+    if (split.effort && snapshot.availableModels.some(entry => entry.modelId === raw)) targetEffort = split.effort;
     if (modelSet.has(raw)) {
       targetModel = raw;
     } else {
-      const split = splitAcpModelId(raw);
       targetModel = split.family;
       targetEffort ??= split.effort;
     }
@@ -506,7 +519,11 @@ export function launchAntigravityAcp(
   }
 
   let finished = false;
-  let promptSubmitted = false;
+  const startedAt = performance.now();
+  const deadline = startedAt + job.timeout_ms;
+  let stage = 'initialize';
+  let sessionAttempts = 0;
+  let promptDispatchedAt: number | undefined;
   let sessionId: string | undefined;
   let snapshot: AcpProbeSnapshot | undefined;
   let selectedModel: string | undefined;
@@ -525,6 +542,7 @@ export function launchAntigravityAcp(
   };
 
   const request = (method: string, params: unknown, onReply: (msg: Record<string, unknown>) => void) => {
+    stage = method;
     const id = nextId++;
     pending.set(id, onReply);
     sendRaw({ jsonrpc: '2.0', id, method, params });
@@ -570,6 +588,10 @@ export function launchAntigravityAcp(
       model: selectedModel ?? null,
       effort: selectedEffort ?? null,
       response_chars: collectedText.length,
+      stage,
+      session_attempts: sessionAttempts,
+      elapsed_ms: Math.round(performance.now() - startedAt),
+      ...(promptDispatchedAt === undefined ? {} : { prompt_wait_ms: Math.round(performance.now() - promptDispatchedAt) }),
       ...summaryExtra,
     });
     try { child.stdin?.end(); } catch { /* ignore */ }
@@ -624,7 +646,8 @@ export function launchAntigravityAcp(
   };
 
   const runPrompt = () => {
-    promptSubmitted = true;
+    if (finished || active.reason || ctx.active() !== active || performance.now() >= deadline) return;
+    promptDispatchedAt = performance.now();
     request('session/prompt', { sessionId, prompt: [{ type: 'text', text: job.prompt }] }, msg => {
       const err = record(msg.error);
       if (err) {
@@ -653,7 +676,9 @@ export function launchAntigravityAcp(
       if (sessionId) sendRaw({ jsonrpc: '2.0', id: nextId++, method: 'session/close', params: { sessionId } });
 
       if (stopReason === 'cancelled' || active.reason === 'CANCELLED') {
-        const errText = 'CANCELLED: prompt may have been submitted, so it is never replayed';
+        const errText = active.reason === 'TIMEOUT'
+          ? 'TIMEOUT: Antigravity did not return a result before the deadline; the prompt may have been submitted, so it is never replayed'
+          : 'CANCELLED: prompt may have been submitted, so it is never replayed';
         return finalize('needs_review', { exit_code: 0, error: errText }, undefined, { stopReason, error: errText });
       }
 
@@ -742,7 +767,7 @@ export function launchAntigravityAcp(
     clearTimeout(timer);
     try { fs.closeSync(stderrFd); } catch { /* ignore */ }
     if (finished || ctx.active() !== active) return;
-    if (!promptSubmitted) {
+    if (promptDispatchedAt === undefined) {
       const status = active.reason === 'CANCELLED' ? 'cancelled' : 'failed';
       const errText = `${active.reason ?? 'ACP_BEFORE_SUBMISSION'}: exited (${code ?? 'null'})`;
       return finalize(status, { exit_code: code, error: errText }, undefined, { error: errText });
@@ -752,6 +777,23 @@ export function launchAntigravityAcp(
   });
 
   let initResult: unknown;
+  const openSession = () => {
+    if (finished || active.reason || promptDispatchedAt !== undefined || performance.now() >= deadline) return;
+    sessionAttempts++;
+    request('session/new', { cwd, mcpServers: [] }, sessMsg => {
+      if (finished || active.reason) return;
+      const error = record(sessMsg.error);
+      if (error) {
+        if (sessionAttempts === 1 && retryableSessionStart(error)) return openSession();
+        return failBeforePrompt(`ACP_BEFORE_SUBMISSION: session/new failed: ${String(error.message ?? 'error')}`);
+      }
+      const parsed = parseProbeSnapshot(initResult, sessMsg.result);
+      if (typeof parsed === 'string') return failBeforePrompt(`ACP_BEFORE_SUBMISSION: ${parsed}`);
+      sessionId = String(record(sessMsg.result)!.sessionId);
+      snapshot = parsed;
+      applyConfigAndPrompt(parsed);
+    });
+  };
   request(
     'initialize',
     {
@@ -763,15 +805,7 @@ export function launchAntigravityAcp(
       const err = record(initMsg.error);
       if (err) return failBeforePrompt(`ACP_BEFORE_SUBMISSION: initialize failed: ${String(err.message ?? 'error')}`);
       initResult = initMsg.result;
-      request('session/new', { cwd, mcpServers: [] }, sessMsg => {
-        const serr = record(sessMsg.error);
-        if (serr) return failBeforePrompt(`ACP_BEFORE_SUBMISSION: session/new failed: ${String(serr.message ?? 'error')}`);
-        const parsed = parseProbeSnapshot(initResult, sessMsg.result);
-        if (typeof parsed === 'string') return failBeforePrompt(`ACP_BEFORE_SUBMISSION: ${parsed}`);
-        sessionId = String(record(sessMsg.result)!.sessionId);
-        snapshot = parsed;
-        applyConfigAndPrompt(parsed);
-      });
+      openSession();
     },
   );
 }

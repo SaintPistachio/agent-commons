@@ -91,3 +91,29 @@ test('Watch-AcHealth flags Codex banked resets expiring within ResetExpiryDays a
   const second = JSON.parse(fs.readFileSync(path.join(dir, HEALTH_FILE), 'utf8'));
   assert.ok(!second.problems.some((p: any) => p.id === 'codex-reset-expiry'), 'reset expiring in 10 days is not flagged');
 });
+
+test('Watch-AcHealth reports a backup run whose last status line failed, and clears it after a good run', t => {
+  if (process.platform !== 'win32') return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-watch-backup-run-'));
+  const backupDir = path.join(dir, 'backups'); fs.mkdirSync(backupDir);
+  new Store(dir).close();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const runLog = path.join(backupDir, '_offdrive-backup.log');
+  const script = fileURLToPath(new URL('../scripts/automation/Watch-AcHealth.ps1', import.meta.url));
+  const cloudDir = path.join(dir, 'cloud'); fs.mkdirSync(cloudDir);
+  const run = (cloud = false) => {
+    execFileSync('pwsh', ['-NoProfile', '-File', script, '-DataRoot', dir, '-Destination', backupDir, '-Url', 'http://127.0.0.1:1', '-NoToast',
+      ...(cloud ? ['-CloudDestination', cloudDir] : [])], { stdio: 'pipe' });
+    return JSON.parse(fs.readFileSync(path.join(dir, HEALTH_FILE), 'utf8')).problems.find((p: any) => p.id === 'backup-run');
+  };
+  const failed = '2026-11-25T02:30:04 off-drive ok: copied\n2026-11-25T02:30:09 failed: cli.ts bundle command failed (exit 1)\n';
+  fs.writeFileSync(runLog, failed + 'continuation\n'.repeat(60));
+  assert.match(run()?.text ?? '', /last backup run failed at 2026-11-25T02:30:09: cli\.ts bundle command failed/, 'found past later non-status lines');
+
+  // With a cloud destination the off-drive step alone does not clear the failure; the cloud step does.
+  fs.appendFileSync(runLog, '2026-11-25T10:20:00 off-drive ok: copied\n');
+  assert.ok(run(true), 'cloud step of the new run has not finished');
+  assert.equal(run(), undefined, 'without a cloud destination the off-drive step ends the run');
+  fs.appendFileSync(runLog, '2026-11-25T10:20:20 cloud ok: verified x\n');
+  assert.equal(run(true), undefined);
+});

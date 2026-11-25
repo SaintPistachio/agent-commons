@@ -13,6 +13,8 @@ import { patchCheckArgs, resolvePatchCheck, runPatchCheck } from '../src/patch-c
 import type { RunnerOptions } from '../src/adapters/types.ts';
 import { patchWorktreeExecutables } from '../src/adapters/shared.ts';
 import { turnRequestId } from '../src/adapters/openai-api-tools.ts';
+import { renderProjectTasks } from '../src/viewer.ts';
+import { overlappingEditScope } from '../src/task-prerequisites.ts';
 
 function fixture(t: TestContext) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ac-patch-edit-'));
@@ -92,6 +94,88 @@ test('all four adapters revise a patch against refreshed context, with the main 
     assert.equal(paid.cost_usd, '0.020000250');
     assert.equal(paid.tokens_in, 42);
   } finally { runner.stop(); }
+});
+
+test('Git prerequisites require an integrated commit and pin both native and patch edit worktrees', async t => {
+  const f = fixture(t);
+  const tx = (packet: string) => f.call('air_tx', { project_id: f.project.id, packet: '@air1\n' + packet });
+  const created = tx('#0 tnew "Prerequisite"\n#1 tnew deps=#0:git "Dependent"\n#2 tclm t=#0 v=1\n#3 tclm t=#1 v=1');
+  const prerequisite = created.handles[0].split('@')[0], dependent = created.handles[1].split('@')[0];
+  assert.equal(f.call('task_read', { task_id: dependent }).task.status, 'blocked');
+  tx(`#0 tupd t=${prerequisite} v=2 st=rev`);
+  assert.match(f.call('air_get', { handles: dependent }).air, /awaiting review/);
+  assert.match(renderProjectTasks(f.store.db, 1)!, /awaiting review/);
+  const linked = { task_id: dependent };
+  assert.throws(() => f.submit('invalid-route', linked), new RegExp(`${prerequisite} \\(awaiting review\\)`));
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM jobs').get()!.n, 0);
+  assert.equal(fs.existsSync(path.join(f.home, 'worktrees')), false);
+  tx(`#0 tupd t=${prerequisite} v=3 st=done`);
+  assert.match(renderProjectTasks(f.store.db, 1)!, /awaiting integration commit/);
+  assert.throws(() => f.submit('claude', linked), /awaiting integration commit/);
+  f.git('checkout', '-qb', 'prerequisite');
+  fs.writeFileSync(path.join(f.repo, 'integrated.txt'), 'integrated source\n');
+  f.git('add', 'integrated.txt');
+  f.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'integrate prerequisite');
+  const integrated = f.git('rev-parse', 'HEAD');
+  tx(`#0 tupd t=${prerequisite} v=4 integrated_rev=${integrated}`);
+  f.git('checkout', '--detach', f.base);
+  assert.match(f.call('air_get', { handles: dependent }).air, /integration commit missing from base/);
+  assert.match(renderProjectTasks(f.store.db, 1)!, /integration commit missing from base/);
+  assert.throws(() => f.submit('claude', linked), /integration commit missing from base/);
+  f.git('checkout', 'prerequisite');
+  const patch = f.submit('claude', linked);
+  const native = f.call('job_submit', { project_id: f.project.id, route: 'claude', mode: 'edit', prompt: 'EDIT a file', ...linked }).job;
+  assert.equal(patch.options.patch_edit.base, integrated);
+  assert.equal(native.options.edit_base, integrated);
+  f.git('checkout', '--detach', f.base);
+  f.store.db.prepare('UPDATE projects SET approved_git_dir=NULL WHERE id=?').run(f.project.id);
+  assert.match(renderProjectTasks(f.store.db, 1, 'j2')!, /job j2's base/);
+  assert.doesNotMatch(renderProjectTasks(f.store.db, 1, 'j2')!, /integration commit missing from base/);
+  const runner = f.makeRunner();
+  runner.start();
+  try {
+    for (const original of [patch, native]) {
+      const job = await f.untilDone(original.id);
+      assert.equal(job.status, 'completed', job.error);
+      assert.equal(job.base_revision, integrated);
+    }
+  } finally { runner.stop(); }
+});
+
+test('a prerequisite reopened after submission prevents dispatch and clears integration evidence', async t => {
+  const f = fixture(t);
+  const tx = (packet: string) => f.call('air_tx', { project_id: f.project.id, packet: '@air1\n' + packet });
+  const r = tx(`#0 tnew "A"\n#1 tnew deps=#0:git "B"\n#2 tclm t=#0 v=1\n#3 tupd t=#0 v=2 st=done integrated_rev=${f.base}`);
+  const prerequisite = r.handles[0].split('@')[0], dependent = r.handles[1].split('@')[0];
+  const job = f.submit('claude', { task_id: dependent });
+  tx(`#0 tupd t=${prerequisite} v=3 st=open`);
+  assert.equal(f.call('task_read', { task_id: prerequisite }).task.integrated_revision, null);
+  const runner = f.makeRunner();
+  runner.start();
+  try {
+    const result = await f.untilDone(job.id);
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, new RegExp(`TASK_PREREQUISITES_BLOCKED.*${prerequisite}`));
+    assert.equal(result.workdir, null);
+    assert.equal(f.checkCalls.length, 0);
+  } finally { runner.stop(); }
+});
+
+test('job overlap warnings use repository paths and survive AIR replay', t => {
+  const f = fixture(t);
+  const first = f.call('job_submit', { project_id: f.project.id, route: 'claude', mode: 'edit', prompt: 'First', edit_paths: ['src/api/'] });
+  assert.equal(first.warnings, undefined);
+  const input = { operation_id: randomUUID(), project_id: f.project.id,
+    packet: '@air1\n#0 job route=claude mode=edit paths=src/api/routes.ts "Second"\n#1 job route=claude mode=edit paths=src/api2 "Sibling"' };
+  const r = f.call('air_tx', input);
+  const replay = f.call('air_tx', input);
+  assert.deepEqual(r.warnings, ['j2: j1 overlaps src/api/routes.ts']);
+  assert.deepEqual(replay.warnings, r.warnings);
+  assert.match(replay.air, /! edit_overlap.*j1 overlaps src\/api\/routes\.ts/);
+  assert.equal(overlappingEditScope('Src/API', 'src/api/routes.ts', true), 'src/api/routes.ts');
+  assert.equal(overlappingEditScope('Src/API', 'src/api/routes.ts', false), undefined);
+  assert.equal(overlappingEditScope('src/a', 'src/ab', true), undefined);
+  assert.throws(() => f.submit('claude', { edit_paths: ['../outside'] }), /repository-relative/);
 });
 
 test('AIR job requires an approved name and blocks a traversal patch before running the check', async t => {

@@ -104,10 +104,144 @@ export interface BundleRestoreResult {
   manifest: BundleManifest;
 }
 
+/**
+ * SHA-256 (latin1 bytes) of the exact credential-shaped test values in tracked v2 tests. Artifacts that quote those
+ * tests (staged diffs, audit context) would otherwise block every standard backup. Only an exact match is skipped:
+ * any other value of the same shape, or the same value with extra characters, still blocks.
+ * A private key counts as its whole bounded block (BEGIN through END), so a real key body never matches.
+ */
+export const KNOWN_TEST_CREDENTIAL_SHA256: ReadonlySet<string> = new Set([
+  'f23831a9dae8f307e06b33fbeaf4284fd6a3b6d32937e68d6de5ac925af41460', // v2/test/host-audit.test.ts fakeGhToken
+  '723d52e26bce28985493f7f873c46277d4d81b926a4d52e10344c413d361cc2d', // v2/test/ops.test.ts pk.txt RSA block
+]);
+const PRIVATE_KEY_BLOCK_MAX = 4096;
+/** How far after a quoted header a matching END or a key body line still counts as part of a key. */
+const PRIVATE_KEY_LOOKAHEAD = 65536;
+const PRIVATE_KEY_BODY_LOOKAHEAD = 4096;
+/** A quoted mention: a quote, backtick or bracket closes the BEGIN line at once. */
+const MENTION_CLOSE = /^[`'")\]]/;
+/**
+ * A key body line near a header: a base64 run that starts a line (after a real or escaped newline, a quote,
+ * bracket, comma, semicolon, tab or tag end) and ends one (newline, backslash, quote, comma, bracket, tag, dash),
+ * at least 40 characters or ending in = padding, mixing upper case, lower case and digits. Paths and words in
+ * prose start after a space or backtick, so they are not lines.
+ */
+const KEY_BODY_LINE = /(?:^|[\n\r\t"'[,;>]|\\[nr])([A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]{4,}={1,2})(?=$|[\n\r"'\\,\]<-])/g;
+const isKeyBodyLine = (run: string) => /[A-Z]/.test(run) && /[a-z]/.test(run) && /[0-9]/.test(run);
+/** A long base64 run inside prose: 40+ characters, two digits, mixed case, and not a path of words. */
+const KEY_BODY_IN_PROSE = /[A-Za-z0-9+/]{40,}/g;
+const PATH_WORD = /^(?:[a-z]+|[A-Z]?[a-z]+(?:[A-Z][a-z]+)*|[A-Z]+)[0-9]*$|^v?[0-9]+$/;
+const isPathLike = (run: string) => {
+  const segments = run.split('/');
+  return segments.length >= 3 && segments.every(segment => segment === '' || PATH_WORD.test(segment));
+};
+const isKeyBodyInProse = (run: string) => isKeyBodyLine(run) && (run.match(/[0-9]/g)?.length ?? 0) >= 2 && !isPathLike(run);
+
+/**
+ * True when text holds a credential-shaped value that is not one of the known tracked test values.
+ * mode 'block' (raw file bytes): every private-key BEGIN line without a bounded, allowlisted block is a key.
+ * mode 'tokens': API and chat tokens only, no private-key rule (the raw pass over a payload database).
+ * mode 'mention' (the logical text of a database, where stored values are contiguous): a BEGIN line without a
+ * bounded block passes only when a quote, backtick or bracket closes it at once, no matching END follows within
+ * 64 KB, and no key body line follows within 4 KB, so a header quoted in a review passes and a key does not.
+ */
+export function containsCredentialMaterial(text: string, known: ReadonlySet<string> = KNOWN_TEST_CREDENTIAL_SHA256,
+  mode: 'block' | 'mention' | 'tokens' = 'block'): boolean {
+  const pattern = /sk-(?:proj|admin)-[A-Za-z0-9_-]{70,}|ghp_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{20,}|\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])|\bAQ\.[0-9A-Za-z._~-]{36,}|-----BEGIN ((?:RSA |EC |OPENSSH )?PRIVATE KEY)-----/g;
+  for (const match of text.matchAll(pattern)) {
+    let value = match[0];
+    if (match[1] !== undefined) {
+      if (mode === 'tokens') continue;
+      const end = `-----END ${match[1]}-----`;
+      const after = match.index + value.length;
+      const at = text.indexOf(end, after);
+      if (at < 0 || at + end.length - match.index > PRIVATE_KEY_BLOCK_MAX) {
+        if (mode === 'block' || !MENTION_CLOSE.test(text.slice(after, after + 1))) return true;
+        if (at >= 0 && at - after <= PRIVATE_KEY_LOOKAHEAD) return true;
+        const near = text.slice(after, after + PRIVATE_KEY_BODY_LOOKAHEAD);
+        for (const run of near.matchAll(KEY_BODY_LINE)) if (isKeyBodyLine(run[1]) && !isPathLike(run[1])) return true;
+        for (const run of near.matchAll(KEY_BODY_IN_PROSE)) if (isKeyBodyInProse(run[0])) return true;
+        continue; // a quoted header with no key after it
+      }
+      value = text.slice(match.index, at + end.length);
+    }
+    if (!known.has(crypto.createHash('sha256').update(value, 'latin1').digest('hex'))) return true;
+  }
+  return false;
+}
+
+/** Payload databases that are compacted and then checked value by value instead of as raw bytes. */
+const STANDARD_DATABASES = new Set(['commons.sqlite', 'openai-helper/usage.sqlite3']);
+
+/** Largest per-table text a database scan holds at once; a bigger table fails closed. */
+const TABLE_SCAN_MAX_CHARS = 256 * 1024 * 1024;
+
+/**
+ * Rewrites a staged (never live) database with VACUUM so no free page keeps deleted text, then reports whether it
+ * holds a connection token or credential material. Three passes:
+ *  1. each cell (text, or blob as latin1) for connection tokens;
+ *  2. the schema SQL and each table as one text, cells and rows joined by newlines, in 'mention' mode, so a key
+ *     split across columns or rows still reads as a key; every sqlite_master table is read, FTS and shadow tables
+ *     included;
+ *  3. the compacted file's raw bytes in 'tokens' mode, which catches a token split across adjacent columns of one
+ *     record (the private-key rule is left to pass 2, because raw pages break values apart).
+ * The database must be UTF-8 so the raw pass sees text as stored. Any read error throws, so the caller fails closed.
+ */
+export function databaseHoldsCredentialMaterial(file: string, tokens: readonly Buffer[] = [],
+  known: ReadonlySet<string> = KNOWN_TEST_CREDENTIAL_SHA256): boolean {
+  const db = new DatabaseSync(file);
+  try {
+    db.exec('PRAGMA journal_mode=DELETE; VACUUM');
+    if (db.prepare('PRAGMA freelist_count').get()?.freelist_count !== 0) throw new Error(`free pages remain in ${file}`);
+    if (db.prepare('PRAGMA encoding').get()?.encoding !== 'UTF-8') throw new Error(`${file} is not UTF-8`);
+    const asText = (value: unknown): string | undefined => {
+      if (value === null || typeof value === 'number' || typeof value === 'bigint') return undefined;
+      return typeof value === 'string' ? value : Buffer.from(value as Uint8Array).toString('latin1');
+    };
+    const hasToken = (value: unknown): boolean => {
+      if (!tokens.length || value === null || typeof value === 'number' || typeof value === 'bigint') return false;
+      const bytes = typeof value === 'string' ? Buffer.from(value, 'utf8') : Buffer.from(value as Uint8Array);
+      return tokens.some(token => bytes.includes(token));
+    };
+    const schemaRows = db.prepare('SELECT sql FROM sqlite_master').all();
+    if (schemaRows.some(row => hasToken(row.sql))) return true;
+    const schema = schemaRows.map(row => asText(row.sql) ?? '').join('\n');
+    if (containsCredentialMaterial(schema, known, 'mention')) return true;
+    const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+    for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]) {
+      const rows = db.prepare(`SELECT * FROM ${quote(name)}`);
+      rows.setReturnArrays(true);
+      rows.setReadBigInts(true);
+      const parts: string[] = [];
+      let size = 0;
+      for (const row of rows.iterate() as Iterable<unknown[]>) {
+        const fields: string[] = [];
+        for (const value of row) {
+          if (hasToken(value)) return true;
+          const text = asText(value);
+          if (text === undefined) continue;
+          size += text.length + 1;
+          if (size > TABLE_SCAN_MAX_CHARS) throw new Error(`table ${name} is too large to scan`);
+          parts.push(text);
+          fields.push(text);
+        }
+        // A token split across adjacent fields of one row, wherever the file's pages happen to break.
+        if (fields.length > 1) {
+          const joined = fields.join('');
+          if (hasToken(joined) || containsCredentialMaterial(joined, known, 'tokens')) return true;
+        }
+      }
+      if (containsCredentialMaterial(parts.join('\n'), known, 'mention')) return true;
+    }
+  } finally {
+    db.close();
+  }
+  return containsCredentialMaterial(fs.readFileSync(file).toString('latin1'), known, 'tokens');
+}
+
 function checkStandardPayload(home: string, payloadDir: string, files: string[]): void {
   const connections = path.join(home, 'connections');
   const tokens: Buffer[] = [];
-  const pattern = /(?:sk-(?:proj|admin)-[A-Za-z0-9_-]{70,}|ghp_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/;
   try {
     if (fs.existsSync(connections)) {
       for (const entry of fs.readdirSync(connections, { withFileTypes: true })) {
@@ -117,8 +251,20 @@ function checkStandardPayload(home: string, payloadDir: string, files: string[])
       }
     }
     for (const relative of files) {
-      const contents = fs.readFileSync(path.join(payloadDir, relative));
-      if (tokens.some(token => contents.includes(token)) || pattern.test(contents.toString('latin1'))) {
+      const full = path.join(payloadDir, relative);
+      let found: boolean;
+      if (STANDARD_DATABASES.has(relative)) {
+        // Raw database bytes split values across pages and keep journal/free-page leftovers, so a header quoted in a
+        // review looks like a truncated key. Scan the compacted copy cell by cell; then also check the final bytes
+        // for connection tokens.
+        try { found = databaseHoldsCredentialMaterial(full, tokens); }
+        catch (error) { fail('CREDENTIAL_SCAN_FAILED', 500, `Could not scan ${relative} for credentials (${(error as Error).message}); cloud archive was not created`); }
+        found ||= tokens.some(token => fs.readFileSync(full).includes(token));
+      } else {
+        const contents = fs.readFileSync(full);
+        found = tokens.some(token => contents.includes(token)) || containsCredentialMaterial(contents.toString('latin1'));
+      }
+      if (found) {
         fail('CREDENTIAL_IN_STANDARD_BACKUP', 400, `Sensitive credential material detected in ${relative}; cloud archive was not created`);
       }
     }

@@ -207,7 +207,8 @@ def profile_headroom(profile, quota, registry):
         rows[key] = amount
     required = {(r["group"], r["limit"]) for r in profile["quota_limits"]}
     if not required.issubset(rows):
-        _fail("QUOTA_UNKNOWN", "An applicable verified quota limit is missing.")
+        # A window the CLI no longer reports (Gemini 4 Argon, Nov 2026) closes only the profiles that need it.
+        _fail("QUOTA_LIMIT_MISSING", "An applicable verified quota limit is missing.")
     return min(rows[key] for key in required)
 
 
@@ -231,13 +232,18 @@ def assignment_options(models, quota, registry):
     for profile in sorted(_profiles(registry).values(), key=lambda p: p["model"]):
         if profile["model"] not in models or profile["family"].startswith("gpt-oss"):
             continue
-        capacity = profile_headroom(profile, quota, registry)
+        try:
+            capacity, blocker = profile_headroom(profile, quota, registry), None
+        except RegistryError as exc:
+            if exc.code != "QUOTA_LIMIT_MISSING":
+                raise
+            capacity, blocker = 0, "quota_limit_missing"
         tasks = families.setdefault(profile["family"], {})
         for task in profile["tasks"]:
             tasks.setdefault(task, []).append({
                 "model": profile["model"], "effort": profile["effort"],
                 "group": profile["group"], "headroom_percent": capacity,
-                "available": capacity > 0,
+                "available": capacity > 0, **({"blocker": blocker} if blocker else {}),
             })
     return [{"family": family, "tasks": tasks} for family, tasks in sorted(families.items())]
 
@@ -282,7 +288,8 @@ def select(task, models, quota, registry, override=None, effort=None, previous=N
                 if capacity > 0:
                     eligible.append((capacity, -p["task_preferences"][task], p))
             except RegistryError as exc:
-                errors.append(exc)
+                if exc.code != "QUOTA_LIMIT_MISSING":
+                    errors.append(exc)
     if not eligible:
         if errors:
             raise errors[0]
@@ -309,7 +316,8 @@ def select_probe(group, purpose, models, quota, registry):
             try:
                 capacity = profile_headroom(profile, quota, registry)
             except RegistryError as exc:
-                errors.append(exc)
+                if exc.code != "QUOTA_LIMIT_MISSING":
+                    errors.append(exc)
                 continue
             if capacity > 0:
                 eligible.append((capacity, model, profile))

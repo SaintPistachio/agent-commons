@@ -23,7 +23,7 @@ RESET = "2026-11-21T00:00:00Z"
 class FixedDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
-        return cls(2026, 11, 20, tzinfo=timezone.utc).astimezone(tz)
+        return cls(2026, 11, 22, tzinfo=timezone.utc).astimezone(tz)
 
 
 def usage_text(gemini_week=1, gemini_five=100, claude_week=73, argon_week=90):
@@ -127,6 +127,30 @@ class UsagePoolsTest(unittest.TestCase):
             ag._select_acceptance_probe(self.probe_selector(quota, calls))
         self.assertEqual(caught.exception.code, "NO_ELIGIBLE_MODEL")
         self.assertEqual(calls, [GEMINI, ARGON])
+
+    def four_row_quota(self, gemini_week=55):
+        # agy 1.5.17 (2026-11-25) no longer prints the Gemini 4 Argon weekly row.
+        text = "\n".join(line for line in usage_text(gemini_week=gemini_week).splitlines() if not line.startswith(ARGON))
+        return ag.parse_quota(text)
+
+    def test_missing_argon_row_closes_only_argon_profiles(self):
+        quota = self.four_row_quota()
+        options = registry.assignment_options(self.models, quota, self.routing)
+        entries = [entry for family in options for rows in family["tasks"].values() for entry in rows]
+        argon = [e for e in entries if e["group"] == ARGON]
+        self.assertTrue(argon)
+        self.assertTrue(all(not e["available"] and e["blocker"] == "quota_limit_missing" for e in argon))
+        self.assertTrue(any(e["available"] for e in entries if e["group"] == GEMINI))
+        self.assertEqual(registry.select("coding", self.models, quota, self.routing)["group"] in (GEMINI, CLAUDE), True)
+
+    def test_missing_argon_row_skips_argon_probe_group(self):
+        calls = []
+        with self.assertRaises(ag.HelperError) as caught:
+            ag._select_acceptance_probe(self.probe_selector(self.four_row_quota(gemini_week=0), calls))
+        self.assertEqual(caught.exception.code, "NO_ELIGIBLE_MODEL")
+        self.assertEqual(calls, [GEMINI, ARGON])
+        calls.clear()
+        self.assertEqual(ag._select_acceptance_probe(self.probe_selector(self.four_row_quota(), calls))["group"], GEMINI)
 
     def test_probe_does_not_skip_unknown_quota(self):
         calls = []

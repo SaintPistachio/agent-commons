@@ -1,4 +1,4 @@
 # Install from PyPI wheels; the SDK's supported transport is httpx2.
-# Official SDK, Apache-2.0. Verified by AC on 2026-11-20 (tests + dry run).
-openai==3.57.0
+# Official SDK, Apache-2.0. Verified by AC on 2026-11-24 (tests + dry run).
+openai==3.58.0
 tzdata==2026.6

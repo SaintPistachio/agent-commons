@@ -8,8 +8,8 @@ import { listedTools } from '../src/tools.ts';
 
 const source = (file: string) => fs.readFileSync(fileURLToPath(new URL(`../src/${file}`, import.meta.url)), 'utf8');
 
-test('the registry lists the four routes, claude first, with consistent capabilities', () => {
-  assert.deepEqual(adapterIds(), ['claude', 'codex', 'openai-api', 'antigravity']);
+test('the registry lists the five routes, claude first, with consistent capabilities', () => {
+  assert.deepEqual(adapterIds(), ['claude', 'codex', 'openai-api', 'antigravity', 'gemini-api']);
   assert.equal(DEFAULT_ROUTE, 'auto');
   for (const a of allAdapters()) {
     const c = a.capabilities;
@@ -17,8 +17,8 @@ test('the registry lists the four routes, claude first, with consistent capabili
     assert.equal(adapter(c.id), a);
   }
   // Only the paid route can spend money, and only it asks its platform for outcomes after a restart.
-  assert.deepEqual(allAdapters().filter(a => a.capabilities.billing === 'paid').map(a => a.capabilities.id), ['openai-api']);
-  assert.deepEqual(allAdapters().filter(a => a.reconcile).map(a => a.capabilities.id), ['openai-api']);
+  assert.deepEqual(allAdapters().filter(a => a.capabilities.billing === 'paid').map(a => a.capabilities.id), ['openai-api', 'gemini-api']);
+  assert.deepEqual(allAdapters().filter(a => a.reconcile).map(a => a.capabilities.id), ['openai-api', 'gemini-api']);
 });
 
 test('job_submit offers exactly the registered routes', () => {

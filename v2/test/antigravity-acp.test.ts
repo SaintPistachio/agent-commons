@@ -41,6 +41,8 @@ function writeFakeAcpServer(dir: string): string {
     let currentEffort = 'high';
     let currentMode = 'default';
     let pendingToolPermId = 100;
+    let sessionStarts = 0;
+    let timedPromptId;
     const rl = readline.createInterface({ input: process.stdin });
 
     rl.on('line', line => {
@@ -58,6 +60,10 @@ function writeFakeAcpServer(dir: string): string {
         });
       }
       if (msg.method === 'session/new') {
+        record({ sessionStart: ++sessionStarts });
+        if (mode === 'start-fails' || (mode === 'start-retry' && sessionStarts === 1)) {
+          return send({jsonrpc: '2.0', id: msg.id, error: {code: -32603, message: 'Failed to start Antigravity conversation'}});
+        }
         if (mode === 'auth-error') {
           return send({
             jsonrpc: '2.0',
@@ -77,6 +83,7 @@ function writeFakeAcpServer(dir: string): string {
                 { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
                 { modelId: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
                 { modelId: 'gemini-4-hydrogen-low', name: 'Gemini 4 Hydrogen (Low)' },
+                { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
                 { modelId: 'claude-sonnet-5-5-high', name: 'Claude Sonnet 5.5 (High)' },
                 { modelId: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
                 { modelId: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
@@ -98,6 +105,7 @@ function writeFakeAcpServer(dir: string): string {
                   { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
                   { value: 'gemini-4-argon', name: 'Gemini 4 Argon' },
                   { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+                  { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
                   { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
                   { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
                 ],
@@ -150,6 +158,10 @@ function writeFakeAcpServer(dir: string): string {
             params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial...' } } },
           });
           setTimeout(() => process.exit(2), 20);
+          return;
+        }
+        if (text === 'WAIT_FOR_TIMEOUT') {
+          timedPromptId = msg.id;
           return;
         }
         if (text === 'SLEEP_CANCEL') {
@@ -212,6 +224,7 @@ function writeFakeAcpServer(dir: string): string {
       }
       if (msg.method === 'session/cancel') {
         record({ cancelled: true });
+        if (timedPromptId !== undefined) send({ jsonrpc: '2.0', id: timedPromptId, result: { stopReason: 'cancelled' } });
         return;
       }
       if (msg.method === 'session/close') {
@@ -308,10 +321,62 @@ test('Antigravity ACP probe verifies server version/hash and reports auth-requir
   assert.match(blocked.reason ?? '', /Google sign-in/i);
 });
 
+test('Antigravity ACP retries an explicit transient session failure once before any prompt', async t => {
+  const f = fixture(t);
+  const prevMode = process.env.FAKE_ACP_MODE, prevLog = process.env.FAKE_ACP_LOG;
+  process.env.FAKE_ACP_MODE = 'start-retry';
+  process.env.FAKE_ACP_LOG = f.logFile;
+  t.after(() => {
+    if (prevMode === undefined) delete process.env.FAKE_ACP_MODE;
+    else process.env.FAKE_ACP_MODE = prevMode;
+    if (prevLog === undefined) delete process.env.FAKE_ACP_LOG;
+    else process.env.FAKE_ACP_LOG = prevLog;
+  });
+
+  const probe = () => antigravity.probe({ home: f.home, options: {}, overrides: { antigravityAcp: f.acpCmd } });
+  assert.equal((await probe()).state, 'verified');
+  assert.deepEqual(f.readLog().filter(row => 'sessionStart' in row).map(row => row.sessionStart), [1, 2]);
+
+  f.makeRunner().start();
+  const job = f.submit('Retry startup first', { model: 'gemini-4-neon-high' });
+  const done = await f.until(job.id, FINAL);
+  assert.equal(done.status, 'completed', done.error);
+  assert.equal(done.result, 'acp: Retry startup first');
+  const summary = JSON.parse(fs.readFileSync(path.join(f.home, 'jobs', job.id, 'stdout.json'), 'utf8'));
+  assert.equal(summary.session_attempts, 2);
+  assert.equal(summary.stage, 'session/prompt');
+
+  process.env.FAKE_ACP_MODE = 'start-fails';
+  const failing = f.submit('Do not send this prompt', { model: 'gemini-4-neon-high' });
+  const failed = await f.until(failing.id, FINAL);
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /^ACP_BEFORE_SUBMISSION: session\/new failed/);
+  const before = JSON.parse(fs.readFileSync(path.join(f.home, 'jobs', failing.id, 'stdout.json'), 'utf8'));
+  assert.equal(before.session_attempts, 2);
+  assert.equal(before.stage, 'session/new');
+  assert.equal(before.prompt_wait_ms, undefined);
+});
+
+test('Antigravity ACP records a prompt deadline separately from operator cancellation', async t => {
+  const f = fixture(t);
+  const job = f.submit('WAIT_FOR_TIMEOUT', { model: 'gemini-4-neon-high' });
+  f.store.db.prepare('UPDATE jobs SET timeout_ms=1500 WHERE id=?').run(job.id);
+  f.makeRunner().start();
+  const done = await f.until(job.id, FINAL);
+  assert.equal(done.status, 'needs_review');
+  assert.match(done.error, /^TIMEOUT:.*never replayed/);
+  const summary = JSON.parse(fs.readFileSync(path.join(f.home, 'jobs', job.id, 'stdout.json'), 'utf8'));
+  assert.equal(summary.stage, 'session/prompt');
+  assert.equal(summary.session_attempts, 1);
+  assert.equal(summary.response_chars, 0);
+  assert.ok(summary.prompt_wait_ms > 0);
+  if (process.platform === 'win32') assert.equal(summary.stopReason, 'cancelled');
+});
+
 test('Antigravity ACP discovery writes acp-catalog.json, marks hidden models, and updates discoverySummary', async t => {
   const f = fixture(t);
   const rows = await antigravity.discover!({ home: f.home, options: {}, overrides: { antigravityAcp: f.acpCmd } });
-  assert.equal(rows.length, 6);
+  assert.equal(rows.length, 7);
   assert.ok(rows.completeSources?.includes('acp-catalog'));
   assert.equal(rows.find(r => r.model === 'gemini-4-neon-high')?.hidden, false);
   assert.equal(rows.find(r => r.model === 'gemini-4-neon-high')?.state, 'validated');
@@ -320,9 +385,47 @@ test('Antigravity ACP discovery writes acp-catalog.json, marks hidden models, an
   assert.equal(rows.find(r => r.model === 'gpt-oss-120b-medium')?.hidden, true);
   assert.equal(rows.find(r => r.model === 'gemini-pro-orchestrator-neon')?.hidden, true);
 
-  const summary = antigravity.discoverySummary!({ home: f.home, options: {}, overrides: {} });
+  const summary = antigravity.discoverySummary!({ home: f.home, options: { antigravityAcp: f.acpCmd }, overrides: {} });
   assert.match(summary, /Antigravity ACP catalog current \(1\.5\.16, Google AI Pro\)/);
-  assert.match(summary, /6 models/);
+  assert.match(summary, /7 models/);
+});
+
+test('an ACP refresh acknowledges its own catalog write and checks again when the catalog expires', async t => {
+  const f = fixture(t);
+  const at = Date.now();
+  t.mock.timers.enable({ apis: ['Date'], now: at });
+  const prober = new Prober(f.store, f.home, { antigravityAcp: f.acpCmd }, { adapters: ['antigravity'], schedule: false });
+  t.after(() => prober.stop());
+  await prober.probe('antigravity');
+  const discovery = () => f.store.modelDiscoveryState('antigravity')?.last_attempt_at;
+  const first = discovery();
+  assert.ok(first);
+
+  t.mock.timers.setTime(at + 60_000);
+  await prober.refreshModelCatalogs();
+  assert.equal(discovery(), first);
+
+  t.mock.timers.setTime(at + 61 * 60_000);
+  await prober.refreshModelCatalogs();
+  const refreshed = discovery();
+  assert.notEqual(refreshed, first);
+  assert.ok(f.store.routeModels('antigravity').some(row => row.model === 'gemini-4-carbon-high'));
+
+  t.mock.timers.setTime(at + 62 * 60_000);
+  await prober.refreshModelCatalogs();
+  assert.equal(discovery(), refreshed);
+});
+
+test('an advertised Carbon High variant takes precedence over the profile effort', async t => {
+  const f = fixture(t);
+  f.store.recordDiscovery('antigravity', await antigravity.discover!({
+    home: f.home, options: { antigravityAcp: f.acpCmd }, overrides: {},
+  }));
+  f.makeRunner().start();
+  const job = f.submit('Carbon check', { model: 'gemini-4-carbon-high', intent: 'code', eff: 'med' });
+  const done = await f.until(job.id, FINAL);
+  assert.equal(done.status, 'completed', done.error);
+  assert.equal(done.reported_model, 'gemini-4-carbon-high');
 });
 
 test('Antigravity ACP advice job sets config, assembles chunks, scrubs secrets, and validates model', async t => {

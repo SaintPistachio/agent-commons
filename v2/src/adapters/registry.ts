@@ -7,9 +7,10 @@ import { claude } from './claude.ts';
 import { codex } from './codex.ts';
 import { openaiApi } from './openai-api.ts';
 import { antigravity } from './antigravity.ts';
+import { geminiApi } from './gemini-api.ts';
 
 /** In the order routes are listed to callers. Omitted routes default to automatic routing (`auto`). */
-const ADAPTERS: PlatformAdapter[] = [claude, codex, openaiApi, antigravity];
+const ADAPTERS: PlatformAdapter[] = [claude, codex, openaiApi, antigravity, geminiApi];
 const BY_ID = new Map(ADAPTERS.map(adapter => [adapter.capabilities.id, adapter]));
 
 export const adapterIds = (): string[] => ADAPTERS.map(adapter => adapter.capabilities.id);

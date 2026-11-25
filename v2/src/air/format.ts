@@ -58,11 +58,12 @@ export function entityLine(kind: string, row: Row, names: Names, opts: { limit?:
  * unanswered messages addressed to you; review names the auto review a move to rev queued (or why it did not);
  * hint follows a second failed checkpoint in a row and names idle peers of another model family.
  */
-export function txReply(result: { op: string; seq: number; handles: Record<string, string>; unseen?: number; inbox?: number; review?: string; hint?: string; wake?: string }, replayed = false): string {
+export function txReply(result: { op: string; seq: number; handles: Record<string, string>; unseen?: number; inbox?: number; review?: string; hint?: string; wake?: string; warnings?: string[] }, replayed = false): string {
   const handles = Object.entries(result.handles).map(([k, v]) => `#${k}=${v}`).join(' ');
   const counts = result.unseen === undefined ? '' : ` unseen=${result.unseen} inbox=${result.inbox ?? 0}`;
   const notes = (result.review ? ` review=${result.review}` : '') + (result.hint ? ` hint=consult:${result.hint}` : '') + (result.wake ? ` wake=${result.wake}` : '');
-  return `@air1 ok op=${q(result.op)} seq=${result.seq}${replayed ? ' replay=1' : ''}${counts}${notes}` + (handles ? '\n' + handles : '');
+  return `@air1 ok op=${q(result.op)} seq=${result.seq}${replayed ? ' replay=1' : ''}${counts}${notes}`
+    + (handles ? '\n' + handles : '') + (result.warnings ?? []).map(warning => `\n! edit_overlap ${q(warning)}`).join('');
 }
 
 /** `@air1 err line=5 node=3 code=VERSION_CONFLICT msg="..."`; line and node are omitted when unknown. */

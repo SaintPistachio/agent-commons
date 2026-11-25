@@ -41,6 +41,25 @@ function Copy-AcDirectory([string]$From, [string]$To, [string[]]$Options) {
   if ($LASTEXITCODE -ge 8) { throw "robocopy to $To failed ($LASTEXITCODE)" }
 }
 
+function Copy-AcHelperLedger([string]$Source, [string]$Target) {
+  $tmp = "$Target.$([guid]::NewGuid().ToString('N')).tmp"
+  $snapshot = @'
+const { DatabaseSync, backup } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
+(async () => {
+  try { await backup(db, process.argv[2]); }
+  finally { db.close(); }
+})().catch(e => { console.error(e.message); process.exitCode = 1; });
+'@
+  try {
+    & $node --disable-warning=ExperimentalWarning -e $snapshot $Source $tmp
+    if ($LASTEXITCODE) { throw "Helper ledger snapshot failed ($LASTEXITCODE)" }
+    [IO.File]::Move($tmp, $Target, $true)
+  } finally {
+    if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+  }
+}
+
 function Publish-AcCloudBackup([string]$Cloud, [string]$Key, [string]$RecoveryKeyFile, [string]$ArchiveMode) {
   $tempRoot = Get-AcLocalTempRoot
   Assert-AcNotOneDrive $tempRoot
@@ -112,12 +131,16 @@ try {
   $helperSelection = Get-AcHelperSelection $node $cli $DataRoot
   $helper = $helperSelection.root
   $ledger = Join-Path $helper '.local\usage.sqlite3'
+  $geminiRoot = if ($env:AGENT_COMMONS_GEMINI_HELPER_ROOT) {
+    [IO.Path]::GetFullPath($env:AGENT_COMMONS_GEMINI_HELPER_ROOT.Trim(), $DataRoot)
+  } else { Join-Path (Split-Path $helper -Parent) 'gemini-capabilities' }
+  $geminiLedger = Join-Path $geminiRoot '.local\usage.sqlite3'
   if (-not [IO.File]::Exists($ledger)) {
     if ($helperSelection.configured) { throw "Configured API helper ledger is missing: $ledger" }
     Write-Warning "No API helper ledger at $ledger. This generation backs up Agent Commons data only."
   }
   Assert-AcNotOneDrive $Destination
-  foreach ($root in @($DataRoot, $helper, $cloud)) { Assert-AcSeparatePaths $Destination $root }
+  foreach ($root in @($DataRoot, $helper, $geminiRoot, $cloud)) { Assert-AcSeparatePaths $Destination $root }
   Assert-AcSeparatePaths $cloud $DataRoot
   Assert-AcSeparatePaths $cloud $helper
   Assert-AcSeparatePaths $recoveryKeyFile $helper
@@ -159,23 +182,15 @@ try {
 
     $helperMirror = Join-Path $mirror 'openai-capabilities'
     if ([IO.File]::Exists($ledger)) {
-      $copy = Join-Path $helperMirror '.local\usage.sqlite3'
-      $tmp = "$copy.$([guid]::NewGuid().ToString('N')).tmp"
-      $snapshot = @'
-const { DatabaseSync, backup } = require('node:sqlite');
-const db = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
-(async () => {
-  try { await backup(db, process.argv[2]); }
-  finally { db.close(); }
-})().catch(e => { console.error(e.message); process.exitCode = 1; });
-'@
-      try {
-        & $node --disable-warning=ExperimentalWarning -e $snapshot $ledger $tmp
-        if ($LASTEXITCODE) { throw "Helper ledger snapshot failed ($LASTEXITCODE)" }
-        [IO.File]::Move($tmp, $copy, $true)
-      } finally {
-        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+      Copy-AcHelperLedger $ledger (Join-Path $helperMirror '.local\usage.sqlite3')
+    }
+    if ([IO.File]::Exists($geminiLedger)) {
+      $geminiMirror = Join-Path $mirror 'gemini-capabilities'
+      if ((Test-Path -LiteralPath $geminiMirror) -and ((Get-Item -LiteralPath $geminiMirror -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refusing to write into a reparse-point directory: $geminiMirror"
       }
+      [void][IO.Directory]::CreateDirectory($geminiMirror)
+      Copy-AcHelperLedger $geminiLedger (Join-Path $geminiMirror 'usage.sqlite3')
     }
     # These directories are for redacted evidence only. Never copy the helper's .local tree wholesale.
     foreach ($name in 'evidence', '.local\evidence') {

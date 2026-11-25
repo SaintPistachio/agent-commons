@@ -202,7 +202,7 @@ test('job nodes keep every job_submit rule; proto takes text or air', t => {
   const r = f.tx(f.claude, '@air1\n#0 tnew "with a job"\n#1 job t=#0 route=antigravity task=review "review this"');
   assert.match(r.handles['1'], /^j\d+$/);
   const job = f.call(f.claude, 'job_status', { job_id: r.handles['1'] }).job;
-  assert.equal(job.route, 'antigravity'); assert.deepEqual(job.options, { task: 'review', selection: { intent: 'code', eff: 'med', source: 'inferred', reasons: ['default'] } });
+  assert.equal(job.route, 'antigravity'); assert.deepEqual(job.options, { task: 'review', cost_class: 'omitted', selection: { intent: 'code', eff: 'med', source: 'inferred', reasons: ['default'] } });
 });
 
 test('an existing ID that looks like a handle wins over the handle', t => {

@@ -1,0 +1,17 @@
+{
+  "verified_at": "2026-11-25",
+  "source_url": "https://aistudio.google.com/docs/pricing",
+  "note": "Paid tier, Standard, USD per 1M tokens; output includes thinking tokens. Model IDs still need confirming with `run.py models` once the key is stored. Gemini 4 Argon doubles on 2026-12-01 and 3.8 Flash on 2027-01-01, as the pricing page lists.",
+  "models": {
+    "gemini-4-neon": {"tier": "pro", "context_tokens": 1000000,
+      "prices": [{"from": "2026-11-01", "input": "3.00", "output": "15.00", "cached_input": "0.15"}]},
+    "gemini-4-argon": {"tier": "pro", "context_tokens": 1000000,
+      "prices": [{"from": "2026-11-01", "input": "2.00", "output": "10.00", "cached_input": "0.10"},
+                 {"from": "2026-12-01", "input": "4.00", "output": "20.00", "cached_input": "0.20"}]},
+    "gemini-4-hydrogen": {"tier": "balanced", "context_tokens": 1000000,
+      "prices": [{"from": "2026-11-01", "input": "1.50", "output": "7.50", "cached_input": "0.075"}]},
+    "gemini-3.8-flash": {"tier": "fast",
+      "prices": [{"from": "2026-11-01", "input": "0.75", "output": "3.75", "cached_input": "0.075"},
+                 {"from": "2027-01-01", "input": "1.50", "output": "7.50", "cached_input": "0.15"}]}
+  }
+}

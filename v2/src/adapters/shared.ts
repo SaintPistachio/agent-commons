@@ -98,7 +98,7 @@ export function helperCall(helper: RouteCommand, args: string[], timeoutMs = 120
   });
 }
 
-export const git = (cwd: string, args: string[]) => execFileSync('git', ['-C', cwd, '-c', 'core.fsmonitor=false', ...args],
+export const git = (cwd: string, args: string[]) => execFileSync('git', ['-C', cwd, '-c', 'core.fsmonitor=false', '-c', 'core.longpaths=true', ...args],
   { env: jobGitEnvironment(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim();
 
 export function killTree(pid: number): void {
@@ -159,7 +159,9 @@ export function launchCli(job: Json, ctx: RunContext, command: RouteCommand | un
  */
 export function safeWorktreeGitArgs(cwd: string, gitDir?: string | null): string[] {
   const target = gitDir ? ['--git-dir', gitDir, '--work-tree', cwd] : ['-C', cwd];
-  return [...target, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+  // core.longpaths: job worktrees live under a long home path, and some tracked files would pass Windows' 260-character
+  // limit there (every edit-mode job failed WORKDIR_FAILED on the checkout before this).
+  return [...target, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.longpaths=true',
     '-c', 'submodule.recurse=false', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0'];
 }
 

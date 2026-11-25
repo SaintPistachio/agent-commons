@@ -39,7 +39,7 @@ const DIFF_EXCLUDES = ['**/.env*', '**/*secret*', '**/*token*', '**/*credential*
   .map(glob => `:(exclude,glob,icase)${glob}`);
 const RANGE = /^[A-Za-z0-9._\/~^@{}-]+(\.\.\.?[A-Za-z0-9._\/~^@{}-]+)?$/;
 /** Values that look like live credentials: OpenAI/Anthropic keys, Google API keys, GitHub and Slack tokens, AWS keys, private keys. */
-export const SECRET_VALUES = [/\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/, /\bAIza[0-9A-Za-z_-]{35}\b/, /\bgh[pousr]_[A-Za-z0-9]{30,}\b/,
+export const SECRET_VALUES = [/\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/, /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/, /\bAQ\.[0-9A-Za-z._~-]{36,}/, /\bgh[pousr]_[A-Za-z0-9]{30,}\b/,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/, /\bAKIA[0-9A-Z]{16}\b/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/];
 export const checkSecrets = (ref: string, text: string) => {
   if (SECRET_VALUES.some(pattern => pattern.test(text))) fail('CTX_SECRET', 400, `${ref} contains what looks like a credential; leave it out or redact it`);

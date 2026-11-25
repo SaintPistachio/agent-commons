@@ -553,9 +553,14 @@ async function observeUsage(ctx: ProbeContext): Promise<UsageSnapshot | undefine
   const observedAt = new Date().toISOString();
   const { code, reply } = await helperCall(command, ['-Action', 'Status'], 90_000, undefined,
     { AC_ANTIGRAVITY_STATE: state, PYTHONDONTWRITEBYTECODE: '1' });
-  if (code !== 0 || reply?.status !== 'SUCCESS' || !Array.isArray(reply.quota)) return;
+  if (code !== 0 || reply?.status !== 'SUCCESS' || !Array.isArray(reply.quota)) {
+    const reason = typeof reply?.error_code === 'string' && /^[A-Z0-9_]{1,64}$/.test(reply.error_code) ? reply.error_code : `exit_${code ?? 'none'}`;
+    ctx.onUsageError?.({ kind: `helper:${reason}`, method: 'Status', at: new Date().toISOString() });
+    return;
+  }
   const rows = quotaUsage({ quota_after: reply.quota, observed_at_utc: observedAt });
-  return rows.length ? { rows, source: 'status' } : undefined;
+  if (!rows.length) ctx.onUsageError?.({ kind: 'helper:no_quota_rows', method: 'Status', at: new Date().toISOString() });
+  return rows.length ? { rows, source: 'status', completeInventory: rows.length === reply.quota.length } : undefined;
 }
 
 export const antigravity: PlatformAdapter = {
@@ -581,7 +586,7 @@ export const antigravity: PlatformAdapter = {
   binaries: ctx => versionedCopies([{ path: antigravityCliPath(ctx), source: 'helper install' }], file => ({ file })),
   discover,
   discoverySummary: ctx => {
-    if (!ctx.overrides.antigravityHelperRoot && !ctx.options?.antigravity) {
+    if (resolveAntigravityAcp(ctx.options, ctx.overrides)) {
       const acpSummary = acpInventorySummary(ctx.home);
       if (acpSummary) return acpSummary;
     }

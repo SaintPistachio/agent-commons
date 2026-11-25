@@ -296,7 +296,11 @@ class Service:
         from .credits import track_status
         observations = self.ledger.funding() or read_json(self.state_dir / "credit-observations.json")
         snapshot = self.state_dir / "account-costs.json"
-        result = track_status(observations, self.ledger.status(), read_json(snapshot) if snapshot.is_file() else None)
+        try:
+            weekly = self.ledger.weekly_budget_display()
+        except PolicyError:
+            weekly = None
+        result = track_status(observations, self.ledger.status(), read_json(snapshot) if snapshot.is_file() else None, weekly)
         try:
             self.credential_loader(self.policy, self.root, admin=True)
             result["admin_credential_present"] = True

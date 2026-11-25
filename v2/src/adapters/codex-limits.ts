@@ -121,6 +121,27 @@ export function parseCodexAppServerRateLimits(result: unknown, previous: UsageWi
   return observedAt ? usage.map(u => ({ ...u, observed_at: observedAt })) : usage;
 }
 
+/** Only the explicit multi-pool response can retire meters; the legacy single-pool reply is partial. */
+export function codexUsageInventoryComplete(result: unknown, readings: UsageObservation[], now: number): boolean {
+  const response = row(result), byId = row(response?.rateLimitsByLimitId);
+  if (!byId || !Object.keys(byId).length) return false;
+  const expected = new Set<string>();
+  for (const [pool, value] of Object.entries(byId)) {
+    const snap = row(value);
+    if (!snap || !pool.trim() || snap.limitId !== pool) return false;
+    let windows = 0;
+    for (const value of [snap.primary, snap.secondary]) {
+      if (value === null) continue;
+      const normalized = sample(pool, mapAppServerWindow(value), now);
+      if (!normalized || expected.has(key(normalized))) return false;
+      expected.add(key(normalized));
+      windows++;
+    }
+    if (!windows) return false;
+  }
+  return readings.length === expected.size && readings.every(reading => expected.has(key(reading)));
+}
+
 function isoFromEpochSeconds(value: unknown): string | null {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
   const ms = value * 1000;

@@ -96,6 +96,16 @@ class PrepaidAvailableModeTests(unittest.TestCase):
             with self.assertRaises(PolicyError) as caught:
                 self.ledger.reserve(late,1000000)
             self.assertEqual(caught.exception.code,'grant_deadline_exceeded')
+    def test_weekly_display_tolerates_stale_costs_but_admission_does_not(self):
+        with frozen_time(START+timedelta(seconds=301)):
+            self.assertEqual(self.ledger.status()['weekly_budget']['status'],'unverified')
+            shown=self.ledger.weekly_budget_display()
+            self.assertNotEqual(shown['status'],'unverified')
+            self.assertTrue(shown['display_from_stale_costs'])
+            self.assertGreater(Decimal(shown['weekly_limit_usd']),0)
+            with self.assertRaises(PolicyError) as caught:
+                self.ledger.reserve(request('stale-after-display'),1000000)
+            self.assertEqual(caught.exception.code,'account_costs_stale')
     def test_stale_cost_status_remains_structured_without_optional_observation(self):
         from openai_capabilities.service import Service
         with frozen_time(START+timedelta(seconds=301)):

@@ -37,7 +37,7 @@ const FINAL = ['completed', 'failed', 'needs_review', 'cancelled'];
 test('an antigravity job runs the helper once with task, effort and the prompt in a file', async t => {
   const f = fixture(t);
   const job = f.submit('Compare two designs', { task: 'review', effort: 'high', effort_reason: 'Demanding critique of a short design.', timeout_minutes: 10 });
-  assert.deepEqual(job.options, { task: 'review', effort_reason: 'Demanding critique of a short design.', selection: { intent: 'code', eff: 'med', source: 'inferred', reasons: ['default'] } });
+  assert.deepEqual(job.options, { task: 'review', effort_reason: 'Demanding critique of a short design.', cost_class: 'omitted', selection: { intent: 'code', eff: 'med', source: 'inferred', reasons: ['default'] } });
   f.runner().start();
   const done = await f.until(job.id, FINAL);
   assert.equal(done.status, 'completed', done.error);

@@ -176,6 +176,24 @@ test('encrypted backup bundles round-trip databases, artifacts, and local files'
     }), { code: 'CREDENTIAL_IN_STANDARD_BACKUP' });
     fs.unlinkSync(path.join(home, 'helpers', 'token-fixture.txt'));
 
+    // A stored review that quotes a bare private-key header does not block; a stored key does.
+    const pemHeader = '-----' + 'BEGIN RSA PRIVATE KEY-----';
+    const setError = (value: string | null) => {
+      const db = new DatabaseSync(path.join(home, 'commons.sqlite'));
+      try { db.prepare("UPDATE jobs SET error = ? WHERE id = 'completed-job'").run(value); } finally { db.close(); }
+    };
+    setError(`the fixture \`${pemHeader}\` is not a real key`);
+    const quotedBundle = await createBackupBundle({
+      home, outFile: path.join(root, 'pem-quoted.acbak.tar.gz'), standardArchive: true, helperRoot, stagingParent,
+    });
+    assert.ok(fs.existsSync(quotedBundle.file));
+    for (const file of [quotedBundle.file, quotedBundle.sha256File, quotedBundle.metaFile]) fs.rmSync(file, { force: true });
+    setError(`${pemHeader}\n${'MIIEowIBAAKCAQEA'.repeat(4)}`);
+    await assert.rejects(createBackupBundle({
+      home, outFile: path.join(root, 'pem-key2.acbak.tar.gz'), standardArchive: true, helperRoot, stagingParent,
+    }), { code: 'CREDENTIAL_IN_STANDARD_BACKUP' });
+    setError(null);
+
     const standard = await createBackupBundle({
       home, outFile: path.join(root, 'standard.acbak.tar.gz'), standardArchive: true, helperRoot, stagingParent,
     });

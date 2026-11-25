@@ -229,7 +229,7 @@ def refresh_costs(observations, policy, admin_key, client=None):
             "next_action": "Grant balances, expirations, funding sources, and Auto Recharge are not returned by these APIs"}
 
 
-def _track_prepaid_status(observations, local_status, api_snapshot=None):
+def _track_prepaid_status(observations, local_status, api_snapshot=None, weekly_display=None):
     _targets(observations)
     now = _now()
     verified = timestamp(observations.get("verified_at"), "verified_at")
@@ -262,6 +262,12 @@ def _track_prepaid_status(observations, local_status, api_snapshot=None):
               "pending_jobs": len(local_status.get("pending_jobs", [])), "account_cost_snapshot": api_snapshot,
               "estimated_remaining_usd": None, "funding_activation_allowed": False,
               "account_cost_basis": "unverified", "estimate_note": "Refresh supported account costs; grant balances remain observed evidence"}
+    weekly = weekly_display
+    if isinstance(weekly, dict) and weekly.get("status") in ("active", "exhausted", "activation_pending"):
+        # Display only (Agent Commons paces the prepaid grant by it); admission is decided by the ledger.
+        result["weekly_budget"] = {key: weekly[key] for key in (
+            "status", "window_start", "reset_at", "weekly_limit_usd", "weekly_remaining_usd",
+            "available_for_new_requests_usd", "display_from_stale_costs") if key in weekly}
     if api_snapshot is None:
         return result
     _targets(api_snapshot, observations)
@@ -292,10 +298,10 @@ def _track_prepaid_status(observations, local_status, api_snapshot=None):
     return result
 
 
-def track_status(observations, local_status, api_snapshot=None):
+def track_status(observations, local_status, api_snapshot=None, weekly_display=None):
     """Combine grant snapshots and local/account usage without double subtraction."""
     if isinstance(observations, dict) and observations.get("funding_policy") == "existing_prepaid_only":
-        return _track_prepaid_status(observations, local_status, api_snapshot)
+        return _track_prepaid_status(observations, local_status, api_snapshot, weekly_display)
     _targets(observations)
     observed = timestamp(observations.get("observed_at"), "observed_at")
     now = _now()

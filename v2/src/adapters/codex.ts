@@ -10,7 +10,7 @@ import { profileGrid, type ModelDiscoveries, type PlatformAdapter, type ProbeCon
 import { helperEnv, killTree, launchCli, runCapture } from './shared.ts';
 import { cliCommand, directoryEntries, launchSelectedCli, pathCopies, registryUpstream, resolveCli, retainNativeCli, retainedCliPath, runOfficialUpdater, sameCliPath, versionedCopies, type CliRoute } from './cli-freshness.ts';
 import { catalogDiscoveries, catalogSelectionStatus, chooseCodexModel, cliEfforts, codexLine, queuedCliSelection, readCodexModels } from './cli-models.ts';
-import { codexLimits, parseCodexAppServerRateLimits, parseCodexResetCredits } from './codex-limits.ts';
+import { codexLimits, codexUsageInventoryComplete, parseCodexAppServerRateLimits, parseCodexResetCredits } from './codex-limits.ts';
 import { codexToolsetArgs } from '../tool-hub.ts';
 import { ENTITLEMENT_ERROR_PATTERN, estimateExpectedCostUsd, modelPricing } from './model-pricing.ts';
 
@@ -373,7 +373,8 @@ async function readAppServerUsage(ctx: ProbeContext): Promise<UsageSnapshot | un
         if (typeof res.accountId === 'string' && res.accountId && verifiedAccountId && res.accountId !== verifiedAccountId) {
           return fail('accountMismatch', 'account/rateLimits/read');
         }
-        const rows = parseCodexAppServerRateLimits(res, ctx.usage ?? [], Date.now(), startedAt);
+        const observedAt = Date.now();
+        const rows = parseCodexAppServerRateLimits(res, ctx.usage ?? [], observedAt, startedAt);
         if (!rows) {
           return fail('protocol', 'account/rateLimits/read');
         }
@@ -381,6 +382,7 @@ async function readAppServerUsage(ctx: ProbeContext): Promise<UsageSnapshot | un
         finish({
           rows,
           source: 'app-server',
+          completeInventory: codexUsageInventoryComplete(res, rows, observedAt),
           ...(accountScope ? { accountScope } : {}),
           ...(resetCredits ? { meta: { resetCredits } } : {}),
         });

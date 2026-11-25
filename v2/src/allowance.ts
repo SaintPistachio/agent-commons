@@ -23,10 +23,14 @@ export const ALLOWANCE_POLICY = {
   scarceMaxRemaining: 30,
   /** ...and its reset is further away than this share of its window (or the fallback horizon). */
   scarceShareOfWindow: 0.5,
+  /** At the current burn rate, at least this much (percent) of the binding window is projected to go unused. */
+  surplusMinProjected: 20,
+  /** A window of unknown length (a prepaid grant) only binds over a paced one when this low or this close to reset. */
+  unpacedBindsAtOrBelow: 15,
 } as const;
 
-export type AllowanceClass = 'expiring' | 'neutral' | 'scarce';
-export interface Allowance { cls: AllowanceClass; pool?: string; window?: string; remaining?: number; resetsAt?: string }
+export type AllowanceClass = 'expiring' | 'surplus' | 'neutral' | 'scarce';
+export interface Allowance { cls: AllowanceClass; pool?: string; window?: string; remaining?: number; resetsAt?: string; projected?: number }
 
 const HOUR = 3600_000;
 /**
@@ -48,16 +52,24 @@ export function windowLengthMs(label: string): number | null {
 
 const left = (w: UsageWindow) => w.closed ? 0 : w.remaining_percent!;
 const resetAt = (w: UsageWindow) => w.resets_at === null ? Infinity : Date.parse(w.resets_at);
+/**
+ * A window of unknown length (a prepaid grant) yields to a paced window of the same pool unless it is nearly
+ * used up or about to reset, so pace and projection stay meaningful for spend-down.
+ */
+const unpacedBinds = (w: UsageWindow, at: number) => w.pool !== 'prepaid' || windowLengthMs(w.window) !== null || w.closed
+  || left(w) <= ALLOWANCE_POLICY.unpacedBindsAtOrBelow || resetAt(w) - at <= ALLOWANCE_POLICY.expiringFallbackMs;
 
 /**
  * Selects the binding fresh window across pools: each pool is bound by its tightest window
  * (a window with unknown remaining makes its pool unknown), and independent pools choose the
  * one with the most remaining headroom (ties break to the sooner reset).
  */
-export function bindingWindow(windows: readonly UsageWindow[]): UsageWindow | undefined {
+export function bindingWindow(windows: readonly UsageWindow[], at = Date.now()): UsageWindow | undefined {
   const pools = new Map<string, UsageWindow | null>();
+  const paced = new Set(windows.filter(w => !w.stale && windowLengthMs(w.window) !== null).map(w => w.pool));
   for (const w of windows) {
     if (w.stale) continue;
+    if (paced.has(w.pool) && !unpacedBinds(w, at)) continue;
     if (!w.closed && w.remaining_percent === null) { pools.set(w.pool, null); continue; }
     const current = pools.get(w.pool);
     if (current === null) continue;
@@ -72,7 +84,7 @@ export function bindingWindow(windows: readonly UsageWindow[]): UsageWindow | un
 }
 
 export function classifyAllowance(windows: readonly UsageWindow[], at = Date.now()): Allowance {
-  const best = bindingWindow(windows);
+  const best = bindingWindow(windows, at);
   if (!best || best.closed || best.resets_at === null) return { cls: 'neutral' };
   const remaining = best.remaining_percent!, until = Date.parse(best.resets_at) - at;
   if (!Number.isFinite(until) || until <= 0) return { cls: 'neutral' };
@@ -81,6 +93,9 @@ export function classifyAllowance(windows: readonly UsageWindow[], at = Date.now
   const p = ALLOWANCE_POLICY;
   if (remaining >= p.expiringMinRemaining && until <= (length ? length * p.expiringShareOfWindow : p.expiringFallbackMs))
     return { cls: 'expiring', ...detail };
+  const projection = windowProjection(best, at);
+  if (projection?.kind === 'remaining_at_reset' && projection.percent >= p.surplusMinProjected)
+    return { cls: 'surplus', ...detail, projected: projection.percent };
   if (remaining <= p.scarceMaxRemaining && until > (length ? length * p.scarceShareOfWindow : p.expiringFallbackMs))
     return { cls: 'scarce', ...detail };
   return { cls: 'neutral' };
@@ -171,8 +186,12 @@ export function downsamplePoints<T>(points: readonly T[], limit = 240): T[] {
 }
 
 /** Sort key: lower is preferred. */
-export const allowanceRank = (cls: AllowanceClass): number => cls === 'expiring' ? 0 : cls === 'neutral' ? 1 : 2;
+export const allowanceRank = (cls: AllowanceClass): number => cls === 'expiring' ? 0 : cls === 'surplus' ? 1 : cls === 'neutral' ? 2 : 3;
 
-/** Short label for job options, e.g. `expiring:gemini/weekly@62%`. */
+/** Within one allowance class, a larger projected unused share wins, in 10-point bands so near-ties fall through. */
+export const surplusBand = (a: Allowance): number => a.cls === 'surplus' || a.cls === 'expiring' ? Math.floor((a.projected ?? 0) / 10) : 0;
+
+/** Short label for job options, e.g. `expiring:gemini/weekly@62%` or `surplus:default/weekly@87%+58%`. */
 export const allowanceLabel = (a: Allowance): string =>
-  a.cls === 'neutral' ? 'neutral' : `${a.cls}:${a.pool}/${a.window}@${Math.round(a.remaining!)}%`;
+  a.cls === 'neutral' ? 'neutral'
+    : `${a.cls}:${a.pool}/${a.window}@${Math.round(a.remaining!)}%${a.projected !== undefined ? `+${Math.round(a.projected)}%` : ''}`;

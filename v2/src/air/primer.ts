@@ -7,8 +7,10 @@ Handles: p project, t task, d decision, c checkpoint, g discussion, m message, a
   A full UUID works anywhere a handle does.
 Opcodes:
   ref <uri|"text"> [status= sha=]          local evidence anchor; use it as ev=#k / ok=#k
-  tnew "title" [obj= acc= next= rev_pol=]  create a task (rev_pol=cross: moving it to rev queues a cross-family review)
-  tclm t= v=   tupd t= v= [st= next= title= obj= acc= rev_pol=]   trel t= v=
+  tnew "title" [obj= acc= next= rev_pol= deps=]  create a task (rev_pol=cross: moving it to rev queues a cross-family review)
+  tclm t= v=   tupd t= v= [st= next= title= obj= acc= rev_pol= deps= integrated_rev=]   trel t= v=
+      deps=t42,t43:git requires both tasks done and t43's integration commit in the downstream edit base. deps=none clears.
+      Record integrated_rev=<full commit> on a done task, or integrated_rev=none to clear it. Claim with unfinished prerequisites sets blk.
   dec "summary" [t= why= ev= sup= p=]     record a decision
   chk "summary" [t= rev= br= ok= q= arts= next= p= fail=1]   checkpoint (ok=checks, q=open questions; fail=1, or a
                                            ref with status=fail in ok=, marks it failed)
@@ -16,7 +18,8 @@ Opcodes:
       wake=auto: a recipient offline 2 min is answered by one job on its own adapter (reply marked via jN; force: even online)
   dopen subj="..." "question" [t=]  dpost g= "body" [reply= ev= p=]  dclose g= "outcome"
   art name="..." "content" [kind=]          the same bytes and name again return the existing handle
-  job "prompt" [t= route= mode= intent= eff= proto= ctx= cost= shell= model= effort= timeout= task= reason= max_usd= max_tok= tier= purpose= deliv= repair=auto|off tools= max_turns= check=]
+  job "prompt" [t= route= mode= intent= eff= proto= ctx= cost= shell= model= effort= timeout= task= reason= max_usd= max_tok= tier= purpose= deliv= repair=auto|off tools= max_turns= check= paths=]
+      paths=src/api,app.ts declares repository-relative edit scopes for overlap warnings.
       mode=edit check=<operator-approved name>: AC applies patches and runs the check in isolation; all routes; max_turns=1-4 (default 2).
       intent: fast code review deep edit; eff: min low med high max (the route's profile picks model and effort)
       route=auto (default): the service picks from the R line (local, sub, then paid; workspace-read routes preferred when ctx is empty; reviews go to another model family);

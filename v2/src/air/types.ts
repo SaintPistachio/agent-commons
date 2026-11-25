@@ -1,7 +1,7 @@
 /** AIR-T v0.1 packet types. The codec has no HTTP, MCP or database dependencies. */
 
 /** One value item: plain text, or a back-reference to an earlier node (`#k`). */
-export type AirItem = { ref: number } | { text: string };
+export type AirItem = { ref: number; git?: true } | { text: string };
 
 export interface AirNode {
   idx: number;

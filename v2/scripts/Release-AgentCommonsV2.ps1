@@ -5,10 +5,11 @@ Tests and installs the checkout's HEAD into Agent Commons.
 
 .DESCRIPTION
 Run from the work branch's checkout (a linked worktree is fine). Steps, stopping at the first failure:
-  1. Checks: v2/ is committed, HEAD is a fast-forward of main, and HEAD contains the live release (so another
+  1. Checks: v2/ and the Gemini helper are committed, HEAD is a fast-forward of main, and HEAD contains the live release (so another
      branch's installed work is never dropped; -AllowDroppingLive overrides).
   2. Tests: tsc and the v2 test suite. -SkipTests needs -SkipReason "...", which goes into the release checkpoint.
-  3. Install-AgentCommonsV2.ps1 (database backup, release copy, `current` swap, graceful restart), then checks that
+  3. If Gemini helper files changed, fast-forwards the checked-out main before restart.
+     Install-AgentCommonsV2.ps1 (database backup, release copy, `current` swap, graceful restart), then checks that
      `current` points at HEAD and /health answers.
   4. Fast-forwards main to HEAD in the main checkout (`git merge --ff-only`; never a merge commit or a reset).
   5. With -Push, pushes main and the work branch to origin without force.
@@ -51,9 +52,9 @@ $node = (Get-Command node.exe).Source
 $done = @()
 
 Step "1. Checks ($branch at $($commit.Substring(0, 8)))"
-$dirty = git -C $SourceRoot status --porcelain -- v2
+$dirty = git -C $SourceRoot status --porcelain -- v2 tools/gemini-capabilities
 if ($LASTEXITCODE) { throw "git status failed ($LASTEXITCODE)" }
-if ($dirty) { throw 'v2/ has uncommitted changes; commit them first.' }
+if ($dirty) { throw 'v2/ or tools/gemini-capabilities has uncommitted changes; commit them first.' }
 if ($branch -eq 'HEAD') { throw 'HEAD is detached; release from a branch.' }
 git -C $SourceRoot merge-base --is-ancestor main $commit
 if ($LASTEXITCODE) { throw "main is not an ancestor of $branch; rebase or merge main into it first." }
@@ -87,6 +88,19 @@ if (-not $SkipTests) {
   $done += 'tests passed'
 } else { $done += "tests skipped ($($SkipReason.Trim()))" }
 
+$mainBranch = (git -C $mainCheckout rev-parse --abbrev-ref HEAD).Trim()
+$mainRevision = (git -C $mainCheckout rev-parse HEAD).Trim()
+$geminiChanges = git -C $SourceRoot diff --name-only $mainRevision $commit -- tools/gemini-capabilities
+if ($LASTEXITCODE) { throw "Could not compare the Gemini helper ($LASTEXITCODE)." }
+if ($geminiChanges) {
+  if ($NoMain -or $mainBranch -ne 'main') {
+    throw 'The Gemini helper differs from the main checkout. Release with main checked out and without -NoMain.'
+  }
+  Invoke-Git -C $mainCheckout merge --ff-only $commit
+  if ((git -C $mainCheckout rev-parse HEAD).Trim() -ne $commit) { throw "main is not at the tested commit $commit" }
+  $done += 'main fast-forwarded before installing the updated Gemini helper'
+}
+
 Step '3. Install into live Agent Commons'
 & (Join-Path $PSScriptRoot 'Install-AgentCommonsV2.ps1') -SourceRoot $SourceRoot -DataRoot $DataRoot -Port $Port
 $expected = [IO.Path]::GetFullPath((Join-Path $dataRoot "app\$commit")).TrimEnd('\')
@@ -95,27 +109,28 @@ if ($target -ne $expected) { throw "current points at $target, not $expected" }
 $health = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 5
 $done += "installed (schema $($health.schema_version))"
 
-if (-not $NoMain) {
+if (-not $NoMain -and -not $geminiChanges) {
   Step '4. Fast-forward main'
   $mainBranch = (git -C $mainCheckout rev-parse --abbrev-ref HEAD).Trim()
   if ($mainBranch -eq 'main') { Invoke-Git -C $mainCheckout merge --ff-only $commit }
   else { Invoke-Git -C $SourceRoot fetch . "${commit}:main" }  # main is not checked out: move the ref, fast-forward only
   if ((git -C $SourceRoot rev-parse main).Trim() -ne $commit) { throw "main is not at the tested commit $commit after the fast-forward" }
   $done += 'main fast-forwarded'
-  if ($Push) {
-    Step '5. Push main and the work branch'
-    # Push the pinned, tested commit to explicit destinations: no '+', no configured push refspecs, no tags.
-    foreach ($ref in @('main', $branch) | Select-Object -Unique) {
-      $pushed = $false
-      foreach ($delay in 0, 2, 4, 8, 16) {
-        if ($delay) { Start-Sleep $delay }
-        git -C $SourceRoot push --no-follow-tags origin "${commit}:refs/heads/$ref"
-        if (-not $LASTEXITCODE) { $pushed = $true; break }
-      }
-      if (-not $pushed) { throw "push of $ref failed after retries" }
+}
+
+if (-not $NoMain -and $Push) {
+  Step '5. Push main and the work branch'
+  # Push the pinned, tested commit to explicit destinations: no '+', no configured push refspecs, no tags.
+  foreach ($ref in @('main', $branch) | Select-Object -Unique) {
+    $pushed = $false
+    foreach ($delay in 0, 2, 4, 8, 16) {
+      if ($delay) { Start-Sleep $delay }
+      git -C $SourceRoot push --no-follow-tags origin "${commit}:refs/heads/$ref"
+      if (-not $LASTEXITCODE) { $pushed = $true; break }
     }
-    $done += 'pushed'
+    if (-not $pushed) { throw "push of $ref failed after retries" }
   }
+  $done += 'pushed'
 }
 
 $backupConfig = Read-AcBackupConfig $DataRoot

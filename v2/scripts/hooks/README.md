@@ -29,7 +29,7 @@ Claude Code, in `~/.claude/settings.json` (merged into any existing `hooks`):
     "SessionStart": [{ "hooks": [{ "type": "command", "timeout": 5,
       "command": "node C:/Projects/AgentCommons-data/current/v2/scripts/hooks/ac-session-start.mjs --format json --connection C:/Projects/AgentCommons-data/connections/claude-desktop.json" }] }],
     "PostToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "timeout": 5,
-      "command": "node C:/Projects/AgentCommons-data/current/v2/scripts/hooks/ac-failure-nudge.mjs --format json --state-dir C:/Temp/AgentCommons --connection C:/Projects/AgentCommons-data/connections/claude-desktop.json" }] }]
+      "command": "node C:/Projects/AgentCommons-data/current/v2/scripts/hooks/ac-failure-nudge.mjs --format json --state-dir C:/ExampleWorkspace/AgentCommons --connection C:/Projects/AgentCommons-data/connections/claude-desktop.json" }] }]
   }
 }
 ```

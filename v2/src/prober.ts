@@ -14,6 +14,7 @@ import { compareCliVersions, isStableCliVersion, pendingStableVersion } from './
 import { pendingSdkVersion, SdkRecoveryRequired } from './adapters/sdk-freshness.ts';
 import { inspectSdkSwap, withSdkSwapFinalizer } from './adapters/openai-sdk.ts';
 import type { SdkRecoveryEvent } from './adapters/sdk-swap.ts';
+import { readAcpCatalog, resolveAntigravityAcp } from './adapters/antigravity-acp.ts';
 
 type Check = 'probe' | 'daily' | 'now' | 'sdk-now';
 type ProbeStore = Pick<Store, 'platformState' | 'recordProbe' | 'beginCliUpdate' | 'finishCliUpdate' |
@@ -74,6 +75,7 @@ export class Prober {
   private readonly usageFailures = new Map<string, number>();
   private readonly nextUsageRetryAt = new Map<string, number>();
   private readonly resetTimers = new Map<string, NodeJS.Timeout>();
+  private readonly lastInventoryRecheck = new Map<string, number>();
   private readonly catalogStamps = new Map<string, string>();
   private lastAgDiscovery = -Infinity;
   private catalogRefresh?: Promise<void>;
@@ -114,19 +116,19 @@ export class Prober {
     }
     if (id === 'antigravity') {
       const directory = path.join(this.home, 'helpers', 'antigravity');
+      if (resolveAntigravityAcp(this.options, this.overrides)) {
+        const stamp = 'acp:' + await fileStamp(path.join(directory, 'acp-catalog.json'));
+        const age = Date.now() - Date.parse(readAcpCatalog(this.home)?.observedAt ?? '');
+        return { stamp, expired: !Number.isFinite(age) || age < 0 || age >= AG_CATALOG_TTL };
+      }
       const catalog = path.join(directory, 'catalog.json');
-      const acpCatalog = path.join(directory, 'acp-catalog.json');
-      const files = ['routing-state.json', 'candidate-attempts.json', 'acceptance.json']
+      const files = ['catalog.json', 'routing-state.json', 'candidate-attempts.json', 'acceptance.json']
         .map(name => path.join(directory, name));
-      files.unshift(catalog, acpCatalog);
       const stamp = JSON.stringify(await Promise.all(files.map(fileStamp)));
       if (stamp !== previousStamp) return { stamp };
       let fetchedAt = NaN;
-      try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(acpCatalog, 'utf8')).observedAt); }
-      catch {
-        try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(catalog, 'utf8')).fetched_at); }
-        catch { /* A missing or unreadable cache can be refreshed by the verified route. */ }
-      }
+      try { fetchedAt = Date.parse(JSON.parse(await fs.readFile(catalog, 'utf8')).fetched_at); }
+      catch { /* A missing or unreadable cache can be refreshed by the verified route. */ }
       const age = Date.now() - fetchedAt;
       return { stamp, expired: !Number.isFinite(age) || age < 0 || age >= AG_CATALOG_TTL };
     }
@@ -307,8 +309,16 @@ export class Prober {
     return `${result} (${version}); log: ${logPath}`;
   }
 
+  private allowInventoryRecheck(id: string): boolean {
+    const now = Date.now();
+    if (this.running.has(id) || !this.usageReadAllowed(id)
+      || now - (this.lastInventoryRecheck.get(id) ?? -Infinity) < USAGE_REFRESH) return false;
+    this.lastInventoryRecheck.set(id, now);
+    return true;
+  }
+
   /** Discovery never runs a prompt, and a failed snapshot never retires any inventory entries. */
-  discover(id: string): Promise<void> {
+  discover(id: string, fromUsage = false): Promise<void> {
     if (this.stopped) return Promise.resolve();
     const pending = this.discovering.get(id);
     if (pending) return pending;
@@ -339,12 +349,16 @@ export class Prober {
         if (id === 'antigravity') this.lastAgDiscovery = Date.now();
         const rows = await platform.discover(ctx);
         if (!sameSelection()) return;
-        this.store.recordDiscovery(id, rows);
+        const changed = this.store.recordDiscovery(id, rows);
         this.store.seedProfiles(id);
-        if (id === 'codex' && selected) {
-          // A successful native model/list may republish its own CLI cache. Acknowledge that write.
+        if ((id === 'codex' && selected) || (id === 'antigravity' && resolveAntigravityAcp(this.options, this.overrides))) {
+          // These discovery paths can republish the catalog we watch. Acknowledge their own successful write.
           const published = await this.nativeCatalog(id);
           if (published && sameSelection()) this.catalogStamps.set(id, published.stamp);
+        }
+        if (changed && !fromUsage && !this.observing.has(id) && platform.observeUsage
+          && Date.now() >= (this.nextUsageRetryAt.get(id) ?? 0) && this.allowInventoryRecheck(id)) {
+          void this.observeUsage(id, false, true);
         }
       } catch (error) {
         try {
@@ -436,7 +450,7 @@ export class Prober {
   }
 
   /** Serialize local reads per route. A terminal event gets a new read, not an in-flight pre-job snapshot. */
-  private observeUsage(id: string, force = false): Promise<void> {
+  private observeUsage(id: string, force = false, fromDiscovery = false): Promise<void> {
     const platform = adapter(id);
     if (!platform?.observeUsage) return Promise.resolve();
     if (!force && Date.now() < (this.nextUsageRetryAt.get(id) ?? 0)) return Promise.resolve();
@@ -494,11 +508,13 @@ export class Prober {
         // Persist scope, authoritative meta (clearing stale resetCredits if omitted), and usage rows atomically.
         const persist = () => {
           this.store.recordUsageMeta?.(id, { accountScope: snapshot.accountScope, meta: snapshot.meta ?? null, clearError: true });
-          this.store.recordUsage?.(id, rows, snapshot.source, startedAt, snapshot.partial);
+          return this.store.recordUsage?.(id, rows, snapshot.source, startedAt, snapshot.partial, snapshot.completeInventory);
         };
-        if (this.store.transaction) this.store.transaction(persist);
-        else persist();
+        const changed = this.store.transaction ? this.store.transaction(persist) : persist();
         this.scheduleResetRecheck(id);
+        if (changed && !fromDiscovery && !this.discovering.has(id) && platform.discover && this.allowInventoryRecheck(id)) {
+          void this.discover(id, true);
+        }
       } catch (error) {
         if (error instanceof UsageContractViolation) {
           const identity = usageIdentity(before);
@@ -523,11 +539,14 @@ export class Prober {
       void this.observeUsage(job.route);
       this.scheduleResetRecheck(job.route);
     }
-    if (job.status !== 'failed' || !String(job.error ?? '').startsWith('CLI_ERROR')) return;
+    const error = String(job.error ?? '');
+    const geminiBlocked = job.route === 'gemini-api' &&
+      /^HELPER_BLOCKED: (disabled|overrun|funding_missing|funding_stale|grant_expired|credential_missing|credential_changed)$/.test(error);
+    if (job.status !== 'failed' || (!error.startsWith('CLI_ERROR') && !geminiBlocked)) return;
     const recheck = () => {
       if (this.stopped) return;
       const last = this.store.platformState(job.route)?.last_probe_at;
-      if (!last || Date.now() - Date.parse(last) >= RECHECK_AFTER_FAILURE) void this.probe(job.route);
+      if (geminiBlocked || !last || Date.now() - Date.parse(last) >= RECHECK_AFTER_FAILURE) void this.probe(job.route);
     };
     // An active probe may already have recorded its result and still be reading usage or discovery metadata.
     const activeProbe = this.running.get(job.route);

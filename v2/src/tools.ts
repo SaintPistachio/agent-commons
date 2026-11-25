@@ -4,6 +4,8 @@ import { INTENTS, EFFORTS } from './adapters/types.ts';
 type Schema = Record<string, any>;
 const str = (description?: string, maxLength = 65536): Schema => ({ type: 'string', minLength: 1, maxLength, ...(description ? { description } : {}) });
 const strings = (description?: string): Schema => ({ type: 'array', items: { type: 'string', maxLength: 4096 }, maxItems: 200, ...(description ? { description } : {}) });
+const dependencies: Schema = { type: 'array', maxItems: 200, items: { type: 'object', additionalProperties: false,
+  properties: { task_id: { type: 'string' }, kind: { type: 'string', enum: ['done', 'git'] } }, required: ['task_id', 'kind'] } };
 const projectId = str('Project ID from project_discover. Defaults to the connection\'s single project when omitted.', 256);
 const operationId = str('Stable ID for this mutation. Reuse it to retry safely; the stored result is returned.', 256);
 const taskId = str('Task ID.', 256);
@@ -26,14 +28,16 @@ const tools: Tool[] = [
       failed: { type: 'boolean', description: 'The checks failed. A second failed checkpoint in a row in the same scope returns consult_hint (idle peers of another model family).' }, operation_id: operationId },
     required: ['summary', 'operation_id'] },
   { name: 'task_create', description: 'Create a task with acceptance criteria.',
-    properties: { project_id: projectId, title: str(undefined, 512), objective: str(), acceptance: strings(), next_action: str(undefined, 4096), review_policy: reviewPolicyField, operation_id: operationId },
+    properties: { project_id: projectId, title: str(undefined, 512), objective: str(), acceptance: strings(), next_action: str(undefined, 4096),
+      review_policy: reviewPolicyField, depends_on: dependencies, operation_id: operationId },
     required: ['title', 'operation_id'] },
   { name: 'task_read', description: 'Read a task.', properties: { task_id: taskId }, required: ['task_id'] },
   { name: 'task_claim', description: 'Take ownership of an unowned task at its current version.',
     properties: { task_id: taskId, version: ver, operation_id: operationId }, required: ['task_id', 'version', 'operation_id'] },
   { name: 'task_update', description: 'Update a task you own: status (open, in_progress, blocked, awaiting_review, done, cancelled), next_action, title, objective, acceptance.',
     properties: { task_id: taskId, version: ver, status: { type: 'string', enum: ['open', 'in_progress', 'blocked', 'awaiting_review', 'done', 'cancelled'] },
-      next_action: str(undefined, 4096), title: str(undefined, 512), objective: str(), acceptance: strings(), review_policy: reviewPolicyField, operation_id: operationId },
+      next_action: str(undefined, 4096), title: str(undefined, 512), objective: str(), acceptance: strings(), review_policy: reviewPolicyField,
+      depends_on: dependencies, integrated_revision: { type: ['string', 'null'], maxLength: 64 }, operation_id: operationId },
     required: ['task_id', 'version', 'operation_id'] },
   { name: 'task_release', description: 'Release ownership of a task you own.',
     properties: { task_id: taskId, version: ver, operation_id: operationId }, required: ['task_id', 'version', 'operation_id'] },
@@ -82,6 +86,7 @@ const tools: Tool[] = [
       purpose: str('openai-api only: the concrete benefit of this request.', 1000), deliverable: str('openai-api only: what the answer is for.', 500),
       protocol: { type: 'string', enum: ['text', 'air', 'patch'], description: 'air: the worker gets the AIR-T worker primer and ends with an @air1 block (checked, never applied; verdict ok|chg|blk).' },
       cwd: str('Working directory in the project root or a registered linked git worktree.', 4096),
+      edit_paths: strings('Repository-relative file and directory scopes for advisory overlap warnings on edit jobs.'),
       context_refs: { ...strings('Up to 20 refs resolved now: file:<path>[:a-b+c-d], grep:<path>:<terms>[:context_lines], job:<jN>[:a-b], art:<aN>[:a-b], task:<tN>, diff:<git range> (not on paid routes). File paths are relative to cwd or the project root; secret-like and binary files are refused.'), maxItems: 20 },
       operation_id: operationId },
     required: ['prompt', 'operation_id'] },

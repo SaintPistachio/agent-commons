@@ -221,7 +221,13 @@ async function observeUsage(ctx: ProbeContext): Promise<UsageSnapshot | undefine
   const helper = ctx.options.openaiHelper ?? resolveOpenAIHelper(defaultOpenAIHelperRoot(ctx.home));
   if (!helper) return;
   const { code, reply } = await helperCall(helper, ['credits']);
-  return openAICreditUsage(code === 0 ? reply : null);
+  if (code !== 0) {
+    const reason = typeof reply?.error_code === 'string' && /^[a-z0-9_]{1,64}$/i.test(reply.error_code) ? reply.error_code : `exit_${code ?? 'none'}`;
+    ctx.onUsageError?.({ kind: `helper:${reason}`, method: 'credits', at: new Date().toISOString() });
+  }
+  const snapshot = openAICreditUsage(code === 0 ? reply : null);
+  return { ...snapshot, completeInventory: code === 0 && snapshot.rows[0].remaining_percent !== null
+    && (reply?.weekly_budget === null || snapshot.rows.some(row => row.window === 'weekly')) };
 }
 
 export const openaiApi: PlatformAdapter = {
@@ -231,6 +237,9 @@ export const openaiApi: PlatformAdapter = {
   probe,
   discover,
   observeUsage,
+  // The weekly row paces spend-down only: the helper's weekly cap is advisory (prepaid-available mode) and never
+  // makes the route look exhausted.
+  routeQuotaWindows: rows => rows.filter(row => !(row.pool === 'prepaid' && row.window === 'weekly')),
   estimatedCost(model: string | null, effort: string | null, promptChars: number, options?: Json) {
     const resolvedModel = model ?? openaiApi.capabilities.defaultModel ?? 'gpt-6.2-sol';
     const tier = typeof options?.tier === 'string' ? options.tier : 'default';

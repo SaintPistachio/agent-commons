@@ -109,6 +109,31 @@ Use `policy.example.json` as a reference. A dependency install leaves paid execu
 
 If the helper is installed outside this checkout, set `AGENT_COMMONS_OPENAI_HELPER_ROOT` to its installation directory before starting the service. That directory must contain `run.py` and `.venv\Scripts\python.exe` on Windows. An unclear provider outcome is held for reconciliation.
 
+## Optional Gemini API helper
+
+The [Gemini credit helper](../tools/gemini-capabilities/README.md) supports the
+`gemini-api` route on Windows. The helper owns admission, reservations, and
+settlement. Configure a private key and your own verified funding before enabling
+the route in the local worker policy. Leave paid execution disabled until both
+the helper and the worker policy are ready.
+
+## Task prerequisites and offline benchmark
+
+Add `deps=t1,t2` to an AIR task to keep it out of the ready queue until its
+prerequisites are complete. The task view shows what is blocking it.
+
+To run the offline delegation benchmark, create a disposable scratch directory
+outside the checkout and run:
+
+```powershell
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('ac-benchmark-' + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $scratch | Out-Null
+node v2/scripts/delegation-benchmark.ts --scratch $scratch
+```
+
+The default run uses stubs and writes a JSON comparison to the scratch directory.
+It does not invoke any model or spend API credit.
+
 ## Optional Windows maintenance
 
 Use `Bootstrap-AgentCommonsV2.ps1` for a fresh installation or to restore a backup into a new home. Preview with `-WhatIf`. System startup and maintenance tasks are opt-in through `-RegisterTasks`. Run `Register-AcAutomation.ps1 -WhatIf` with an explicit `-Only` selection to preview individual setup steps.

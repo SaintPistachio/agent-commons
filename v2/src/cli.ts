@@ -627,6 +627,7 @@ switch (command) {
   case 'models': await withStore(async store => {
     const route = option('route');
     const { antigravityInventoryLines } = await import('./adapters/antigravity-inventory.ts');
+    const { acpInventorySummary, resolveAntigravityAcp } = await import('./adapters/antigravity-acp.ts');
     const { readPublicInventory, openAIPublicModelLines, publicInventorySummary } = await import('./adapters/openai-public-inventory.ts');
     const { isRestrictedOpenAIModel, defaultOpenAIHelperRoot, openAIModelSummary } = await import('./adapters/openai-models.ts');
     if (flag('refresh')) {
@@ -645,9 +646,17 @@ switch (command) {
       store.setModelState(matches[0].route, model, state);
     }
     const excluded = new Set(readPublicInventory(home).excluded ?? []);
-    const rows = store.routeModels(route).filter(row => row.route !== 'openai-api' ||
-      (!row.superseded_by && row.state !== 'retired' && !isRestrictedOpenAIModel(row.model) && !excluded.has(row.model)));
-    const ag = route === undefined || route === 'antigravity' ? antigravityInventoryLines(home, store.usageFor('antigravity')) : [];
+    const showAntigravity = route === undefined || route === 'antigravity';
+    const acp = showAntigravity && resolveAntigravityAcp()
+      ? acpInventorySummary(home) ?? 'Antigravity ACP catalog unavailable' : undefined;
+    const rows = store.routeModels(route).filter(row => {
+      if (row.route === 'antigravity' && acp) return row.source === 'acp-catalog' && row.state !== 'retired';
+      if (row.route === 'gemini-api') return !row.superseded_by && row.state !== 'retired';
+      if (row.route === 'openai-api') return !row.superseded_by && row.state !== 'retired'
+        && !isRestrictedOpenAIModel(row.model) && !excluded.has(row.model);
+      return true;
+    });
+    const ag = showAntigravity ? acp ? [acp] : antigravityInventoryLines(home, store.usageFor('antigravity')) : [];
     if (!rows.length) console.log('no models recorded; run models --refresh');
     let previous: string | undefined;
     for (const row of rows) {
@@ -806,6 +815,7 @@ switch (command) {
   }
   case 'status': await withStore(async store => {
     const { antigravityInventorySummary } = await import('./adapters/antigravity-inventory.ts');
+    const { acpInventorySummary, resolveAntigravityAcp } = await import('./adapters/antigravity-acp.ts');
     const { publicInventorySummary } = await import('./adapters/openai-public-inventory.ts');
     const { cliFreshnessLines, cliUpdateStatusLine } = await import('./adapters/cli-freshness.ts');
     const { sdkStatusLine } = await import('./adapters/sdk-freshness.ts');
@@ -828,7 +838,11 @@ switch (command) {
       console.log(`  ${s.adapter_id.padEnd(12)} ${s.probe_state.padEnd(11)} ${(s.cli_version ?? '-').padEnd(24)} running ${q?.running ?? 0}, queued ${q?.queued ?? 0}${s.cooldown_until ? `; cooldown until ${s.cooldown_until}` : ''}`);
       const platform = allAdapters().find(a => a.capabilities.id === s.adapter_id);
       console.log('    ' + inventoryFreshness(store, s.adapter_id));
-      if (s.adapter_id === 'antigravity') console.log('    ' + antigravityInventorySummary(home));
+      if (s.adapter_id === 'antigravity') {
+        const inventory = resolveAntigravityAcp() ? acpInventorySummary(home) ?? 'Antigravity ACP catalog unavailable'
+          : antigravityInventorySummary(home);
+        console.log('    ' + inventory);
+      }
       if (s.adapter_id === 'openai-api') for (const line of publicInventorySummary(home)) console.log('    ' + line);
       for (const line of cliFreshnessLines(s, platform?.upstreamTrack)) console.log(`    ${line}`);
       if (s.usage_blocked_identity === usageIdentity(s)) console.log('    quota polling suspended: local command reported model work');
@@ -875,7 +889,7 @@ switch (command) {
     for (const route of allAdapters().filter(a => a.poolEvidenceStatus)) {
       const lines = route.poolEvidenceStatus!(store.poolEvidence(route.capabilities.id), store.consumptionRuns(route.capabilities.id));
       if (lines.length) {
-        console.log(`${route.capabilities.id} pool evidence:`);
+        console.log(`${route.capabilities.id} historical pool evidence:`);
         for (const line of lines) console.log(`  ${line}`);
       }
     }

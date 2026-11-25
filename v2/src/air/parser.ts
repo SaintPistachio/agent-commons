@@ -4,7 +4,7 @@ import { AirParseError, STATUS_OF_CODE, type AirItem, type AirNode, type AirOp, 
  * Field kinds: `one` a single value, `int` a non-negative integer, `conf` a probability in (0, 1),
  * `list` comma-separated values, `status` a task status. Any item may be `#k` (an earlier node).
  */
-type Kind = 'one' | 'int' | 'conf' | 'list' | 'status' | 'verdict';
+type Kind = 'one' | 'int' | 'conf' | 'list' | 'deps' | 'status' | 'verdict';
 /** Workers (proto=air jobs) may only report: ref, dec and chk, with an optional verdict. */
 export type ParseMode = 'tx' | 'worker';
 const WORKER_OPS = new Set(['ref', 'dec', 'chk', 'need']);
@@ -23,9 +23,9 @@ type TransactionPacket = Omit<AirPacket, 'nodes'> & { nodes: TransactionNode[] }
 export const OPS: Record<AirOp | 'out', OpSpec> = {
   out: { text: 'required', required: ['j', 'v'], fields: { j: 'one', v: 'one', replacement: 'one' } },
   ref: { text: 'required', required: [], fields: { status: 'one', sha: 'one' } },
-  tnew: { text: 'required', required: [], fields: { obj: 'one', acc: 'list', next: 'one', rev_pol: 'one' } },
+  tnew: { text: 'required', required: [], fields: { obj: 'one', acc: 'list', next: 'one', rev_pol: 'one', deps: 'deps' } },
   tclm: { text: 'none', required: ['t', 'v'], fields: { t: 'one', v: 'int' } },
-  tupd: { text: 'none', required: ['t', 'v'], fields: { t: 'one', v: 'int', st: 'status', next: 'one', title: 'one', obj: 'one', acc: 'list', rev_pol: 'one' } },
+  tupd: { text: 'none', required: ['t', 'v'], fields: { t: 'one', v: 'int', st: 'status', next: 'one', title: 'one', obj: 'one', acc: 'list', rev_pol: 'one', deps: 'deps', integrated_rev: 'one' } },
   trel: { text: 'none', required: ['t', 'v'], fields: { t: 'one', v: 'int' } },
   dec: { text: 'required', required: [], fields: { t: 'one', why: 'one', ev: 'list', sup: 'one', p: 'conf' } },
   chk: { text: 'required', required: [], fields: { t: 'one', rev: 'one', br: 'one', ok: 'list', q: 'list', arts: 'list', next: 'one', p: 'conf', fail: 'one' } },
@@ -39,7 +39,7 @@ export const OPS: Record<AirOp | 'out', OpSpec> = {
   rstep: { text: 'required', required: ['g'], fields: { g: 'one', to: 'list', ctx: 'list', cwd: 'one' } },
   art: { text: 'required', required: ['name'], fields: { name: 'one', kind: 'one' } },
   job: { text: 'required', required: [], fields: { t: 'one', route: 'one', mode: 'one', proto: 'one', model: 'one', effort: 'one',
-    timeout: 'int', task: 'one', reason: 'one', max_usd: 'one', max_tok: 'int', tier: 'one', purpose: 'one', deliv: 'one', intent: 'one', eff: 'one', ctx: 'list', cwd: 'one', cost: 'one', shell: 'one', repair: 'one', tools: 'one', max_turns: 'int', check: 'one' } },
+    timeout: 'int', task: 'one', reason: 'one', max_usd: 'one', max_tok: 'int', tier: 'one', purpose: 'one', deliv: 'one', intent: 'one', eff: 'one', ctx: 'list', cwd: 'one', cost: 'one', shell: 'one', repair: 'one', tools: 'one', max_turns: 'int', check: 'one', paths: 'list' } },
   jcan: { text: 'none', required: ['j'], fields: { j: 'one' } },
   need: { text: 'required', required: [], fields: { to: 'one', eff: 'one', ctx: 'list' } },
 };
@@ -106,12 +106,13 @@ function node(line: string, lineNo: number, expected: number, mode: ParseMode = 
   const allowed: Record<string, Kind> = mode === 'worker' && op !== 'ref' ? { ...spec.fields, verdict: 'verdict' } : spec.fields;
   const fields: Record<string, AirItem[]> = {};
   let text: string | undefined;
-  const toItem = (value: string, quoted: boolean): AirItem => {
+  const toItem = (value: string, quoted: boolean, kind: Kind): AirItem => {
     if (quoted || !value.startsWith('#')) return { text: value };
-    if (!/^#\d+$/.test(value)) fail('BAD_REF', `${value} is not a node reference`);
-    const k = Number(value.slice(1));
+    const m = (kind === 'deps' ? /^#(\d+)(:git)?$/ : /^#(\d+)$/).exec(value);
+    if (!m) return fail('BAD_REF', `${value} is not a node reference`);
+    const k = Number(m[1]);
     if (k >= idx) fail('FORWARD_REF', `#${idx} may only refer to earlier nodes`);
-    return { ref: k };
+    return m[2] ? { ref: k, git: true } : { ref: k };
   };
   let i = head![0].length;
   while (i < line.length) {
@@ -123,13 +124,13 @@ function node(line: string, lineNo: number, expected: number, mode: ParseMode = 
       if (!kind) fail('UNKNOWN_FIELD', `${op} has no field ${name}=`);
       if (fields[name]) fail('DUPLICATE_FIELD', `${name}= appears twice`);
       const [items, quoted, next] = readItems(line, i + key[0].length, fail);
-      if (kind !== 'list' && items.length !== 1) fail('BAD_VALUE', `${name}= takes one value`);
+      if (kind !== 'list' && kind !== 'deps' && items.length !== 1) fail('BAD_VALUE', `${name}= takes one value`);
       if (kind === 'int' && !/^\d{1,9}$/.test(items[0])) fail('BAD_VALUE', `${name}= must be a whole number`);
       if (kind === 'conf' && (!/^(0?\.\d+)$/.test(items[0]) || !(Number(items[0]) > 0 && Number(items[0]) < 1)))
         fail('BAD_CONFIDENCE', `${name}= must be a probability between 0 and 1, such as .92`);
       if (kind === 'status' && !TASK_STATUSES.includes(items[0]) && !STATUS_OF_CODE[items[0]]) fail('BAD_VALUE', `st= must be one of ${TASK_STATUSES.join(', ')} or ${Object.keys(STATUS_OF_CODE).join(', ')}`);
       if (kind === 'verdict' && !VERDICTS.includes(items[0])) fail('BAD_VALUE', 'verdict= must be ok, chg or blk');
-      fields[name] = items.map((value, n) => kind === 'int' || kind === 'conf' || kind === 'status' || kind === 'verdict' ? { text: value } : toItem(value, quoted[n]));
+      fields[name] = items.map((value, n) => kind === 'int' || kind === 'conf' || kind === 'status' || kind === 'verdict' ? { text: value } : toItem(value, quoted[n], kind));
       i = next;
     } else {
       if (text !== undefined) fail('DUPLICATE_TEXT', 'a node takes one positional value');

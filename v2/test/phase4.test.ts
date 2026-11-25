@@ -38,17 +38,17 @@ test('the R line shows each route\'s load, queue, probe state, cooldown and bill
   f.store.recordProbe(adapter('antigravity')!.capabilities, { state: 'blocked', reason: 'helper files changed' });
   f.store.setCooldown('codex', '2100-01-01T00:00:00.000Z', 'QUOTA_EXHAUSTED: weekly limit');
   f.submit(f.claude, { prompt: 'waiting' });
-  assert.equal(f.rline(), 'R claude=0/1+1q codex=0/1:cool@2100-01-01T00:00Z api=0/1:paid ag=0/1:blk');
+  assert.equal(f.rline(), 'R claude=0/1+1q codex=0/1:cool@2100-01-01T00:00Z api=0/1:paid ag=0/1:blk gem=0/1:na,paid');
 });
 
 test('the R line shows the limit the runner enforces, including an operator override', t => {
   const f = fixture(t, ['claude', 'codex', 'openai-api', 'antigravity']);
   f.store.setRouteLimit('antigravity', 2);
   f.store.setRouteLimit('openai-api', 3);
-  assert.equal(f.rline(), 'R claude=0/1 codex=0/1 api=0/3:paid ag=0/2');
+  assert.equal(f.rline(), 'R claude=0/1 codex=0/1 api=0/3:paid ag=0/2 gem=0/1:na,paid');
   f.store.db.prepare("UPDATE platform_state SET max_running=9 WHERE adapter_id='antigravity'").run(); // a stored value above the ceiling
   const snapshot = (f.call(f.claude, 'air_sync', { project_id: 'p1', since_seq: 0 }).air as string).split('\n').find(l => l.startsWith('R '));
-  assert.match(snapshot!, / ag=0\/2$/, 'capped at the ceiling, as the runner caps it');
+  assert.match(snapshot!, / ag=0\/2 gem=0\/1:na,paid$/, 'capped at the ceiling, as the runner caps it');
 });
 
 test('a job may name its route by the short name the R line shows; it is stored by its full ID', t => {
@@ -89,7 +89,7 @@ test('route=auto: subscription before paid, idle first, other family for reviews
   assert.equal(f.call(f.codex, 'job_status', { job_id: fromPacket.handles['0'] }).job.route, 'claude', 'route=auto works in a packet too');
   const none = failure(() => f.auto({ mode: 'edit', shell: true }));
   assert.equal(none.code, 'NO_ELIGIBLE_ROUTE');
-  assert.match(none.message, /claude:no_shell codex:cooldown api:mode ag:not_probed$/);
+  assert.match(none.message, /claude:no_shell codex:cooldown api:mode ag:not_probed gem:not_probed$/);
   assert.equal(f.submit(f.claude, { route: 'codex', prompt: 'explicit' }).route, 'codex', 'an explicit route is the caller\'s choice, cooldown or not');
 });
 

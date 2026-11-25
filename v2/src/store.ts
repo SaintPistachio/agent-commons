@@ -28,9 +28,10 @@ import { activeDecisionsSql, indexMemoryRow, recallProjectMemory, type SemanticR
 import { inferSelection } from './selection.ts';
 import { cooldownUntil } from './cooldown.ts';
 import { checkWorkerBlock } from './air/worker.ts';
-import { allowanceLabel, allowanceRank, bindingWindow, classifyAllowance, downsamplePoints, formatCompactDuration, windowLengthMs, windowPace, windowProjection, type Allowance, type UsageHistoryCycle, type UsageHistoryPoint } from './allowance.ts';
+import { allowanceLabel, allowanceRank, surplusBand, bindingWindow, classifyAllowance, downsamplePoints, formatCompactDuration, windowLengthMs, windowPace, windowProjection, type Allowance, type UsageHistoryCycle, type UsageHistoryPoint } from './allowance.ts';
 import { healthLine } from './health.ts';
 import { busySlots, findToolset, hubStatus, isBuiltinToolset, jobToolset, loadManifest, toolsAirLines, toolsetAirLine, toolsSummaryLine, type HubEnv } from './tool-hub.ts';
+import { commitAt, describePrerequisiteIssues, editScopes, overlappingEditScope, prerequisiteIssues, type EditBase, type TaskDependency } from './task-prerequisites.ts';
 import os from 'node:os';
 
 export { CommonsError } from './errors.ts';
@@ -40,9 +41,14 @@ export { downsamplePoints, type UsageHistoryCycle, type UsageHistoryPoint };
 interface OutcomeCandidate {
   id: string; billing: string; priority: number; lowQuota: number;
   running: number; limit: number; queued: number; success: number; order: number;
-  /** Allowance class (expiring, neutral, scarce); absent means neutral. */
+  /** Allowance class (expiring, surplus, neutral, scarce); absent means neutral. */
   allowance?: Allowance;
+  /** A paid route admitted for prepaid spend-down; it competes in the subscription band. */
+  spendDown?: boolean;
 }
+
+/** Ceiling for each prepaid spend-down job (the helper still admits each request against the grant). */
+const SPEND_DOWN_MAX_USD = 2;
 
 export const sha256 = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const now = () => new Date().toISOString();
@@ -65,7 +71,7 @@ const parseLists = (row: Json | undefined, fields: string[]) => {
   for (const field of fields) if (typeof out[field] === 'string') out[field] = JSON.parse(out[field]);
   return out;
 };
-const taskRow = (row: Json | undefined) => parseLists(row, ['acceptance']);
+const taskRow = (row: Json | undefined) => parseLists(row, ['acceptance', 'depends_on']);
 const decisionRow = (row: Json | undefined) => parseLists(row, ['evidence']);
 const checkpointRow = (row: Json | undefined) => parseLists(row, ['checks', 'open_questions', 'artifacts']);
 const messageRow = (row: Json | undefined) => parseLists(row, ['recipients', 'evidence']);
@@ -95,7 +101,7 @@ function confidence(value: unknown): number | null {
   if (typeof value !== 'number' || !(value > 0 && value < 1)) fail('INVALID_INPUT', 400, 'confidence must be a number between 0 and 1');
   return value as number;
 }
-interface AirResult { kind: string; id: string; handle: string; reply?: string; text?: string; review?: string; hint?: string; wake?: string }
+interface AirResult { kind: string; id: string; handle: string; reply?: string; text?: string; review?: string; hint?: string; wake?: string; warnings?: string[] }
 
 export class Store {
   readonly db: DatabaseSync;
@@ -474,14 +480,49 @@ export class Store {
   }
 
   // ---- tasks --------------------------------------------------------------
+  private taskDependencies(project: string, task: string, input: unknown): TaskDependency[] {
+    if (!Array.isArray(input) || input.length > 200) return fail('INVALID_INPUT', 400, 'depends_on must be a list of up to 200 dependencies');
+    const deps = new Map<string, TaskDependency>();
+    for (const entry of input) {
+      if (!entry || typeof entry !== 'object' || !['done', 'git'].includes(entry.kind))
+        fail('INVALID_INPUT', 400, 'depends_on entries require task_id and kind=done or git');
+      const id = this.optionalTask(project, text(entry.task_id, 'dependency task_id', 256))!;
+      const kind = entry.kind as TaskDependency['kind'];
+      if (deps.has(id)) fail('INVALID_INPUT', 400, 'depends_on contains a duplicate task');
+      deps.set(id, { task_id: id, kind });
+    }
+    const pending = [...deps.keys()], visited = new Set<string>();
+    const lookup = this.db.prepare('SELECT depends_on FROM tasks WHERE project_id=? AND id=?');
+    while (pending.length) {
+      const id = pending.pop()!;
+      if (id === task) fail('TASK_DEPENDENCY_CYCLE', 409, 'task prerequisites form a cycle');
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const row = lookup.get(project, id);
+      if (row) for (const dep of JSON.parse(String(row.depends_on)) as TaskDependency[]) pending.push(dep.task_id);
+    }
+    return [...deps.values()];
+  }
+  private taskBlockers(deps: TaskDependency[], base?: EditBase | null): string | null {
+    if (!deps.length) return null;
+    const issues = prerequisiteIssues(this.db, deps, base);
+    return issues.length ? `Waiting for ${describePrerequisiteIssues(issues)}` : null;
+  }
+  private requireTaskPrerequisites(deps: TaskDependency[], base?: EditBase | null): void {
+    const blockers = this.taskBlockers(deps, base);
+    if (blockers) fail('TASK_PREREQUISITES_BLOCKED', 409, blockers);
+  }
   op_task_create(actor: Actor, input: Json): Json {
     const project = this.project(input.project_id), at = now();
-    const row = { id: randomUUID(), project_id: project.id, title: text(input.title, 'title', 512), objective: optText(input.objective, 'objective') ?? '',
+    const id = randomUUID();
+    const depends_on = input.depends_on === undefined ? [] : this.taskDependencies(project.id, id, input.depends_on);
+    const row = { id, project_id: project.id, title: text(input.title, 'title', 512), objective: optText(input.objective, 'objective') ?? '',
       acceptance: list(input.acceptance, 'acceptance'), status: 'open', owner: null, next_action: optText(input.next_action, 'next_action', 4096),
-      review_policy: reviewPolicy(input.review_policy ?? 'none'), version: 1, created_by: actor.id, created_at: at, updated_at: at };
-    this.db.prepare(`INSERT INTO tasks(id,project_id,title,objective,acceptance,status,owner,next_action,review_policy,version,created_by,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(row.id, row.project_id, row.title, row.objective, json(row.acceptance), row.status, null,
-      row.next_action, row.review_policy, 1, actor.id, at, at);
+      review_policy: reviewPolicy(input.review_policy ?? 'none'), depends_on, integrated_revision: null,
+      version: 1, created_by: actor.id, created_at: at, updated_at: at };
+    this.db.prepare(`INSERT INTO tasks(id,project_id,title,objective,acceptance,status,owner,next_action,review_policy,version,created_by,created_at,updated_at,depends_on)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(row.id, row.project_id, row.title, row.objective, json(row.acceptance), row.status, null,
+      row.next_action, row.review_policy, 1, actor.id, at, at, json(depends_on));
     this.touch(project.id);
     return { task: row };
   }
@@ -491,8 +532,9 @@ export class Store {
   }
   private saveTask(task: Json, changes: Json): Json {
     const next: Json = { ...task, ...changes, version: task.version + 1, updated_at: now() };
-    this.db.prepare('UPDATE tasks SET title=?,objective=?,acceptance=?,status=?,owner=?,next_action=?,review_policy=?,version=?,updated_at=? WHERE id=?')
-      .run(next.title, next.objective, json(next.acceptance), next.status, next.owner, next.next_action, next.review_policy ?? 'none', next.version, next.updated_at, task.id);
+    this.db.prepare('UPDATE tasks SET title=?,objective=?,acceptance=?,status=?,owner=?,next_action=?,review_policy=?,version=?,updated_at=?,depends_on=?,integrated_revision=? WHERE id=?')
+      .run(next.title, next.objective, json(next.acceptance), next.status, next.owner, next.next_action, next.review_policy ?? 'none',
+        next.version, next.updated_at, json(next.depends_on), next.integrated_revision, task.id);
     this.touch(task.project_id);
     return { task: next };
   }
@@ -500,7 +542,8 @@ export class Store {
     const task = this.task(input.task_id); this.expectVersion(task, input);
     if (task.status === 'done' || task.status === 'cancelled') fail('TASK_CLOSED', 409);
     if (task.owner && task.owner !== actor.id) fail('TASK_OWNED', 409, `task is owned by ${task.owner}`);
-    return this.saveTask(task, { owner: actor.id, status: task.status === 'open' ? 'in_progress' : task.status });
+    const status = task.status === 'open' ? (this.taskBlockers(task.depends_on) ? 'blocked' : 'in_progress') : task.status;
+    return this.saveTask(task, { owner: actor.id, status });
   }
   op_task_update(actor: Actor, input: Json): Json {
     const task = this.task(input.task_id); this.expectVersion(task, input);
@@ -516,6 +559,23 @@ export class Store {
     if (input.acceptance !== undefined) changes.acceptance = list(input.acceptance, 'acceptance');
     if (input.next_action !== undefined) changes.next_action = optText(input.next_action, 'next_action', 4096);
     if (input.review_policy !== undefined) changes.review_policy = reviewPolicy(input.review_policy);
+    if (input.depends_on !== undefined) changes.depends_on = this.taskDependencies(task.project_id, task.id, input.depends_on);
+    const status = changes.status ?? task.status;
+    if (status !== task.status && ['in_progress', 'awaiting_review', 'done'].includes(status))
+      this.requireTaskPrerequisites(changes.depends_on ?? task.depends_on);
+    if (input.integrated_revision === null) changes.integrated_revision = null;
+    else if (input.integrated_revision !== undefined) {
+      if (status !== 'done') fail('TASK_INTEGRATION_REQUIRES_DONE', 409, 'record an integration commit on a done task');
+      const revision = text(input.integrated_revision, 'integrated_revision', 64);
+      const root = this.approvedProjectRoot(task.project_id);
+      this.assertJobRepository(task.project_id, root);
+      try {
+        const commit = commitAt(root, revision);
+        if (commit !== revision.toLowerCase()) throw new Error('not a commit ID');
+        changes.integrated_revision = commit;
+      } catch { fail('TASK_INTEGRATION_COMMIT_INVALID', 400, 'give a full commit ID in the approved project repository'); }
+    }
+    if (status !== 'done' && task.integrated_revision) changes.integrated_revision = null;
     if (!Object.keys(changes).length) fail('INVALID_INPUT', 400, 'no changes');
     const saved = this.saveTask(task, changes);
     // review_policy=cross: moving into review queues one review by another model family (never blocks the move).
@@ -896,7 +956,7 @@ export class Store {
     return resolved;
   }
   /** `consult` is internal (never from callers): jobs Agent Commons starts itself record their trigger, depth and parent. */
-  op_job_submit(actor: Actor, input: Json, consult: { trigger?: string; wakeDepth?: number; parentJobId?: string; roomId?: string; roomRound?: number; options?: Json; repairOf?: string } = {}): Json {
+  op_job_submit(actor: Actor, input: Json, consult: { trigger?: string; wakeDepth?: number; parentJobId?: string; roomId?: string; roomRound?: number; options?: Json; repairOf?: string; spendDown?: boolean } = {}): Json {
     const project = this.project(input.project_id);
     const checkName = optText(input.check, 'check', 64);
     const patchEdit = checkName !== null;
@@ -909,6 +969,24 @@ export class Store {
     if (patchEdit && (mode !== 'edit' || (input.protocol != null && input.protocol !== 'patch')
       || input.tools != null || [true, 'yes', 'true', '1', 1].includes(input.shell)))
       fail('INVALID_INPUT', 400, 'check requires mode=edit and the patch protocol; shell and tool sets are unavailable');
+    const taskId = this.optionalTask(project.id, input.task_id);
+    const deps: TaskDependency[] = mode === 'edit' && taskId ? this.task(taskId).depends_on : [];
+    this.requireTaskPrerequisites(deps);
+    const paths = editScopes(list(input.edit_paths, 'edit_paths'));
+    if (paths.length && mode !== 'edit') fail('INVALID_INPUT', 400, 'edit_paths require mode=edit');
+    const hasGitDeps = deps.some(dep => dep.kind === 'git');
+    const cwd = optText(input.cwd, 'cwd', 4096);
+    let editBase: string | undefined, editRepository: string | undefined;
+    if (hasGitDeps || paths.length) {
+      const root = this.approvedProjectRoot(project.id), selected = cwd ? resolveContextRoot(root, cwd, [this.home]) : root;
+      editRepository = this.assertJobRepository(project.id, selected);
+      if (hasGitDeps) {
+        let base: EditBase | null = null;
+        try { base = { root: selected, revision: commitAt(selected, 'HEAD') }; } catch { /* Report affected prerequisites below. */ }
+        this.requireTaskPrerequisites(deps, base);
+        editBase = base!.revision;
+      }
+    }
     const workerMode = patchEdit ? 'advice' : mode;
     const selection = inferSelection({
       intent: callerIntent, eff: callerEff, mode, trigger: consult.trigger,
@@ -930,6 +1008,26 @@ export class Store {
     const platform = adapter(requested) ?? allAdapters().find(a => a.capabilities.short === requested)
       ?? fail('ROUTE_UNAVAILABLE', 400, `route must be auto or one of ${adapterIds().join(', ')} (or ${allAdapters().map(a => a.capabilities.short).join(', ')})`);
     const route = platform.capabilities.id;
+    const jobId = randomUUID();
+    // Prepaid spend-down: auto routing (or a system caller that used it) chose a paid route for a job that named no
+    // cost class. AC fills the spend fields; the purpose carries the job ID so the helper never sees a duplicate.
+    const spendDown = platform.capabilities.billing === 'paid' && (input.cost === undefined || input.cost === null)
+      && (picked?.spendDown === true || consult.spendDown === true);
+    const costClass = input.cost === undefined || input.cost === null ? 'omitted' : String(input.cost);
+    if (spendDown) {
+      // The spend-down ceiling always applies; a caller's own smaller ceiling is kept (rounded down to the cent), and
+      // an invalid one is refused rather than replaced.
+      const given = input.max_cost_usd !== undefined && input.max_cost_usd !== null;
+      const callerMax = given ? Math.floor(Number(input.max_cost_usd) * 100) / 100 : NaN;
+      if (given && !(Number.isFinite(callerMax) && callerMax > 0))
+        fail('INVALID_INPUT', 400, 'max_cost_usd must be a positive amount of at least 0.01');
+      const title = input.task_id ? (this.db.prepare('SELECT title FROM tasks WHERE id=?').get(this.optionalTask(project.id, input.task_id)) as Json | undefined)?.title : undefined;
+      const summary = String(title ?? input.prompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      input = { ...input,
+        max_cost_usd: (Number.isFinite(callerMax) && callerMax > 0 && callerMax < SPEND_DOWN_MAX_USD ? callerMax : SPEND_DOWN_MAX_USD).toFixed(2),
+        purpose: `prepaid grant spend-down: ${summary} [ac:${jobId.slice(0, 8)}]`,
+        deliverable: 'Agent Commons job result' };
+    }
     if (mode !== 'advice' && mode !== 'edit') fail('INVALID_INPUT', 400, 'mode must be advice or edit');
     if (intent === 'edit' && mode !== 'edit') fail('INVALID_INPUT', 400, 'intent edit is an edit job; omit mode or set mode edit');
     // Each adapter's declared limits are enforced here, so a new platform gets them without code of its own.
@@ -967,9 +1065,13 @@ export class Store {
       considered: picked.considered,
       ...(picked.allowance ? { allowance: picked.allowance } : {}),
       ...(picked.workspaceReadPreferred ? { workspace_read_preferred: true } : {}),
+      ...(picked.spendDown ? { spend_down: true } : {}),
     };
+    if (spendDown) options.spend_down = true;
+    // Repairs keep the caller's cost class (an explicit cost=sub never becomes a paid repair).
+    options.cost_class = costClass;
     if (toolset) options.toolset = toolset;
-    const row = { id: randomUUID(), project_id: project.id, task_id: this.optionalTask(project.id, input.task_id), route, mode,
+    const row = { id: jobId, project_id: project.id, task_id: taskId, route, mode,
       prompt: text(input.prompt, 'prompt', 200000), model, effort,
       timeout_ms: minutes * 60000, status: 'queued', created_by: actor.id, created_at: now() };
     // Structured protocols add a primer; their output is checked, never applied by the store.
@@ -982,7 +1084,6 @@ export class Store {
     if (refs.length > 20) fail('INVALID_INPUT', 400, 'context_refs takes at most 20 refs');
     if (platform.capabilities.billing === 'paid' && refs.some(ref => ref.startsWith('diff:')))
       fail('CTX_NOT_ALLOWED', 400, 'paid routes take no diff context; name the files instead');
-    const cwd = optText(input.cwd, 'cwd', 4096);
     const contextRoot = cwd ? resolveContextRoot(projectRoot, cwd, [this.home]) : projectRoot;
     if (cwd) options.cwd = contextRoot;
     if (refs.some(ref => ref.startsWith('diff:'))) this.assertJobRepository(project.id, contextRoot);
@@ -999,12 +1100,19 @@ export class Store {
         if (same(top(projectRoot) ?? '') !== same(projectRoot) || same(top(contextRoot) ?? '') !== same(contextRoot)
           || !projectCommon || same(common(contextRoot) ?? '') !== same(projectCommon))
           return fail('PATCH_BASE_OUTSIDE_PROJECT', 400, 'select the registered repository root or the root of one of its linked worktrees');
-        base = git(contextRoot, ['rev-parse', '--verify', 'HEAD^{commit}']);
+        base = editBase ?? commitAt(contextRoot, 'HEAD');
       }
       catch (error) { if (error instanceof CommonsError) throw error; return fail('PATCH_BASE_UNAVAILABLE', 400, 'patch edit jobs require a Git commit in the selected checkout'); }
       options.patch_edit = { check: check.name, check_hash: sha256(json(check)), base, turns };
       options.repair_policy = 'off';
     }
+    if (editBase) options.edit_base = editBase;
+    if (editRepository) options.edit_repository = editRepository;
+    const warnings = paths.length ? this.editOverlapWarnings(editRepository!, paths) : [];
+    if (paths.length) {
+      options.edit_paths = paths;
+    }
+    if (warnings.length) options.overlap_warnings = warnings;
     const fileRefs = patchEdit ? refs.filter(ref => /^(file|grep):/.test(ref)) : [];
     const staticRefs = refs.filter(ref => !fileRefs.includes(ref));
     if (patchEdit) {
@@ -1026,11 +1134,11 @@ export class Store {
       fail('PROMPT_TOO_LARGE', 400, `the worker prompt would be ${promptChars} characters; ${route} takes at most ${platform.capabilities.maxPromptChars}`);
     platform.checkBudget?.({
       model, effort, promptChars, options,
-      input: { ...input, ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}) },
+      input: { ...input, geminiHelper: this.validationOptions?.geminiHelper, ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}) },
       home: this.home,
     });
     if (context || (patchEdit && refs.length)) options.ctx = refs;
-    if (input.repair === 'off') options.repair_policy = 'off';
+    if (input.repair === 'off' || platform.capabilities.automaticRepair === false) options.repair_policy = 'off';
     Object.assign(options, consult.options ?? {});
     options.selection = selection;
     this.db.prepare(`INSERT INTO jobs(id,project_id,task_id,route,mode,prompt,model,effort,timeout_ms,status,created_by,created_at,options,req_intent,req_eff,resolved_model,resolved_eff,
@@ -1043,7 +1151,23 @@ export class Store {
       this.mergeJobOptions(row.id, { ctx_artifact: art.id, ctx_chars: context.length });
     }
     this.touch(project.id);
-    return { job: briefJob(this.job(row.id)) };
+    return { job: briefJob(this.job(row.id)), ...(warnings.length ? { warnings } : {}) };
+  }
+
+  private editOverlapWarnings(repo: string, paths: string[]): string[] {
+    const jobs = this.db.prepare(`SELECT seq,options FROM jobs
+      WHERE mode='edit' AND status IN ('queued','running') AND json_type(options,'$.edit_paths')='array' ORDER BY seq`).all();
+    const warnings: string[] = [];
+    for (const job of jobs) {
+      const options = JSON.parse(String(job.options));
+      if (typeof options.edit_repository !== 'string' || same(options.edit_repository) !== same(repo)) continue;
+      let overlap: string | undefined;
+      for (const candidate of paths) {
+        if ((options.edit_paths as string[]).some(active => (overlap = overlappingEditScope(candidate, active)) !== undefined)) break;
+      }
+      if (overlap) warnings.push(`j${job.seq} overlaps ${overlap}`);
+    }
+    return warnings;
   }
   // ---- consult triggers (Phase 5a) ----------------------------------------------
   /**
@@ -1063,7 +1187,7 @@ export class Store {
     if (consults >= MAX_CONSULTS_PER_TASK) return skip('MAX_CONSULTS', `(${consults} of ${MAX_CONSULTS_PER_TASK} used)`);
     const lastDiff = (this.db.prepare("SELECT options FROM jobs WHERE task_id=? AND options LIKE '%diff_artifact%' ORDER BY seq DESC LIMIT 1").get(task.id) as Json | undefined);
     const diffArtifact = lastDiff ? JSON.parse(lastDiff.options).diff_artifact as string | undefined : undefined;
-    const input: Json = { project_id: task.project_id, task_id: task.id, route: 'auto', intent: 'review', eff: 'high', cost: 'sub', protocol: 'air',
+    const input: Json = { project_id: task.project_id, task_id: task.id, route: 'auto', intent: 'review', eff: 'high', protocol: 'air',
       context_refs: [`task:${taskHandle}`, ...(diffArtifact ? [`art:${this.handleOf('a', diffArtifact)}`] : [])],
       prompt: `Review task ${taskHandle}: does the work meet its objective and acceptance criteria? Correctness first. Name concrete problems `
         + `(file and line where you can). verdict=ok if nothing needs changing, chg if changes are needed, blk if something blocks it.` };
@@ -1073,7 +1197,7 @@ export class Store {
       const family = adapter(picked.route)!.capabilities.family, moverFamily = this.actorFamily(mover.id);
       if (moverFamily !== null && family === moverFamily) return skip('NO_CROSS_FAMILY', `(only ${picked.considered.join(', ')} can take it)`);
       const job = this.op_job_submit(SYSTEM_ACTOR, { ...input, route: picked.route },
-        { trigger: 'auto_review', wakeDepth: 1, options: { review_for: mover.id, auto: { picked: picked.route, considered: picked.considered } } }).job;
+        { trigger: 'auto_review', wakeDepth: 1, spendDown: picked.spendDown, options: { review_for: mover.id, auto: { picked: picked.route, considered: picked.considered } } }).job;
       this.emit('job', 'job_submit', job.id, SYSTEM_ACTOR.id);
       return { job: job.id };
     } catch (error) {
@@ -1127,7 +1251,7 @@ export class Store {
     if (target !== 'auto' && target.capabilities.billing === 'paid') return refuse('PAID_ROUTE');
     const handle = this.handleOf('j', id)!;
     const creator: Actor = { id: job.created_by, name: job.created_by, role: 'participant' };
-    const input: Json = { project_id: job.project_id, task_id: job.task_id, mode: 'advice', intent: 'deep', eff: need.eff ?? 'med', cost: 'sub', protocol: 'air',
+    const input: Json = { project_id: job.project_id, task_id: job.task_id, mode: 'advice', intent: 'deep', eff: need.eff ?? 'med', protocol: 'air',
       context_refs: need.ctx, cwd: job.options?.cwd,
       prompt: `A worker on job ${handle} asks: ${need.question}\nAnswer it directly and concretely; you have the context the worker named.` };
     try {
@@ -1135,7 +1259,7 @@ export class Store {
       const picked = target === 'auto' ? this.pickRoute(creator, input, 'advice', 'deep', input.eff) : null;
       const route = picked?.route ?? (target as { capabilities: { id: string } }).capabilities.id;
       const consult = this.op_job_submit(SYSTEM_ACTOR, { ...input, route },
-        { trigger: 'yield', wakeDepth: 1, parentJobId: id, options: { question: need.question, ...(picked ? { auto: { picked: picked.route, considered: picked.considered } } : {}) } }).job;
+        { trigger: 'yield', wakeDepth: 1, parentJobId: id, spendDown: picked?.spendDown, options: { question: need.question, ...(picked ? { auto: { picked: picked.route, considered: picked.considered } } : {}) } }).job;
       this.emit('job', 'job_submit', consult.id, SYSTEM_ACTOR.id);
       this.mergeJobOptions(id, { yield_done: true, next: consult.id });
     } catch (error) { if (error instanceof CommonsError) return refuse(error.code); throw error; }
@@ -1231,7 +1355,7 @@ export class Store {
     let correction = planCorrection(trigger, job);
     if ('refused' in correction) return refuse(correction.refused);
     const o = job.options ?? {}, handle = this.handleOf('j', id)!;
-    let targetRoute = job.route;
+    let targetRoute = job.route, failoverSpendDown = false;
     if (correction.kind === 'effort' || correction.kind === 'capability') {
       const prevModel = job.resolved_model ?? job.model ?? null;
       const prevEff = String(o.ag_effort_fit?.used ?? job.resolved_eff ?? job.effort ?? job.req_eff ?? 'med');
@@ -1262,12 +1386,16 @@ export class Store {
         const failoverEff = (job.req_eff ?? 'med') as typeof EFFORTS[number];
         try {
           const picked = this.pickRoute(failoverActor, {
-            project_id: job.project_id, task_id: job.task_id, cost: 'sub', context_refs: o.ctx ?? [], prompt: job.prompt,
+            // Only a job that itself omitted cost may fail over into prepaid spend-down; older jobs (no record) and
+            // jobs with an explicit cost class stay on local and subscription routes, as before.
+            project_id: job.project_id, task_id: job.task_id, context_refs: o.ctx ?? [], prompt: job.prompt,
+            ...(o.cost_class === 'omitted' ? {} : { cost: 'sub' }),
             ...(o.toolset?.name ? { tools: o.toolset.name } : {}),
           }, 'advice', failoverIntent, failoverEff, undefined, { excludeRoute: job.route });
           const reviewFamily = failoverIntent === 'review' ? this.actorFamily(failoverActor.id) : null;
           if (reviewFamily && adapter(picked.route)?.capabilities.family === reviewFamily) return refuse('NO_STRONGER_PROFILE');
           targetRoute = picked.route;
+          failoverSpendDown = picked.spendDown === true;
           correction = { kind: 'route_failover', from: job.route, to: picked.route, intent: failoverIntent, eff: failoverEff };
         } catch {
           return refuse('NO_STRONGER_PROFILE');
@@ -1282,7 +1410,7 @@ export class Store {
     // A paid repair spends only what is left of the caller's ceiling for this assignment (the attempt's known cost
     // is subtracted); with an unknown cost or nothing meaningful left there is no repair.
     let spend: Json = {};
-    if (adapter(targetRoute)?.capabilities.billing === 'paid') {
+    if (adapter(targetRoute)?.capabilities.billing === 'paid' && !failoverSpendDown) {
       const ceiling = Number(o.max_cost_usd), spent = job.cost_usd == null || !String(job.cost_usd).trim() ? NaN : Number(job.cost_usd);
       if (!Number.isFinite(ceiling) || !Number.isFinite(spent) || spent < 0) return refuse('UNKNOWN_SPEND');
       const left = Math.floor((ceiling - spent) * 1e6) / 1e6;
@@ -1306,7 +1434,7 @@ export class Store {
     let repairId: string;
     this.db.exec('SAVEPOINT job_repair');
     try {
-      repairId = this.op_job_submit(SYSTEM_ACTOR, input, { trigger: 'repair', wakeDepth: 0, parentJobId: root.id, repairOf: root.id,
+      repairId = this.op_job_submit(SYSTEM_ACTOR, input, { trigger: 'repair', wakeDepth: 0, parentJobId: root.id, repairOf: root.id, spendDown: failoverSpendDown,
         options: { repair_from: id, repair_trigger: trigger.kind, correction } }).job.id;
       this.mergeJobOptions(id, { repair: { trigger: trigger.kind, job: repairId, correction: correction.kind }, next: repairId });
       this.db.exec('RELEASE job_repair');
@@ -1482,6 +1610,28 @@ export class Store {
     const builtin = set?.builtin === 'project' && set.name === 'project' && set.server === 'builtin';
     return this.workerPolicy(job.route, set ? (builtin ? 'project' : 'external') : null, job.mode, !!job.options?.patch_edit);
   }
+  /** Called outside the queue's SQLite write transaction, including after asynchronous adapter probes. */
+  queuedEditRefusal(job: Json): string | null {
+    if (job.mode !== 'edit' || !job.task_id) return null;
+    const deps: TaskDependency[] = this.task(job.task_id).depends_on;
+    if (!deps.length) return null;
+    let base: EditBase | null | undefined;
+    if (deps.some(dep => dep.kind === 'git')) {
+      base = null;
+      const pinned = job.options?.edit_base ?? job.options?.patch_edit?.base;
+      if (pinned) {
+        try {
+          const root = this.approvedProjectRoot(job.project_id);
+          const selected = job.options?.cwd ? resolveContextRoot(root, job.options.cwd, [this.home]) : root;
+          const repo = this.assertJobRepository(job.project_id, selected);
+          if (!job.options.edit_repository || same(repo) === same(job.options.edit_repository))
+            base = { root: selected, revision: commitAt(selected, pinned) };
+        } catch { /* Report the affected prerequisites and require resubmission. */ }
+      }
+    }
+    const blockers = this.taskBlockers(deps, base);
+    return blockers ? `TASK_PREREQUISITES_BLOCKED: ${blockers}. Resubmit after resolving the blockers.` : null;
+  }
   failBeforeDispatch(id: string, code: string): void {
     this.updateJob(id, { status: 'failed', finished_at: now(), error: code });
   }
@@ -1580,8 +1730,9 @@ export class Store {
     });
   }
   /** Stores observations without predicting refills. Older deliveries cannot overwrite newer ones. */
-  recordUsage(route: string, rows: UsageObservation[], source: string, checkStartedAt?: string, partial = false): void {
-    if (!rows.length) return;
+  recordUsage(route: string, rows: UsageObservation[], source: string, checkStartedAt?: string, partial = false,
+    completeInventory = false): boolean {
+    if (!rows.length) return false;
     const at = now();
     const upsert = this.db.prepare(`INSERT INTO usage_windows(route,pool,window,remaining_percent,resets_at,observed_at,source)
       VALUES(?,?,?,?,?,?,?)
@@ -1609,6 +1760,13 @@ export class Store {
     const persist = () => {
       const observedWindows = new Map<string, UsageWindow>();
       const known = checkStartedAt ? this.usageFor(route) : [];
+      const meterKey = (row: Pick<UsageObservation, 'pool' | 'window'>) => JSON.stringify([row.pool, row.window]);
+      const state = this.platformState(route);
+      const meta: UsageMetadata = JSON.parse(state?.usage_meta ?? '{}');
+      const freshInventory = !!checkStartedAt && completeInventory && !partial
+        && (!meta.inventoryStartedAt || checkStartedAt > meta.inventoryStartedAt);
+      const keptKeys = new Set<string>();
+      let noNewerRows = true;
       const tracksResets = checkStartedAt && adapter(route)?.capabilities.billing === 'sub';
       for (const row of rows) {
         if (!row || typeof row.pool !== 'string' || !row.pool.trim() || typeof row.window !== 'string' || !row.window.trim()) continue;
@@ -1621,7 +1779,13 @@ export class Store {
         if (checkStartedAt && observedAt > at) continue;
         const resetsAt = row.resets_at === null ? null : new Date(row.resets_at).toISOString();
         const closed = row.closed === true && !!resetsAt;
-        const before = tracksResets ? previous.get(route, row.pool, row.window) as Json | undefined : undefined;
+        const before = (tracksResets || completeInventory || meta.inventoryStartedAt)
+          ? previous.get(route, row.pool, row.window) as Json | undefined : undefined;
+        if (!before && source !== 'operator' && meta.inventoryStartedAt && observedAt < meta.inventoryStartedAt) continue;
+        if (freshInventory && checkStartedAt && observedAt >= checkStartedAt) {
+          keptKeys.add(meterKey(row));
+          if (before?.observed_at > observedAt) noNewerRows = false;
+        }
         const written = upsert.run(route, row.pool, row.window, row.remaining_percent, resetsAt, observedAt,
           closed ? `${source}:closed` : source, checkStartedAt ? 0 : 1);
         if (written.changes && resetsAt !== null && row.remaining_percent !== null) {
@@ -1650,7 +1814,7 @@ export class Store {
         }
         if (!written.changes || !checkStartedAt || observedAt < checkStartedAt) continue;
         // A check straddling the scheduled reset cannot prove that replenishment occurred early.
-        if (before && typeof before.resets_at === 'string' && before.resets_at > at && !closed && row.remaining_percent !== null
+        if (tracksResets && before && typeof before.resets_at === 'string' && before.resets_at > at && !closed && row.remaining_percent !== null
           && (before.source === source || before.source.endsWith(':closed') || before.source === 'reply' && before.remaining_percent === 0)) {
           // Some providers return slightly different timestamps for the same schedule. A rebound to
           // previously observed headroom in that schedule is not another newly observed refill.
@@ -1661,14 +1825,34 @@ export class Store {
           }
         }
         const stale = !!resetsAt && resetsAt <= at;
-        observedWindows.set(JSON.stringify([row.pool, row.window]),
+        observedWindows.set(meterKey(row),
           { ...row, route, resets_at: resetsAt, observed_at: observedAt, source, stale, closed,
             remaining_percent: stale ? null : row.remaining_percent });
       }
-      if (checkStartedAt && !partial && observedWindows.size) this.reconcileQuotaCooldown(route, [...observedWindows.values()], known, checkStartedAt);
+      if (checkStartedAt && !partial && observedWindows.size)
+        this.reconcileQuotaCooldown(route, [...observedWindows.values()], known, checkStartedAt);
+      let retired = 0;
+      if (checkStartedAt && freshInventory && keptKeys.size === rows.length && noNewerRows) {
+        // Retire omitted provider meters only. A reply/manual reading delivered during this check wins.
+        const cooldown = this.platformState(route);
+        const protectedKeys = new Set<string>(cooldown && cooldown.cooldown_until > at
+          ? (JSON.parse(cooldown.cooldown_quota_windows ?? '[]') as [string, string][]).map(key => JSON.stringify(key))
+          : []);
+        const remove = this.db.prepare(`DELETE FROM usage_windows WHERE route=? AND pool=? AND window=?
+          AND observed_at < ? AND source <> 'operator' AND source NOT LIKE 'operator:%'`);
+        for (const old of known) {
+          const key = meterKey(old);
+          if (keptKeys.has(key) || protectedKeys.has(key) || (old.window === 'exhaustion' && !old.stale)) continue;
+          retired += Number(remove.run(route, old.pool, old.window, checkStartedAt).changes);
+        }
+        this.db.prepare('UPDATE platform_state SET usage_meta=? WHERE adapter_id=?')
+          .run(JSON.stringify({ ...meta, inventoryStartedAt: checkStartedAt }), route);
+        const knownKeys = new Set(known.map(meterKey));
+        return retired > 0 || (known.length > 0 && [...keptKeys].some(key => !knownKeys.has(key)));
+      }
+      return false;
     };
-    if (this.db.isTransaction) persist();
-    else this.transaction(persist);
+    return this.db.isTransaction ? persist() : this.transaction(persist);
   }
 
   blockUsageRead(route: string, identity: string): void {
@@ -1684,9 +1868,12 @@ export class Store {
         this.db.prepare('DELETE FROM usage_history WHERE route=?').run(route);
       }
       const nextScope = opts.accountScope ?? state.usage_account_scope ?? null;
-      const nextMeta = opts.meta !== undefined
-        ? (opts.meta ? JSON.stringify(opts.meta) : null)
-        : (scopeChanged ? null : (state.usage_meta ?? null));
+      const priorMeta: UsageMetadata = scopeChanged ? {} : JSON.parse(state.usage_meta ?? '{}');
+      const meta = opts.meta === undefined ? priorMeta : {
+        ...opts.meta,
+        ...(priorMeta.inventoryStartedAt ? { inventoryStartedAt: priorMeta.inventoryStartedAt } : {}),
+      };
+      const nextMeta = Object.keys(meta).length ? JSON.stringify(meta) : null;
       const nextErr = opts.clearError ? null : (state.usage_last_error ?? null);
       this.db.prepare('UPDATE platform_state SET usage_account_scope=?, usage_meta=?, usage_last_error=? WHERE adapter_id=?')
         .run(nextScope, nextMeta, nextErr, route);
@@ -1998,7 +2185,7 @@ export class Store {
   private pickRoute(actor: Actor, input: Json, mode: string, intent: string | null, eff: string | null,
     selection?: ReturnType<typeof inferSelection>, opts?: { excludeRoute?: string }): {
     route: string; considered: string[]; outcomeHistory?: true; allowance?: Record<string, string>;
-    allowanceDecided?: true; workspaceReadPreferred?: true; costTiebreak?: true;
+    allowanceDecided?: true; workspaceReadPreferred?: true; costTiebreak?: true; spendDown?: true;
   } {
     let candidates: readonly OutcomeCandidate[] = [];
     const { withoutAllowance, ...baseline } = this.pickRouteByPolicy(actor, input, mode, intent, eff, list => { candidates = list; }, selection, opts);
@@ -2042,6 +2229,9 @@ export class Store {
 
   private evaluateRouteCandidates(actor: Actor, input: Json, mode: string, intent: string | null, eff: string | null,
     selection?: ReturnType<typeof inferSelection>, opts?: { excludeRoute?: string }) {
+    // An omitted cost class means sub, plus prepaid spend-down when a grant is on track to go unused; an explicit
+    // cost=sub never reaches a paid route.
+    const costOmitted = input.cost === undefined || input.cost === null;
     const cost = input.cost ?? 'sub';
     if (!['local', 'sub', 'paid'].includes(cost)) fail('INVALID_INPUT', 400, 'cost must be local, sub or paid');
     const allowed = ({ local: ['local'], sub: ['local', 'sub'], paid: ['local', 'sub', 'paid'] } as Record<string, string[]>)[cost];
@@ -2058,7 +2248,7 @@ export class Store {
     const needsWorkspaceRead = mode === 'advice' && refs.length === 0 && !toolsetName;
     type Candidate = ReturnType<Store['routeStatus']>[number] & {
       priority: number; success: number; order: number; lowQuota: number; allowance: Allowance;
-      workspaceMismatch: number; expectedCost: number; resolvedModel: string | null; resolvedEffort: string | null;
+      workspaceMismatch: number; expectedCost: number; resolvedModel: string | null; resolvedEffort: string | null; spendDown: boolean;
     };
     const skipped: string[] = [], eligible: Candidate[] = [];
     const hasProfiles = this.hasTable('platform_profiles'), hasState = this.hasTable('platform_state');
@@ -2078,11 +2268,13 @@ export class Store {
       const candidateModel = optText(input.model, 'model', 128) ?? resolvedCfg?.model ?? null;
       const candidateEffort = optText(input.effort, 'effort', 32) ?? resolvedCfg?.effort ?? null;
       const superseded = candidateModel ? this.supersededModel(r.id, candidateModel) : null;
+      const spendDown = costOmitted && r.billing === 'paid' && !spendFields && mode === 'advice' && !patchEdit && !diffContext
+        && this.prepaidSpendDownReady(r.id);
       const reason = opts?.excludeRoute === r.id ? 'excluded'
         : r.state !== 'verified' ? r.state : r.cooldownUntil ? 'cooldown' : quota !== null && quota <= 0 ? 'quota'
         : !caps.modes.includes(mode as 'advice' | 'edit') ? 'mode'
-        : mode === 'edit' && shell && !caps.supportsShellInEdit ? 'no_shell' : !allowed.includes(r.billing) ? 'cost'
-        : r.billing === 'paid' && !spendFields ? 'spend_fields' : r.billing === 'paid' && diffContext ? 'ctx_diff'
+        : mode === 'edit' && shell && !caps.supportsShellInEdit ? 'no_shell' : !allowed.includes(r.billing) && !spendDown ? 'cost'
+        : r.billing === 'paid' && !spendFields && !spendDown ? 'spend_fields' : r.billing === 'paid' && diffContext ? 'ctx_diff'
         : !profile ? 'no_profile' : superseded ? 'superseded' : promptChars > caps.maxPromptChars ? 'prompt_size'
         : toolset && !toolset.routes.includes(r.id) ? 'no_tool' : null;
       if (reason) { skipped.push(`${r.short}:${reason}`); continue; }
@@ -2090,8 +2282,11 @@ export class Store {
         .all(...[r.id, ...(intent ? [intent] : [])]) as Json[];
       const profileOpts = storedProfile?.native_options ? JSON.parse(storedProfile.native_options) as Json : {};
       const est = adapter(r.id)?.estimatedCost?.(candidateModel, candidateEffort, promptChars, {
-        ...profileOpts, ...input, home: this.home, ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}), ...(toolset ? { toolset } : {}),
+        ...profileOpts, ...input, home: this.home, geminiHelper: this.validationOptions?.geminiHelper,
+        ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}), ...(toolset ? { toolset } : {}),
+        ...(spendDown && input.max_output_tokens === undefined ? { max_output_tokens: 8192 } : {}),
       });
+      if (spendDown && (est?.worstCaseUsd === undefined || est.worstCaseUsd > SPEND_DOWN_MAX_USD)) { skipped.push(`${r.short}:budget_ceiling`); continue; }
       eligible.push({
         ...r,
         lowQuota: quota !== null && quota <= 15 ? 1 : 0,
@@ -2101,6 +2296,7 @@ export class Store {
         expectedCost: est?.expectedUsd ?? Infinity,
         resolvedModel: candidateModel,
         resolvedEffort: candidateEffort,
+        spendDown,
         success: recent.length ? recent.filter(j => j.status === 'completed').length / recent.length : 0,
         order,
       });
@@ -2112,26 +2308,33 @@ export class Store {
     observe: (candidates: readonly OutcomeCandidate[]) => void,
     selection?: ReturnType<typeof inferSelection>, opts?: { excludeRoute?: string }): {
     route: string; considered: string[]; allowance?: Record<string, string>; allowanceDecided?: true;
-    withoutAllowance?: string; workspaceReadPreferred?: true; costTiebreak?: true;
+    withoutAllowance?: string; workspaceReadPreferred?: true; costTiebreak?: true; spendDown?: true;
   } {
     const { eligible, skipped, callerFamily, needsWorkspaceRead } = this.evaluateRouteCandidates(actor, input, mode, intent, eff, selection, opts);
     observe(eligible);
     if (!eligible.length) fail('NO_ELIGIBLE_ROUTE', 400, `no route can take this job: ${skipped.join(' ')}`);
     const rank: Record<string, number> = { local: 0, sub: 1, paid: 2 };
+    const band = (r: typeof eligible[number]) => r.spendDown ? rank.sub : rank[r.billing];
     const effectiveIntent = selection?.intent ?? intent;
+    // Allowance order: lapsing allowance first, then projected surplus (the larger projected unused share first, in
+    // 10-point bands), then neutral, then scarce. Operator profile priority stays ahead of it, so an explicit model
+    // preference is never overridden by spare quota.
+    const allowanceOrder = (a: typeof eligible[number], b: typeof eligible[number]) =>
+      allowanceRank(a.allowance.cls) - allowanceRank(b.allowance.cls) || surplusBand(b.allowance) - surplusBand(a.allowance);
     const otherFamily = (r: typeof eligible[number]) => effectiveIntent === 'review' && callerFamily !== null && r.family !== callerFamily ? 0 : 1;
     const idle = (r: typeof eligible[number]) => r.running < r.limit && r.queued === 0 ? 0 : 1;
-    // Allowance only reorders routes of the same billing class (the comparable-cost band) after load, workspace read match, and priority.
+    // Allowance only reorders routes of the same billing band (spend-down puts a paid route in the subscription
+    // band) after load, workspace read match, and priority.
     const aheadBase = (a: typeof eligible[number], b: typeof eligible[number]) =>
-      a.lowQuota - b.lowQuota || rank[a.billing] - rank[b.billing] || otherFamily(a) - otherFamily(b) || idle(a) - idle(b) || b.priority - a.priority;
+      a.lowQuota - b.lowQuota || band(a) - band(b) || otherFamily(a) - otherFamily(b) || idle(a) - idle(b) || b.priority - a.priority;
     const ahead = (a: typeof eligible[number], b: typeof eligible[number]) => aheadBase(a, b) || a.workspaceMismatch - b.workspaceMismatch;
     const restNoCost = (a: typeof eligible[number], b: typeof eligible[number]) => b.success - a.success || a.order - b.order;
     const rest = (a: typeof eligible[number], b: typeof eligible[number]) =>
       b.success - a.success || (a.billing === 'paid' && b.billing === 'paid' ? a.expectedCost - b.expectedCost : 0) || a.order - b.order;
-    const withoutWorkspace = [...eligible].sort((a, b) => aheadBase(a, b) || allowanceRank(a.allowance.cls) - allowanceRank(b.allowance.cls) || rest(a, b))[0];
+    const withoutWorkspace = [...eligible].sort((a, b) => aheadBase(a, b) || allowanceOrder(a, b) || rest(a, b))[0];
     const withoutAllowance = [...eligible].sort((a, b) => ahead(a, b) || rest(a, b))[0];
-    const withoutCost = [...eligible].sort((a, b) => ahead(a, b) || allowanceRank(a.allowance.cls) - allowanceRank(b.allowance.cls) || restNoCost(a, b))[0];
-    eligible.sort((a, b) => ahead(a, b) || allowanceRank(a.allowance.cls) - allowanceRank(b.allowance.cls) || rest(a, b));
+    const withoutCost = [...eligible].sort((a, b) => ahead(a, b) || allowanceOrder(a, b) || restNoCost(a, b))[0];
+    eligible.sort((a, b) => ahead(a, b) || allowanceOrder(a, b) || rest(a, b));
     const labels = Object.fromEntries(eligible.filter(r => r.allowance.cls !== 'neutral').map(r => [r.id, allowanceLabel(r.allowance)]));
     return {
       route: eligible[0].id,
@@ -2141,7 +2344,21 @@ export class Store {
       ...(withoutAllowance.id !== eligible[0].id ? { allowanceDecided: true as const } : {}),
       ...(needsWorkspaceRead && withoutWorkspace.id !== eligible[0].id && eligible[0].workspaceMismatch === 0 ? { workspaceReadPreferred: true as const } : {}),
       ...(withoutCost.id !== eligible[0].id ? { costTiebreak: true as const } : {}),
+      ...(eligible[0].spendDown ? { spendDown: true as const } : {}),
     };
+  }
+
+  /**
+   * The prepaid grant is on track to go unused: a fresh weekly spend-budget row with more than 15% left whose
+   * allowance is expiring or surplus. Unknown or stale readings never qualify.
+   */
+  private prepaidSpendDownReady(routeId: string): boolean {
+    const windows = this.usageFor(routeId);
+    const weekly = windows.find(w => w.pool === 'prepaid' && w.window === 'weekly' && !w.stale);
+    if (!weekly || weekly.closed || weekly.remaining_percent === null || weekly.remaining_percent <= 15) return false;
+    // Decided by the weekly row alone, so a lapsing grant cannot qualify a weekly budget that is on pace.
+    const cls = classifyAllowance([weekly]).cls;
+    return cls === 'expiring' || cls === 'surplus';
   }
 
   /** Read-only dry-run of selection, routing, model/effort resolution, cost comparison, and API budget check. */
@@ -2187,7 +2404,8 @@ export class Store {
       const cfg = this.resolveJobConfig(input, pickedRoute, prof, profileIntent, selection.eff);
       const effUsed = adapter(pickedRoute)?.effectiveEffort?.(String(cfg.effective.task ?? selection.intent), cfg.effort ?? selection.eff, this.home) ?? cfg.effort;
       const est = adapter(pickedRoute)?.estimatedCost?.(cfg.model, effUsed ?? null, info.promptChars, {
-        ...input, home: this.home, ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}), ...(info.toolset ? { toolset: info.toolset } : {}),
+        ...input, home: this.home, geminiHelper: this.validationOptions?.geminiHelper,
+        ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}), ...(info.toolset ? { toolset: info.toolset } : {}),
       }) ?? null;
       resolved = { route: pickedRoute, model: cfg.model, effort: effUsed ?? null, estimated_cost: est, error: cfg.error ?? null };
       if (adapter(pickedRoute)?.checkBudget && input.max_cost_usd !== undefined) {
@@ -2195,7 +2413,8 @@ export class Store {
           adapter(pickedRoute)!.checkBudget!({
             model: cfg.model, effort: effUsed ?? null, promptChars: info.promptChars,
             options: { ...(info.toolset ? { toolset: info.toolset } : {}), ...(cfg.effective ?? {}) },
-            input: { ...input, ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}) },
+            input: { ...input, geminiHelper: this.validationOptions?.geminiHelper,
+              ...(this.validationOptions?.openaiHelper ? { openaiHelper: this.validationOptions.openaiHelper } : {}) },
             home: this.home,
           });
         } catch (e) { budgetError = String((e as Error)?.message ?? e); }
@@ -2380,8 +2599,10 @@ export class Store {
    * Upserts one successful metadata snapshot. Catalog and registry sources are complete by convention;
    * adapters can explicitly supply completeSources, including [] when optional metadata was absent.
    */
-  recordDiscovery(route: string, rows: import('./adapters/types.ts').ModelDiscoveries): void {
+  recordDiscovery(route: string, rows: import('./adapters/types.ts').ModelDiscoveries): boolean {
     const at = now();
+    const current = this.db.prepare("SELECT model,efforts FROM route_models WHERE route=? AND state<>'retired' AND source NOT LIKE '%:hidden' ORDER BY model");
+    const before = JSON.stringify(current.all(route));
     this.db.exec('SAVEPOINT model_discovery');
     try {
       const seen = new Set<string>();
@@ -2431,6 +2652,7 @@ export class Store {
       this.db.prepare(`INSERT INTO model_discovery_state(route,last_attempt_at,error) VALUES(?,?,NULL)
         ON CONFLICT(route) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,error=NULL`).run(route, at);
       this.db.exec('RELEASE model_discovery');
+      return before !== '[]' && before !== JSON.stringify(current.all(route));
     } catch (error) {
       this.db.exec('ROLLBACK TO model_discovery');
       this.db.exec('RELEASE model_discovery');
@@ -2815,7 +3037,9 @@ export class Store {
     const notes = [...results.values()];
     const review = notes.flatMap(r => r.review ? [r.review] : []).join(',') || undefined, hint = notes.find(r => r.hint)?.hint;
     const wake = notes.flatMap(r => r.wake ? [r.wake] : []).join(',') || undefined;
-    const reply = { op: operationId, seq, handles, unseen, inbox: this.inbox(actor, projectId).length, ...(review ? { review } : {}), ...(hint ? { hint } : {}), ...(wake ? { wake } : {}) };
+    const warnings = notes.flatMap(result => (result.warnings ?? []).map(warning => `${result.handle}: ${warning}`));
+    const reply = { op: operationId, seq, handles, unseen, inbox: this.inbox(actor, projectId).length, ...(review ? { review } : {}),
+      ...(hint ? { hint } : {}), ...(wake ? { wake } : {}), ...(warnings.length ? { warnings } : {}) };
     return { ...reply, air: txReply(reply) };
   }
 
@@ -2833,6 +3057,16 @@ export class Store {
     };
     /** List values: ref nodes expand to their text, entity nodes to their handle. */
     const texts = (name: string): string[] | undefined => f[name]?.map(item => 'ref' in item ? (earlier(item).text ?? earlier(item).handle) : item.text);
+    const dependencies = (): TaskDependency[] | undefined => {
+      const items = f.deps;
+      if (!items) return undefined;
+      if (items.length === 1 && 'text' in items[0] && items[0].text === 'none') return [];
+      return items.map(item => {
+        if ('ref' in item) return { task_id: earlier(item, 'task').id, kind: item.git ? 'git' : 'done' };
+        const git = item.text.endsWith(':git');
+        return { task_id: git ? item.text.slice(0, -4) : item.text, kind: git ? 'git' : 'done' };
+      });
+    };
     /** An entity ID from #k (same kind) or a handle/UUID, required to be in this project. */
     const entity = (name: string, kind: string): string | undefined => {
       const item = one(f[name]); if (!item) return undefined;
@@ -2852,7 +3086,8 @@ export class Store {
       // Consult notes for the reply header: a queued (or skipped) review, and the two-strike hint.
       const review = result.review ? (result.review.job ? this.handleOf('j', result.review.job)! : `skip:${result.review.skipped}`) : undefined;
       return { kind, id, handle, ...(kind === 'task' ? { reply: `${handle}@v${result.task.version}` } : {}),
-        ...(review ? { review } : {}), ...(result.consult_hint ? { hint: result.consult_hint } : {}), ...(result.wake ? { wake: result.wake } : {}) };
+        ...(review ? { review } : {}), ...(result.consult_hint ? { hint: result.consult_hint } : {}), ...(result.wake ? { wake: result.wake } : {}),
+        ...(result.warnings ? { warnings: result.warnings } : {}) };
     };
     const t = () => entity('t', 'task');
     switch (node.op) {
@@ -2860,10 +3095,12 @@ export class Store {
         const status = str('status'), sha = str('sha');
         return { kind: 'ref', id: '', handle: '', text: node.text! + (status ? ` [${status}]` : '') + (sha ? ` sha=${sha}` : '') };
       }
-      case 'tnew': return run('task_create', { title: node.text, objective: str('obj'), acceptance: texts('acc'), next_action: str('next'), review_policy: str('rev_pol') }, 'task');
+      case 'tnew': return run('task_create', { title: node.text, objective: str('obj'), acceptance: texts('acc'), next_action: str('next'),
+        review_policy: str('rev_pol'), depends_on: dependencies() }, 'task');
       case 'tclm': return run('task_claim', { task_id: t(), version: int('v') }, 'task');
       case 'tupd': return run('task_update', { task_id: t(), version: int('v'), status: str('st'), next_action: str('next'), title: str('title'),
-        objective: str('obj'), acceptance: texts('acc'), review_policy: str('rev_pol') }, 'task');
+        objective: str('obj'), acceptance: texts('acc'), review_policy: str('rev_pol'), depends_on: dependencies(),
+        integrated_revision: str('integrated_rev') === 'none' ? null : str('integrated_rev') }, 'task');
       case 'trel': return run('task_release', { task_id: t(), version: int('v') }, 'task');
       case 'dec': return run('decision_record', { summary: node.text, task_id: t(), rationale: str('why'), evidence: texts('ev'),
         supersedes: entity('sup', 'decision'), confidence: conf }, 'decision');
@@ -2911,7 +3148,7 @@ export class Store {
           timeout_minutes: int('timeout'), task: str('task'), effort_reason: str('reason'), max_cost_usd: str('max_usd'), max_output_tokens: int('max_tok'),
           tier: str('tier'), purpose: str('purpose'), deliverable: str('deliv'), intent: str('intent'), eff: str('eff'),
           protocol: literal('proto'), context_refs: texts('ctx'), cwd: str('cwd'), cost: str('cost'), shell: str('shell'), repair: str('repair'), tools: str('tools'),
-          max_turns: int('max_turns'), check: str('check') }, 'job');
+          max_turns: int('max_turns'), check: str('check'), edit_paths: texts('paths') }, 'job');
       }
       case 'jcan': return run('job_cancel', { job_id: entity('j', 'job') }, 'job');
       case 'need': return fail('WORKER_ONLY', 400, 'need is for delegated workers');  // the parser refuses it first
@@ -3164,7 +3401,22 @@ export class Store {
     const line = (k: string, entity: Json, extra: string) => entityLine(k, entity, this.names, { limit, extra });
     switch (kind) {
       case 'project': return [line('project', r, kv('obj', r.objective, limit) + kv('root', r.root, limit))];
-      case 'task': return [line('task', r, kv('obj', r.objective, limit) + kl('acc', r.acceptance, limit))];
+      case 'task': {
+        const deps: TaskDependency[] = typeof r.depends_on === 'string' ? JSON.parse(r.depends_on) : r.depends_on ?? [];
+        let base: EditBase | null = null;
+        if (deps.some(dep => dep.kind === 'git')) {
+          try {
+            const root = this.approvedProjectRoot(r.project_id);
+            this.assertJobRepository(r.project_id, root);
+            base = { root, revision: commitAt(root, 'HEAD') };
+          } catch { /* Task status is still available when the approved Git root is unavailable. */ }
+        }
+        const handles = deps.map(dep => (this.handleOf('t', dep.task_id) ?? dep.task_id) + (dep.kind === 'git' ? ':git' : ''));
+        const issues = prerequisiteIssues(this.db, deps, base);
+        return [line('task', r, kv('obj', r.objective, limit) + kl('acc', r.acceptance, limit) + kl('deps', handles, limit)
+          + kv('integrated_rev', r.integrated_revision, limit) + kv('base', base?.revision, limit)
+          + (issues.length ? kv('waiting', describePrerequisiteIssues(issues), limit) : ''))];
+      }
       case 'decision': return [line('decision', r, this.decisionDetails(r, limit))];
       case 'checkpoint': return [line('checkpoint', r, kl('ok', r.checks, limit) + kl('q', r.open_questions, limit)
         + kl('arts', (JSON.parse(r.artifacts) as string[]).map(id => this.handleOf('a', id) ?? id), limit))];

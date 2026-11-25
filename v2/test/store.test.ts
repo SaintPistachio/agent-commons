@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store, CommonsError, type Actor } from './fixtures/service.ts';
+import { SCHEMA_VERSION } from '../src/schema.ts';
 
 function fixture(t: any) {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ac2-store-'));
@@ -21,6 +22,40 @@ function fixture(t: any) {
   return { home, projectDirectory, claude, codex, op, call, project, reopen: () => { store.close(); store = new Store(home); return store; }, get store() { return store; } };
 }
 const code = (fn: () => unknown) => { try { fn(); } catch (error) { return (error as CommonsError).code; } return 'NO_ERROR'; };
+
+test('a v25 task keeps its state and gets an empty integration revision on upgrade', t => {
+  const f = fixture(t);
+  const task = f.call(f.claude, 'task_create', { title: 'Existing task', project_id: f.project.id, operation_id: f.op() }).task;
+  f.store.db.exec('ALTER TABLE tasks DROP COLUMN integrated_revision; PRAGMA user_version = 25;');
+  f.reopen();
+  assert.equal(f.store.db.prepare('PRAGMA user_version').get()!.user_version, SCHEMA_VERSION);
+  assert.deepEqual(f.call(f.claude, 'task_read', { task_id: task.id }).task, task);
+});
+
+test('task dependency validation preserves ownership, versions, and atomic AIR packets', t => {
+  const f = fixture(t);
+  const call = (method: string, input: Record<string, unknown>) => f.call(f.claude, method,
+    { project_id: f.project.id, operation_id: f.op(), ...input });
+  const a = call('task_create', { title: 'A' }).task;
+  assert.deepEqual(a.depends_on, []);
+  const b = call('task_create', { title: 'B', depends_on: [{ task_id: a.id, kind: 'done' }] }).task;
+  call('task_claim', { task_id: a.id, version: 1 });
+  assert.equal(call('task_claim', { task_id: b.id, version: 1 }).task.status, 'blocked');
+  assert.equal(code(() => call('task_update', { task_id: b.id, version: 2, status: 'awaiting_review' })), 'TASK_PREREQUISITES_BLOCKED');
+  assert.equal(code(() => call('task_update', { task_id: a.id, version: 2, depends_on: [{ task_id: b.id, kind: 'done' }] })), 'TASK_DEPENDENCY_CYCLE');
+  assert.equal(code(() => call('task_update', { task_id: a.id, version: 2, depends_on: [{ task_id: a.id, kind: 'done' }] })), 'TASK_DEPENDENCY_CYCLE');
+  const other = call('project_create', { name: 'Other' }).project;
+  const foreign = call('task_create', { project_id: other.id, title: 'Foreign' }).task;
+  assert.equal(code(() => call('task_update', { task_id: a.id, version: 2, depends_on: [{ task_id: foreign.id, kind: 'git' }] })), 'TASK_NOT_IN_PROJECT');
+  const rolledBack = '@air1\n#0 tupd t=t2 v=2 deps=none\n#1 tnew deps=t9999 "Missing"';
+  assert.equal(code(() => call('air_tx', { packet: rolledBack })), 'TASK_NOT_FOUND');
+  assert.deepEqual(call('task_read', { task_id: b.id }).task.depends_on, [{ task_id: a.id, kind: 'done' }]);
+  assert.equal(call('task_read', { task_id: b.id }).task.version, 2);
+  call('task_update', { task_id: a.id, version: 2, status: 'cancelled' });
+  assert.match(call('air_get', { handles: 't2' }).air, /t1 \(cancelled\)/);
+  const change = call('air_tx', { packet: '@air1\n#0 tupd t=t2 v=2 deps=none st=wip' });
+  assert.equal(change.handles[0], 't2@v3');
+});
 
 test('one app records work and another resumes it, including after a restart', t => {
   const f = fixture(t);

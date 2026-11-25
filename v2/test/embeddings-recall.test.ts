@@ -67,7 +67,7 @@ async function startMockEmbeddingsServer(t: TestContext, failMode: { fail?: bool
   return { baseUrl: `http://127.0.0.1:${port}/v1`, getRequests: () => requests };
 }
 
-test('schema 25 upgrades cleanly from v23 and v17', t => {
+test('the current schema upgrades cleanly from v23 and v17', t => {
   const home = mkdtempSync(join(tmpdir(), 'ac-emb-schema-'));
   const store = new Store(home);
   t.after(() => {
@@ -75,14 +75,12 @@ test('schema 25 upgrades cleanly from v23 and v17', t => {
     rmSync(home, { recursive: true, force: true });
   });
   assert.equal(Number((store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version), SCHEMA_VERSION);
-  assert.equal(SCHEMA_VERSION, 25);
-
-  store.db.exec('DROP TABLE memory_vectors; ALTER TABLE projects DROP COLUMN approved_root; ALTER TABLE projects DROP COLUMN approved_git_dir; PRAGMA user_version = 23;');
+  store.db.exec('DROP TABLE memory_vectors; ALTER TABLE projects DROP COLUMN approved_root; ALTER TABLE projects DROP COLUMN approved_git_dir; ALTER TABLE tasks DROP COLUMN integrated_revision; PRAGMA user_version = 23;');
   migrate(store.db);
   assert.equal(Number((store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version), SCHEMA_VERSION);
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_schema WHERE name='memory_vectors' AND type='table'").get());
 
-  store.db.exec('DROP TABLE memory_vectors; DROP TABLE entity_refs; DROP TABLE memory_fts; DROP TABLE job_outcomes; DROP TABLE usage_history; ALTER TABLE projects DROP COLUMN approved_root; ALTER TABLE projects DROP COLUMN approved_git_dir; PRAGMA user_version = 17;');
+  store.db.exec('DROP TABLE memory_vectors; DROP TABLE entity_refs; DROP TABLE memory_fts; DROP TABLE job_outcomes; DROP TABLE usage_history; ALTER TABLE projects DROP COLUMN approved_root; ALTER TABLE projects DROP COLUMN approved_git_dir; ALTER TABLE tasks DROP COLUMN integrated_revision; PRAGMA user_version = 17;');
   migrate(store.db);
   assert.equal(Number((store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version), SCHEMA_VERSION);
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_schema WHERE name='memory_vectors' AND type='table'").get());
